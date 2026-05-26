@@ -1047,7 +1047,26 @@ class ReolinkAudioHandler:
             )
 
             # Wait briefly to see if ffmpeg connects or dies immediately
-            await asyncio.sleep(3.0)
+            # Connection refused exits almost instantly; real connections take longer
+            await asyncio.sleep(0.5)
+            if proc.returncode is not None:
+                # Fast failure — read error and try next URL
+                stderr_data = b""
+                try:
+                    stderr_data = await asyncio.wait_for(proc.stderr.read(2000), timeout=1.0)
+                except Exception:
+                    pass
+                _LOGGER.warning(
+                    "Audio input: ffmpeg failed for %s (rc=%d): %s",
+                    url.split("@")[-1] if "@" in url else url.split("password=")[0] + "...",
+                    proc.returncode,
+                    stderr_data.decode(errors="replace").strip()[:300] if stderr_data else "no error",
+                )
+                proc = None
+                continue
+
+            # Wait more to confirm the stream is actually producing data
+            await asyncio.sleep(2.5)
             if proc.returncode is not None:
                 # ffmpeg exited — read error and try next URL
                 stderr_data = b""
@@ -1057,7 +1076,7 @@ class ReolinkAudioHandler:
                     pass
                 _LOGGER.warning(
                     "Audio input: ffmpeg failed for %s (rc=%d): %s",
-                    url.split("@")[-1] if "@" in url else url,
+                    url.split("@")[-1] if "@" in url else url.split("password=")[0] + "...",
                     proc.returncode,
                     stderr_data.decode(errors="replace").strip()[:300] if stderr_data else "no error",
                 )
