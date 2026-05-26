@@ -1,10 +1,10 @@
-"""Reolink audio handler – manages go2rtc for 2-way audio with Reolink doorbells.
+"""Reolink audio handler – Baichuan protocol 2-way audio with Reolink doorbells.
 
 This module handles:
-  - Auto-detection of Reolink doorbell RTSP details from HA's config entries
-  - Configuration of go2rtc stream with backchannel support
-  - Audio input: extracts PCM audio from go2rtc WebSocket stream
-  - Audio output: sends PCM audio to doorbell speaker via go2rtc backchannel
+  - Audio input: receives ADPCM from doorbell mic via Baichuan cmd 3 (preview stream)
+  - Audio output: sends ADPCM to doorbell speaker via Baichuan cmd 202 (talk)
+  - Both directions use the native Baichuan protocol (port 9000), bypassing RTSP entirely
+  - go2rtc utilities are retained for non-Reolink device fallback
 """
 
 from __future__ import annotations
@@ -17,6 +17,8 @@ from typing import Any
 import aiohttp
 
 from homeassistant.core import HomeAssistant
+
+from .const import AUDIO_INPUT_SAMPLE_RATE, DEFAULT_CHIME_DELAY
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -209,25 +211,29 @@ class ReolinkAudioHandler:
         self._hass = hass
         self._stream_name = stream_name
         self._on_audio_received = on_audio_received
-        self._ws_task: asyncio.Task[None] | None = None
         self._output_reader_task: asyncio.Task[None] | None = None
-        self._session: aiohttp.ClientSession | None = None
-        self._owns_session = True
         self._active = False
-        self._go2rtc_url: str | None = None
         self._send_count = 0
         self._reolink_host: str | None = None
         self._reolink_user: str | None = None
         self._reolink_pass: str | None = None
         self._reolink_rtsp_port: int = 554
         self._camera_entity_id: str | None = None
-        # Baichuan talk state
+        # Baichuan talk state (output — speaker)
         self._baichuan: Any = None
         self._talk_host: Any = None  # Dedicated Host object for talk connection
         self._talk_ability: dict | None = None
         self._talk_enc_type: Any = None
         self._pcm_buffer: bytearray = bytearray()
         self._ffmpeg_proc: asyncio.subprocess.Process | None = None
+        self._chime_delay: float = DEFAULT_CHIME_DELAY
+        # Baichuan audio input state (mic receive via cmd 3 stream)
+        self._listen_host: Any = None  # Separate Host for preview/listen stream
+        self._listen_bc: Any = None
+        self._listen_active = False
+        self._original_push_callback: Any = None
+        self._audio_input_buffer: asyncio.Queue[bytes] = asyncio.Queue(maxsize=200)
+        self._input_processor_task: asyncio.Task[None] | None = None
 
     @property
     def is_active(self) -> bool:
@@ -238,36 +244,20 @@ class ReolinkAudioHandler:
         if self._active:
             return
 
-        # Discover go2rtc URL (for audio input from doorbell mic)
-        self._go2rtc_url = await _discover_go2rtc_url(self._hass)
-        if not self._go2rtc_url:
-            _LOGGER.warning("go2rtc not found — audio input from doorbell mic disabled")
-
         # Get Reolink connection details for direct camera access
         await self._discover_reolink_details()
-
-        # Use HA authenticated session for go2rtc
-        if self._go2rtc_url:
-            ha_session = _get_go2rtc_session(self._hass)
-            if ha_session:
-                self._session = ha_session
-                self._owns_session = False
-            else:
-                self._session = aiohttp.ClientSession()
-                self._owns_session = True
 
         self._active = True
 
         # Start Baichuan talk output pipeline (ADPCM via port 9000)
         await self._start_output_pipeline()
 
-        # Start receive WebSocket (doorbell mic → AI)
-        if self._go2rtc_url:
-            self._ws_task = asyncio.create_task(self._audio_receive_loop())
+        # Start Baichuan audio input (doorbell mic → AI via cmd 3 stream)
+        await self._start_baichuan_audio_input()
 
         _LOGGER.warning(
-            "Reolink audio handler started (stream=%s, host=%s, rtsp_port=%d)",
-            self._stream_name, self._reolink_host, self._reolink_rtsp_port,
+            "Reolink audio handler started (stream=%s, host=%s, baichuan input=%s)",
+            self._stream_name, self._reolink_host, self._listen_active,
         )
 
     async def _discover_reolink_details(self) -> None:
@@ -314,6 +304,7 @@ class ReolinkAudioHandler:
     async def stop(self) -> None:
         """Stop the audio handler and all subprocesses."""
         self._active = False
+        self._listen_active = False
 
         # Stop ffmpeg resampler
         if self._ffmpeg_proc and self._ffmpeg_proc.returncode is None:
@@ -332,6 +323,9 @@ class ReolinkAudioHandler:
         # Stop Baichuan talk session
         await self._stop_baichuan_talk(0)
 
+        # Stop Baichuan listen stream (cmd 4 = stop preview)
+        await self._stop_baichuan_listen()
+
         # Logout dedicated talk connection
         if hasattr(self, "_talk_host") and self._talk_host:
             try:
@@ -340,21 +334,28 @@ class ReolinkAudioHandler:
                 pass
             self._talk_host = None
 
+        # Logout dedicated listen connection
+        if hasattr(self, "_listen_host") and self._listen_host:
+            try:
+                await self._listen_host.logout()
+            except Exception:
+                pass
+            self._listen_host = None
+
         # Cancel tasks
-        for task in (self._ws_task, self._output_reader_task):
+        for task in (self._output_reader_task, self._input_processor_task):
             if task and not task.done():
                 task.cancel()
                 try:
                     await task
                 except asyncio.CancelledError:
                     pass
-        self._ws_task = None
         self._output_reader_task = None
+        self._input_processor_task = None
 
-        if self._session and self._owns_session:
-            await self._session.close()
-        self._session = None
         self._baichuan = None
+        self._listen_bc = None
+        self._talk_ability = None
         self._talk_ability = None
         _LOGGER.warning("Reolink audio handler stopped (sent %d audio chunks)", self._send_count)
 
@@ -535,6 +536,14 @@ class ReolinkAudioHandler:
         block_size = (length_per_encoder // 2) + 4
         channel = 0
 
+        # Wait for the mechanical chime to finish before taking over the speaker
+        chime_delay = getattr(self, "_chime_delay", DEFAULT_CHIME_DELAY)
+        if chime_delay > 0:
+            _LOGGER.warning(
+                "Waiting %.1fs for doorbell chime before starting talk...", chime_delay
+            )
+            await asyncio.sleep(chime_delay)
+
         # Start talk session: send TalkConfig (cmd 201)
         talk_started = await self._start_baichuan_talk(channel, ability)
         if not talk_started:
@@ -611,24 +620,31 @@ class ReolinkAudioHandler:
                 if not adpcm_data:
                     continue
 
-                # Wrap in BcMedia format and send via Baichuan cmd 202
-                payload = self._build_bcmedia_payload(adpcm_data, block_size)
-                if payload:
+                # Match the working reolink_talk pacing: 4 ADPCM blocks per payload.
+                for offset in range(0, len(adpcm_data), block_size * 4):
+                    adpcm_group = adpcm_data[offset:offset + (block_size * 4)]
+                    block_count = len(adpcm_group) // block_size
+                    if block_count == 0:
+                        continue
+
+                    payload = self._build_bcmedia_payload(adpcm_group, block_size)
+                    if not payload:
+                        continue
+
                     try:
                         await self._send_talk_binary(channel, payload)
                         chunks_sent += 1
                         if chunks_sent == 1:
-                            _LOGGER.warning("✓ First ADPCM chunk sent to doorbell speaker!")
+                            _LOGGER.warning("✓ First ADPCM payload sent to doorbell speaker!")
                         elif chunks_sent % 10 == 0:
-                            _LOGGER.warning("Audio output progress: %d chunks sent", chunks_sent)
+                            _LOGGER.warning("Audio output progress: %d payloads sent", chunks_sent)
                     except Exception as exc:
                         if chunks_sent <= 3:
                             _LOGGER.warning("Baichuan talk send error: %s", exc)
-                        # Don't break — transient errors are common
+                        continue
 
-                # Pace: sleep for ~80% of the audio duration to allow buffering
-                audio_duration = len(resampled) / (2 * sample_rate)
-                await asyncio.sleep(audio_duration * 0.8)
+                    payload_samples = (block_size - 4) * 2 * block_count
+                    await asyncio.sleep(payload_samples / sample_rate)
 
         except asyncio.CancelledError:
             pass
@@ -919,30 +935,320 @@ class ReolinkAudioHandler:
             else:
                 raise RuntimeError("Cannot find Baichuan transport to write talk data")
 
-    async def _audio_receive_loop(self) -> None:
-        """Connect to go2rtc WebSocket and receive audio from the doorbell mic."""
-        ws_url = f"{self._go2rtc_url}/api/ws?src={self._stream_name}&media=audio"
-        _LOGGER.warning("Audio receive loop connecting to: %s", ws_url)
+    # ─── Baichuan Audio Input (Mic Receive via cmd 3 Stream) ──────────────────
 
-        while self._active:
-            try:
-                if not self._session:
+    async def _start_baichuan_audio_input(self) -> None:
+        """Start receiving audio from the doorbell mic via Baichuan preview stream.
+
+        Creates a SEPARATE Baichuan connection dedicated to receiving the
+        video/audio stream (cmd 3). We intercept the TCP protocol's push
+        callback to capture BcMedia ADPCM audio packets from the camera's mic.
+
+        This replaces go2rtc-based audio input — works even when RTSP is broken.
+        """
+        camera_entity = self._camera_entity_id or ""
+        reolink_entry_id = find_reolink_entry_for_camera(self._hass, camera_entity)
+        if not reolink_entry_id:
+            _LOGGER.warning("No Reolink entry found — Baichuan audio input disabled")
+            return
+
+        entry = self._hass.config_entries.async_get_entry(reolink_entry_id)
+        if not entry:
+            return
+
+        data = entry.data
+        host = data.get("host", "")
+        username = data.get("username", "admin")
+        password = data.get("password", "")
+        http_port = data.get("port")
+        use_https = data.get("use_https")
+        bc_port = data.get("baichuan_port", 9000)
+
+        if not host:
+            _LOGGER.warning("Reolink entry has no host — audio input disabled")
+            return
+
+        try:
+            from homeassistant.helpers.aiohttp_client import async_get_clientsession  # noqa: PLC0415
+            from reolink_aio.api import Host  # noqa: PLC0415
+
+            listen_host = Host(
+                host=host,
+                username=username,
+                password=password,
+                port=http_port,
+                use_https=use_https,
+                bc_port=bc_port,
+                aiohttp_get_session_callback=lambda: async_get_clientsession(self._hass),
+            )
+            listen_bc = listen_host.baichuan
+            await listen_bc.login()
+            self._listen_host = listen_host
+            self._listen_bc = listen_bc
+            _LOGGER.warning("Created dedicated Baichuan listen connection to %s:%d", host, bc_port)
+        except Exception as exc:
+            _LOGGER.warning("Failed to create Baichuan listen connection: %s", exc)
+            return
+
+        # Intercept the protocol's push callback to capture cmd 3 audio data
+        try:
+            protocol = listen_bc._protocol
+            if protocol:
+                self._original_push_callback = protocol._push_callback
+                protocol._push_callback = self._stream_push_callback
+                _LOGGER.info("Hooked Baichuan protocol push callback for audio input")
+        except Exception as exc:
+            _LOGGER.warning("Failed to hook push callback: %s", exc)
+            return
+
+        # Request the sub-stream (cmd 3) — camera sends multiplexed video+audio
+        try:
+            preview_body = (
+                '<?xml version="1.0" encoding="UTF-8" ?>\n'
+                "<body>\n"
+                '<Preview version="1.1">\n'
+                "<channelId>0</channelId>\n"
+                "<handle>0</handle>\n"
+                "<streamType>sub</streamType>\n"
+                "</Preview>\n"
+                "</body>\n"
+            )
+            # send() waits for the first response; subsequent stream data goes to push
+            await listen_bc.send(cmd_id=3, channel=0, body=preview_body)
+            self._listen_active = True
+            _LOGGER.warning("Baichuan preview stream started — receiving audio from doorbell mic")
+        except Exception as exc:
+            _LOGGER.warning("Failed to start Baichuan preview stream: %s", exc)
+            # Some cameras may return an error but still stream — mark active anyway
+            self._listen_active = True
+
+        # Start the input processor task (decodes ADPCM → PCM and sends to Gemini)
+        self._input_processor_task = asyncio.create_task(self._audio_input_processor())
+
+    def _stream_push_callback(self, cmd_id: int, data: bytes, len_header: int) -> None:
+        """Intercept Baichuan push messages to extract audio from cmd 3 stream.
+
+        Called by the TCP protocol whenever an unsolicited message arrives.
+        For cmd 3 (preview stream), we parse BcMedia packets and queue audio.
+        All other commands pass through to the original handler.
+        """
+        if cmd_id == 3 and self._listen_active:
+            # Extract body from the full packet (skip Baichuan header)
+            body = data[len_header:] if len(data) > len_header else b""
+            if body:
+                self._extract_audio_from_stream(body)
+        elif self._original_push_callback:
+            # Pass non-audio pushes to the original handler
+            self._original_push_callback(cmd_id, data, len_header)
+
+    def _extract_audio_from_stream(self, body: bytes) -> None:
+        """Parse BcMedia packets from a cmd 3 stream chunk and extract ADPCM audio.
+
+        BcMedia multiplexes video and audio. We look for ADPCM packets
+        (magic 0x62773130 = "01wb" LE) and AAC packets (magic 0x62773530 = "05wb" LE).
+        We only extract ADPCM since that matches our codec.
+
+        BcMedia ADPCM packet layout:
+          - 4 bytes: magic (0x62773130)
+          - 2 bytes: payload_size (includes 4 bytes sub-header)
+          - 2 bytes: payload_size (repeated)
+          - 2 bytes: data magic (0x0100)
+          - 2 bytes: half_block_size
+          - N bytes: ADPCM block data (DVI-4: 4-byte header + nibbles)
+          - 0-7 bytes: padding to 8-byte alignment
+        """
+        import struct as struct_mod  # noqa: PLC0415
+
+        BCMEDIA_MAGIC_ADPCM = b"\x30\x31\x77\x62"  # 0x62773130 LE = "01wb"
+        BCMEDIA_MAGIC_AAC = b"\x30\x35\x77\x62"    # 0x62773530 LE = "05wb"
+        # Video frame magics (skip these)
+        BCMEDIA_MAGIC_IFRAME = b"\x30\x30\x64\x63"  # "00dc" LE
+        BCMEDIA_MAGIC_PFRAME = b"\x30\x31\x64\x63"  # "01dc" LE
+        BCMEDIA_MAGIC_INFO = b"\x30\x30\x62\x63"    # "00bc" LE
+
+        pos = 0
+        body_len = len(body)
+
+        while pos + 12 <= body_len:
+            magic = body[pos:pos + 4]
+
+            if magic == BCMEDIA_MAGIC_ADPCM:
+                # Parse ADPCM audio packet
+                payload_size = struct_mod.unpack_from("<H", body, pos + 4)[0]
+                # Total packet size: 8 (header) + payload_size + padding
+                data_start = pos + 8 + 4  # skip header(8) + sub-header(4: magic+half_block)
+                adpcm_size = payload_size - 4  # subtract sub-header size
+                data_end = data_start + adpcm_size
+
+                if data_end <= body_len and adpcm_size > 4:
+                    adpcm_block = body[data_start:data_end]
+                    try:
+                        self._audio_input_buffer.put_nowait(adpcm_block)
+                    except asyncio.QueueFull:
+                        pass  # Drop oldest audio if processor can't keep up
+
+                # Advance past this packet (with padding)
+                total = 8 + payload_size
+                total += (-total) % 8  # padding to 8-byte alignment
+                pos += total
+
+            elif magic in (BCMEDIA_MAGIC_AAC, BCMEDIA_MAGIC_IFRAME,
+                           BCMEDIA_MAGIC_PFRAME, BCMEDIA_MAGIC_INFO):
+                # Skip non-ADPCM packets
+                if pos + 8 <= body_len:
+                    payload_size = struct_mod.unpack_from("<H", body, pos + 4)[0]
+                    total = 8 + payload_size
+                    total += (-total) % 8
+                    pos += total
+                else:
                     break
-                async with self._session.ws_connect(ws_url) as ws:
-                    _LOGGER.warning("Connected to go2rtc audio receive WebSocket")
-                    async for msg in ws:
-                        if not self._active:
-                            break
-                        if msg.type == aiohttp.WSMsgType.BINARY:
-                            await self._on_audio_received(msg.data)
-                        elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
-                            _LOGGER.warning("Receive WS closed: %s", msg.type)
-                            break
-            except asyncio.CancelledError:
-                break
+
+            else:
+                # Unknown magic or encrypted Extension header — skip byte by byte
+                # This handles the initial Extension XML that precedes media data
+                pos += 1
+
+    async def _audio_input_processor(self) -> None:
+        """Process ADPCM audio blocks from the Baichuan stream into PCM for Gemini.
+
+        Continuously dequeues ADPCM blocks, decodes them to 16-bit PCM at the
+        camera's native rate (16kHz), then passes to the audio received callback.
+        Gemini expects 16kHz 16-bit PCM input (AUDIO_INPUT_SAMPLE_RATE).
+        """
+        _LOGGER.warning("Audio input processor started (Baichuan → PCM %dHz)", AUDIO_INPUT_SAMPLE_RATE)
+        blocks_decoded = 0
+
+        try:
+            while self._active and self._listen_active:
+                try:
+                    adpcm_block = await asyncio.wait_for(
+                        self._audio_input_buffer.get(), timeout=2.0
+                    )
+                except asyncio.TimeoutError:
+                    continue
+
+                # Decode ADPCM block to 16-bit PCM
+                pcm_data = self._decode_ima_adpcm(adpcm_block)
+                if not pcm_data:
+                    continue
+
+                blocks_decoded += 1
+                if blocks_decoded == 1:
+                    _LOGGER.warning(
+                        "✓ First audio block decoded from doorbell mic (%d bytes PCM)",
+                        len(pcm_data),
+                    )
+                elif blocks_decoded % 100 == 0:
+                    _LOGGER.info("Audio input: %d blocks decoded from doorbell mic", blocks_decoded)
+
+                # Send PCM to Gemini via callback
+                await self._on_audio_received(pcm_data)
+
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            _LOGGER.warning("Audio input processor error", exc_info=True)
+        finally:
+            _LOGGER.warning("Audio input processor ended (%d blocks decoded)", blocks_decoded)
+
+    def _decode_ima_adpcm(self, adpcm_block: bytes) -> bytes:
+        """Decode a single IMA/DVI-4 ADPCM block to 16-bit PCM (little-endian).
+
+        Block layout (standard DVI-4):
+          - 2 bytes: initial predictor value (i16 LE)
+          - 1 byte: step table index (0–88)
+          - 1 byte: reserved (0)
+          - remaining bytes: packed 4-bit nibbles (2 samples per byte, low nibble first)
+
+        Returns raw 16-bit LE PCM bytes at the camera's native sample rate.
+        """
+        import struct as struct_mod  # noqa: PLC0415
+
+        if len(adpcm_block) < 8:  # Need at least header + some data
+            return b""
+
+        IMA_INDEX_TABLE = [-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8]
+        IMA_STEP_TABLE = [
+            7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31,
+            34, 37, 41, 45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143,
+            157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544,
+            598, 658, 724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878,
+            2066, 2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358, 5894,
+            6484, 7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899, 15289, 16818,
+            18500, 20350, 22385, 24623, 27086, 29794, 32767,
+        ]
+
+        # Parse block header
+        predictor = struct_mod.unpack_from("<h", adpcm_block, 0)[0]
+        step_index = adpcm_block[2]
+        step_index = max(0, min(88, step_index))
+
+        # Decode nibbles
+        nibble_data = adpcm_block[4:]
+        samples = []
+
+        for byte_val in nibble_data:
+            # Low nibble first, then high nibble
+            for nibble in (byte_val & 0x0F, (byte_val >> 4) & 0x0F):
+                step = IMA_STEP_TABLE[step_index]
+
+                # Decode nibble to difference
+                diff = step >> 3
+                if nibble & 4:
+                    diff += step
+                if nibble & 2:
+                    diff += step >> 1
+                if nibble & 1:
+                    diff += step >> 2
+
+                if nibble & 8:
+                    predictor -= diff
+                else:
+                    predictor += diff
+
+                # Clamp to 16-bit range
+                predictor = max(-32768, min(32767, predictor))
+
+                # Update step index
+                step_index += IMA_INDEX_TABLE[nibble]
+                step_index = max(0, min(88, step_index))
+
+                samples.append(predictor)
+
+        if not samples:
+            return b""
+
+        return struct_mod.pack(f"<{len(samples)}h", *samples)
+
+    async def _stop_baichuan_listen(self) -> None:
+        """Stop the Baichuan preview stream (cmd 4)."""
+        if not self._listen_bc:
+            return
+        try:
+            # cmd 4 = stop preview
+            stop_body = (
+                '<?xml version="1.0" encoding="UTF-8" ?>\n'
+                "<body>\n"
+                '<Preview version="1.1">\n'
+                "<channelId>0</channelId>\n"
+                "<handle>0</handle>\n"
+                "</Preview>\n"
+                "</body>\n"
+            )
+            await self._listen_bc.send(cmd_id=4, channel=0, body=stop_body)
+            _LOGGER.info("Baichuan preview stream stopped (cmd 4)")
+        except Exception as exc:
+            _LOGGER.debug("Preview stop error (non-critical): %s", exc)
+
+        # Restore original push callback
+        if self._original_push_callback and self._listen_bc:
+            try:
+                protocol = self._listen_bc._protocol
+                if protocol:
+                    protocol._push_callback = self._original_push_callback
             except Exception:
-                _LOGGER.warning("go2rtc audio receive error, retrying in 2s", exc_info=True)
-                await asyncio.sleep(2)
+                pass
+        self._original_push_callback = None
 
 
 async def auto_configure_reolink(
@@ -1165,10 +1471,13 @@ class AudioInterruptDetector:
 
     def __init__(
         self,
-        on_interrupt_detected: Any,  # Callable[[], Awaitable[None]]
+        on_interrupt_detected: Any | None = None,  # Callable[[], Awaitable[None]] | None
         on_silence_timeout: Any | None = None,  # Callable[[], Awaitable[None]] | None
+        *,
+        on_interrupt: Any | None = None,
+        energy_threshold: float | None = None,
     ) -> None:
-        self._on_interrupt_detected = on_interrupt_detected
+        self._on_interrupt_detected = on_interrupt_detected or on_interrupt
         self._on_silence_timeout = on_silence_timeout
         self._ai_is_speaking = False
         self._high_energy_count = 0
@@ -1176,6 +1485,8 @@ class AudioInterruptDetector:
         self._silence_task: asyncio.Task[None] | None = None
         self._active = False
         self._triggered = False
+        if energy_threshold is not None:
+            self.SPEECH_THRESHOLD = energy_threshold
 
     def start(self) -> None:
         self._active = True

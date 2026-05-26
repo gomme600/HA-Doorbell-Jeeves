@@ -12,7 +12,7 @@ from google import genai
 from google.genai import types
 
 from .client_base import BaseRealtimeClient
-from .const import AUDIO_SAMPLE_RATE
+from .const import AUDIO_INPUT_SAMPLE_RATE
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -117,7 +117,10 @@ class GeminiLiveClient(BaseRealtimeClient):
             return
         try:
             await self._session.send_realtime_input(
-                audio=types.Blob(data=pcm_bytes, mime_type=f"audio/pcm;rate={AUDIO_SAMPLE_RATE}")
+                audio=types.Blob(
+                    data=pcm_bytes,
+                    mime_type=f"audio/pcm;rate={AUDIO_INPUT_SAMPLE_RATE}",
+                )
             )
         except Exception:
             _LOGGER.exception("Failed to send audio")

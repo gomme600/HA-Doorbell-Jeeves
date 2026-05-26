@@ -47,6 +47,7 @@ from .const import (
     CONF_FRAME_QUALITY,
     CONF_IDENTITY_MODE,
     CONF_MEDIA_PLAYER_ENTITY,
+    CONF_MEMORY_RETENTION_DAYS,
     CONF_MODEL,
     CONF_PIN_CODE,
     CONF_PROVIDER,
@@ -64,6 +65,7 @@ from .const import (
     DEFAULT_FRAME_MAX_HEIGHT,
     DEFAULT_FRAME_MAX_WIDTH,
     DEFAULT_FRAME_QUALITY,
+    DEFAULT_MEMORY_RETENTION_DAYS,
     DEFAULT_MODEL_GEMINI,
     DEFAULT_MODEL_OPENAI,
     DEFAULT_SESSION_TIMEOUT,
@@ -259,6 +261,9 @@ class DoorbellJeevesConfigFlow(ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             self._data[CONF_SYSTEM_PROMPT] = user_input[CONF_SYSTEM_PROMPT]
             self._data[CONF_SESSION_TIMEOUT] = user_input.get(CONF_SESSION_TIMEOUT, DEFAULT_SESSION_TIMEOUT)
+            self._data[CONF_MEMORY_RETENTION_DAYS] = user_input.get(
+                CONF_MEMORY_RETENTION_DAYS, DEFAULT_MEMORY_RETENTION_DAYS
+            )
             return await self.async_step_triggers_setup()
 
         return self.async_show_form(
@@ -274,6 +279,14 @@ class DoorbellJeevesConfigFlow(ConfigFlow, domain=DOMAIN):
                         default=self._data.get(CONF_SESSION_TIMEOUT, DEFAULT_SESSION_TIMEOUT),
                     ): NumberSelector(
                         NumberSelectorConfig(min=10, max=600, step=10, mode=NumberSelectorMode.SLIDER)
+                    ),
+                    vol.Required(
+                        CONF_MEMORY_RETENTION_DAYS,
+                        default=self._data.get(
+                            CONF_MEMORY_RETENTION_DAYS, DEFAULT_MEMORY_RETENTION_DAYS
+                        ),
+                    ): NumberSelector(
+                        NumberSelectorConfig(min=1, max=365, step=1, mode=NumberSelectorMode.SLIDER)
                     ),
                 }
             ),
@@ -392,6 +405,12 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                         CONF_SESSION_TIMEOUT,
                         default=self._data.get(CONF_SESSION_TIMEOUT, DEFAULT_SESSION_TIMEOUT),
                     ): NumberSelector(NumberSelectorConfig(min=10, max=600, step=10, mode=NumberSelectorMode.SLIDER)),
+                    vol.Required(
+                        CONF_MEMORY_RETENTION_DAYS,
+                        default=self._data.get(
+                            CONF_MEMORY_RETENTION_DAYS, DEFAULT_MEMORY_RETENTION_DAYS
+                        ),
+                    ): NumberSelector(NumberSelectorConfig(min=1, max=365, step=1, mode=NumberSelectorMode.SLIDER)),
                     vol.Optional(CONF_VALIDATOR_MODEL, default=self._data.get(CONF_VALIDATOR_MODEL, DEFAULT_VALIDATOR_MODEL)): TextSelector(),
                 }
             ),
@@ -784,10 +803,14 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
 
     async def async_step_triggers(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         from .const import (  # noqa: PLC0415
+            CONF_CHIME_DELAY,
+            CONF_SILENCE_TIMEOUT,
             CONF_TAKEOVER_AUDIO_ENERGY,
             CONF_TAKEOVER_ENERGY_THRESHOLD,
             CONF_TAKEOVER_POLL_INTERVAL,
             CONF_TAKEOVER_REOLINK_API,
+            DEFAULT_CHIME_DELAY,
+            DEFAULT_SILENCE_TIMEOUT,
             DEFAULT_TAKEOVER_ENERGY_THRESHOLD,
             DEFAULT_TAKEOVER_POLL_INTERVAL,
         )
@@ -801,6 +824,8 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
             self._data[CONF_TAKEOVER_AUDIO_ENERGY] = user_input.get(CONF_TAKEOVER_AUDIO_ENERGY, False)
             self._data[CONF_TAKEOVER_ENERGY_THRESHOLD] = user_input.get(CONF_TAKEOVER_ENERGY_THRESHOLD, DEFAULT_TAKEOVER_ENERGY_THRESHOLD)
             self._data[CONF_TAKEOVER_POLL_INTERVAL] = user_input.get(CONF_TAKEOVER_POLL_INTERVAL, DEFAULT_TAKEOVER_POLL_INTERVAL)
+            self._data[CONF_CHIME_DELAY] = user_input.get(CONF_CHIME_DELAY, DEFAULT_CHIME_DELAY)
+            self._data[CONF_SILENCE_TIMEOUT] = user_input.get(CONF_SILENCE_TIMEOUT, DEFAULT_SILENCE_TIMEOUT)
             return self._save_options()
 
         current_start = self._data.get("start_triggers_config", [])
@@ -823,6 +848,18 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                 default=self._data.get(CONF_TAKEOVER_ENERGY_THRESHOLD, DEFAULT_TAKEOVER_ENERGY_THRESHOLD),
             )
         ] = NumberSelector(NumberSelectorConfig(min=500, max=10000, step=100, mode=NumberSelectorMode.SLIDER))
+        schema[
+            vol.Optional(
+                CONF_CHIME_DELAY,
+                default=self._data.get(CONF_CHIME_DELAY, DEFAULT_CHIME_DELAY),
+            )
+        ] = NumberSelector(NumberSelectorConfig(min=0.0, max=10.0, step=0.5, mode=NumberSelectorMode.SLIDER))
+        schema[
+            vol.Optional(
+                CONF_SILENCE_TIMEOUT,
+                default=self._data.get(CONF_SILENCE_TIMEOUT, DEFAULT_SILENCE_TIMEOUT),
+            )
+        ] = NumberSelector(NumberSelectorConfig(min=5, max=300, step=5, mode=NumberSelectorMode.SLIDER))
         if is_reolink:
             schema[
                 vol.Optional(

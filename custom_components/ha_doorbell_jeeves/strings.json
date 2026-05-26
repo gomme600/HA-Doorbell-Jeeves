@@ -44,7 +44,8 @@
         "description": "Define the AI agent's personality and rules. This is the core instruction set that governs how Jeeves behaves, greets visitors, and makes decisions.",
         "data": {
           "system_prompt": "System Prompt",
-          "session_timeout": "Session Timeout"
+          "session_timeout": "Session Timeout",
+          "memory_retention_days": "Memory Retention (days)"
         }
       },
       "triggers_setup": {
@@ -90,6 +91,7 @@
           "model": "Model Name",
           "voice": "Voice Name",
           "session_timeout": "Session Timeout",
+          "memory_retention_days": "Memory Retention (days)",
           "validator_model": "Security Validator Model"
         }
       },
@@ -224,6 +226,8 @@
           "takeover_reolink_api": "Reolink API Takeover Detection (polls camera talk state)",
           "takeover_audio_energy": "Audio Energy Takeover Detection (monitors mic loudness)",
           "takeover_energy_threshold": "Audio Energy Threshold (higher = less sensitive)",
+          "chime_delay": "Doorbell Chime Delay",
+          "silence_timeout": "Silence Auto-Hangup Timeout",
           "takeover_poll_interval": "Reolink Poll Interval"
         }
       },

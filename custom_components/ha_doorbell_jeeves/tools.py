@@ -90,6 +90,7 @@ def build_system_context(store: DataStore, hass: HomeAssistant) -> str:
         lines.append("\n--- SMART CAPABILITIES ---")
         lines.append("• get_entity_history: View recent state changes for any managed entity")
         lines.append("• search_events: Search across all entity history for specific events/objects")
+        lines.append("• recall_memories: Search past doorbell conversations for useful context")
         lines.append("These are useful for answering questions about what happened recently.")
 
     # Notification targets
@@ -235,6 +236,44 @@ def build_gemini_tools(store: DataStore) -> list[Any]:
                 "required": ["query"],
             },
         ))
+
+    # ─── Session memory and hangup tools ─────────────────────────────────────
+    declarations.append(types.FunctionDeclaration(
+        name="recall_memories",
+        description=(
+            "Search past doorbell interactions. Use when a visitor references a previous "
+            "visit or you need context about past events."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search term (visitor name, event description, etc.)",
+                },
+                "hours_back": {
+                    "type": "integer",
+                    "description": "How many hours back to search (default 72)",
+                },
+            },
+        },
+    ))
+    declarations.append(types.FunctionDeclaration(
+        name="end_conversation",
+        description=(
+            "End the doorbell conversation. Call this when the visitor says goodbye, "
+            "leaves, or the conversation is complete."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": "Brief reason for ending (e.g., 'visitor said goodbye')",
+                }
+            },
+        },
+    ))
 
     # ─── Custom actions ───────────────────────────────────────────────────────
     for entity in store.managed_entities:
@@ -424,6 +463,46 @@ def build_openai_tools(store: DataStore) -> list[dict[str, Any]]:
                 "required": ["query"],
             },
         })
+
+    # Session memory and hangup tools
+    tools.append({
+        "type": "function",
+        "name": "recall_memories",
+        "description": (
+            "Search past doorbell interactions. Use when a visitor references a previous "
+            "visit or you need context about past events."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search term (visitor name, event description, etc.)",
+                },
+                "hours_back": {
+                    "type": "integer",
+                    "description": "How many hours back to search (default 72)",
+                },
+            },
+        },
+    })
+    tools.append({
+        "type": "function",
+        "name": "end_conversation",
+        "description": (
+            "End the doorbell conversation. Call this when the visitor says goodbye, "
+            "leaves, or the conversation is complete."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": "Brief reason for ending (e.g., 'visitor said goodbye')",
+                }
+            },
+        },
+    })
 
     # Custom actions
     for entity in store.managed_entities:
