@@ -46,6 +46,14 @@
           "system_prompt": "System Prompt",
           "session_timeout": "Session Timeout"
         }
+      },
+      "triggers_setup": {
+        "title": "Triggers",
+        "description": "Choose which entities start Jeeves automatically and which entities stop the session.",
+        "data": {
+          "start_entities": "Start Trigger Entities",
+          "stop_entities": "Stop Trigger Entities"
+        }
       }
     },
     "error": {
@@ -111,14 +119,18 @@
         "title": "Entities & Actions",
         "description": "Manage the entities and actions available to the AI agent. {entity_summary}",
         "menu_options": {
-          "add_camera": "📷 Add Camera (on-demand viewing)",
-          "add_calendar": "📅 Add Calendar (schedule access)",
-          "add_entity": "🏠 Add Other Entity",
-          "add_action": "⚡ Add Action to Entity",
-          "add_notification": "🔔 Add Notification Target",
-          "remove_entity": "➖ Remove Entity",
-          "remove_notification": "🗑️ Remove Notification Target",
-          "init": "← Back to Menu"
+          "add_camera": "\ud83d\udcf7 Add Camera (on-demand viewing)",
+          "add_calendar": "\ud83d\udcc5 Add Calendar (schedule access)",
+          "add_entity": "\ud83c\udfe0 Add Other Entity",
+          "edit_entity": "\u270f\ufe0f Edit Entity",
+          "add_action": "\u26a1 Add Action to Entity",
+          "edit_action": "\ud83d\udee0\ufe0f Edit Action",
+          "add_standalone_action": "\ud83e\udde9 Add Standalone Action",
+          "add_notification": "\ud83d\udd14 Add Notification Target",
+          "remove_entity": "\u2796 Remove Entity",
+          "remove_action": "\ud83d\uddd1\ufe0f Remove Action",
+          "remove_notification": "\ud83d\uddd1\ufe0f Remove Notification Target",
+          "init": "\u2190 Back to Menu"
         }
       },
       "add_camera": {
@@ -136,7 +148,7 @@
         "data": {
           "entity_id": "Calendar Entity",
           "name": "Calendar Name (e.g., 'Owner's Work Schedule')",
-          "description": "Description (e.g., 'Main work and personal calendar — use to determine availability')"
+          "description": "Description (e.g., 'Main work and personal calendar \u2014 use to determine availability')"
         }
       },
       "add_entity": {
@@ -160,13 +172,17 @@
       },
       "add_action": {
         "title": "Add Action",
-        "description": "Create a custom action the AI can perform. Actions are tools the AI calls during conversation — e.g., 'Toggle the porch light' calls `light.toggle`.",
+        "description": "Create a custom action the AI can perform. Use the main action plus up to four optional follow-up steps.",
         "data": {
           "target_entity": "Target Entity",
           "action_id": "Action ID (e.g., unlock_gate)",
           "action_name": "Action Name (e.g., Unlock the gate)",
           "action_description": "Description (tells AI when to use this)",
-          "service": "HA Service (e.g., lock.unlock)",
+          "action_config": "Step 1 Action",
+          "step_2_config": "Step 2 Action (optional)",
+          "step_3_config": "Step 3 Action (optional)",
+          "step_4_config": "Step 4 Action (optional)",
+          "step_5_config": "Step 5 Action (optional)",
           "action_security_mode": "Security Mode",
           "action_visual_match": "Require Visual Match",
           "action_camera_feed": "Send Camera to Validator",
@@ -179,7 +195,7 @@
         "title": "Add Notification Target",
         "description": "Add a notification service the AI can use to alert you (e.g., push notification, alarm).",
         "data": {
-          "service": "Service (e.g., notify.mobile_app_phone)",
+          "service": "Notification Service",
           "name": "Display Name (e.g., Admin Phone)",
           "description": "Description (tells AI when to use this)"
         }
@@ -215,10 +231,10 @@
         "title": "Known Identities",
         "description": "Manage known people, animals, and objects that the AI should recognize. {identity_summary}",
         "menu_options": {
-          "add_identity": "➕ Add Identity",
-          "remove_identity": "➖ Remove Identity",
-          "identity_settings": "⚙️ Identity Detection Settings",
-          "init": "← Back to Menu"
+          "add_identity": "\u2795 Add Identity",
+          "remove_identity": "\u2796 Remove Identity",
+          "identity_settings": "\u2699\ufe0f Identity Detection Settings",
+          "init": "\u2190 Back to Menu"
         }
       },
       "add_identity": {
@@ -253,6 +269,67 @@
         "description": "Edit the AI agent's core instructions. This defines personality, rules, and behavior boundaries.",
         "data": {
           "system_prompt": "System Prompt"
+        }
+      },
+      "edit_entity": {
+        "title": "Edit Managed Entity",
+        "description": "Select an entity to edit, then update its current values. Existing actions are preserved.",
+        "data": {
+          "entity_id": "Managed Entity",
+          "name": "Display Name (for AI)",
+          "description": "Description (what is this entity?)",
+          "security_mode": "Default Security Mode",
+          "require_visual_match": "Require Visual Identity Match",
+          "require_camera_feed": "Send Camera Feed to Validator"
+        }
+      },
+      "edit_action": {
+        "title": "Edit Action",
+        "description": "Select any configured action, then update its current definition and optional extra steps.",
+        "data": {
+          "action_ref": "Action",
+          "target_entity": "Target Entity",
+          "action_id": "Action ID",
+          "action_name": "Action Name",
+          "action_description": "Description",
+          "action_config": "Step 1 Action",
+          "step_2_config": "Step 2 Action (optional)",
+          "step_3_config": "Step 3 Action (optional)",
+          "step_4_config": "Step 4 Action (optional)",
+          "step_5_config": "Step 5 Action (optional)",
+          "action_security_mode": "Security Mode",
+          "action_visual_match": "Require Visual Match",
+          "action_camera_feed": "Send Camera to Validator",
+          "max_per_session": "Max Uses Per Session (0=unlimited)",
+          "cooldown_seconds": "Cooldown Between Uses (seconds)",
+          "validator_prompt": "Custom Validator Instructions (optional)"
+        }
+      },
+      "add_standalone_action": {
+        "title": "Add Standalone Action",
+        "description": "Create an action that is not tied to one managed entity. Useful for scenes, scripts, or grouped actions.",
+        "data": {
+          "action_id": "Action ID (e.g., start_arrival_scene)",
+          "action_name": "Action Name",
+          "action_description": "Description",
+          "action_config": "Step 1 Action",
+          "step_2_config": "Step 2 Action (optional)",
+          "step_3_config": "Step 3 Action (optional)",
+          "step_4_config": "Step 4 Action (optional)",
+          "step_5_config": "Step 5 Action (optional)",
+          "action_security_mode": "Security Mode",
+          "action_visual_match": "Require Visual Match",
+          "action_camera_feed": "Send Camera to Validator",
+          "max_per_session": "Max Uses Per Session (0=unlimited)",
+          "cooldown_seconds": "Cooldown Between Uses (seconds)",
+          "validator_prompt": "Custom Validator Instructions (optional)"
+        }
+      },
+      "remove_action": {
+        "title": "Remove Action",
+        "description": "Select an action to remove.",
+        "data": {
+          "action_ref": "Action to Remove"
         }
       }
     }

@@ -295,6 +295,9 @@ class JeevesSessionManager:
             provider, model, fps, dual_model,
         )
 
+        # Send initial greeting prompt to make the AI speak first
+        await self._send_initial_greeting()
+
     async def async_stop_session(self) -> None:
         """Tear down the active session."""
         if not self._active:
@@ -633,8 +636,24 @@ class JeevesSessionManager:
 
     # ─── Callbacks ────────────────────────────────────────────────────────────
 
+    async def _send_initial_greeting(self) -> None:
+        """Send an initial trigger message so the AI starts speaking immediately."""
+        if not self._client:
+            return
+        trigger_msg = (
+            "[SYSTEM] A visitor just rang the doorbell. "
+            "Greet them now according to your instructions. "
+            "If you can see them in the camera feed, describe or acknowledge them naturally."
+        )
+        try:
+            await self._client.inject_context(trigger_msg)
+            _LOGGER.warning("Sent initial greeting trigger to AI model")
+        except Exception:
+            _LOGGER.exception("Failed to send initial greeting trigger")
+
     def _handle_audio_output(self, audio_bytes: bytes) -> None:
         """Handle audio output from the AI model."""
+        _LOGGER.warning("Audio output received from AI: %d bytes", len(audio_bytes))
         # If Reolink audio handler is active, send directly to doorbell speaker
         if self._audio_handler and self._audio_handler.is_active:
             self.hass.async_create_task(self._audio_handler.send_audio(audio_bytes))
