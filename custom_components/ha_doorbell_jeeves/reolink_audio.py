@@ -329,6 +329,7 @@ class ReolinkAudioHandler:
 
     async def _ffmpeg_output_loop(self) -> None:
         """Read transcoded PCMA from ffmpeg stdout and send to go2rtc WebSocket."""
+        send_count = 0
         try:
             while self._active and self._ffmpeg_proc:
                 # Read in 320-byte chunks (40ms of 8kHz mono alaw = 320 bytes)
@@ -339,9 +340,17 @@ class ReolinkAudioHandler:
                 if self._send_ws and not self._send_ws.closed:
                     try:
                         await self._send_ws.send_bytes(chunk)
+                        send_count += 1
+                        if send_count == 1:
+                            _LOGGER.warning("First audio chunk sent to doorbell speaker")
                     except Exception:
-                        _LOGGER.warning("Failed to send audio via send WS")
-                        break
+                        if send_count < 5:
+                            _LOGGER.warning("Failed to send audio chunk #%d via WS", send_count)
+                        # Don't break — WS might reconnect
+                        await asyncio.sleep(0.05)
+                else:
+                    # WS not ready yet, wait briefly
+                    await asyncio.sleep(0.05)
         except asyncio.CancelledError:
             pass
         except Exception:
@@ -349,7 +358,8 @@ class ReolinkAudioHandler:
 
     async def _send_ws_loop(self) -> None:
         """Maintain a persistent WebSocket connection for sending audio to go2rtc backchannel."""
-        ws_url = f"{self._go2rtc_url}/api/ws?src={self._stream_name}"
+        # Use dst= to indicate we're PRODUCING audio for this stream's backchannel
+        ws_url = f"{self._go2rtc_url}/api/ws?src={self._stream_name}&media=&backchannel=1"
         _LOGGER.warning("Send WS connecting to: %s", ws_url)
 
         while self._active:
@@ -359,13 +369,17 @@ class ReolinkAudioHandler:
                 async with self._session.ws_connect(ws_url) as ws:
                     self._send_ws = ws
                     _LOGGER.warning("Send WS connected for backchannel audio")
-                    # Keep alive — just wait for close
-                    async for msg in ws:
-                        if not self._active:
-                            break
-                        # We don't expect messages on this WS, but handle close
-                        if msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
-                            break
+                    # Keep connection alive by reading (discard any incoming data)
+                    while self._active:
+                        try:
+                            msg = await asyncio.wait_for(ws.receive(), timeout=30)
+                            if msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE):
+                                _LOGGER.warning("Send WS closed by server: %s", msg.type)
+                                break
+                            # Discard any incoming data (video/audio from stream)
+                        except asyncio.TimeoutError:
+                            # Send ping to keep alive
+                            await ws.ping()
             except asyncio.CancelledError:
                 break
             except Exception:
