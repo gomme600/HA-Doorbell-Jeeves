@@ -20,10 +20,13 @@ from homeassistant.helpers import config_validation as cv
 from .const import (
     AUDIO_MODE_REOLINK,
     AUDIO_OUTPUT_GO2RTC,
+    CONF_API_KEY,
     CONF_AUDIO_MODE,
     CONF_AUDIO_OUTPUT_MODE,
     CONF_CAMERA_ENTITY,
+    CONF_MODEL,
     CONF_REOLINK_ENTRY_ID,
+    DEFAULT_MODEL_GEMINI,
     DOMAIN,
     SERVICE_ADD_ACTION,
     SERVICE_ADD_ENTITY,
@@ -47,6 +50,18 @@ JeevesData = JeevesSessionManager
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Doorbell Jeeves from a config entry."""
     hass.data.setdefault(DOMAIN, {})
+
+    # ─── Data migration: fix invalid model names from older configs ───
+    _INVALID_MODELS = {"gemini-2.5-flash-native-audio-dialog"}
+    stored_model = entry.data.get(CONF_MODEL) or entry.options.get(CONF_MODEL)
+    if stored_model in _INVALID_MODELS:
+        new_data = dict(entry.data)
+        new_data[CONF_MODEL] = DEFAULT_MODEL_GEMINI
+        hass.config_entries.async_update_entry(entry, data=new_data)
+        _LOGGER.info(
+            "Migrated model %s → %s for entry %s",
+            stored_model, DEFAULT_MODEL_GEMINI, entry.entry_id[:8],
+        )
 
     # Create session manager
     manager = JeevesSessionManager(hass, entry)
