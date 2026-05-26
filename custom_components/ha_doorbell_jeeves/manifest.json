@@ -1,13 +1,24 @@
 {
   "domain": "ha_doorbell_jeeves",
   "name": "Doorbell Jeeves",
-  "codeowners": ["@gomme600"],
+  "codeowners": [
+    "@gomme600"
+  ],
   "config_flow": true,
-  "dependencies": ["camera"],
-  "after_dependencies": ["go2rtc", "reolink"],
+  "dependencies": [
+    "camera"
+  ],
+  "after_dependencies": [
+    "go2rtc",
+    "reolink"
+  ],
   "documentation": "https://github.com/gomme600/HA-Doorbell-Jeeves",
   "iot_class": "cloud_push",
   "issue_tracker": "https://github.com/gomme600/HA-Doorbell-Jeeves/issues",
-  "requirements": ["google-genai>=1.14.0", "openai>=1.40.0", "Pillow>=10.0.0"],
-  "version": "2.0.0"
+  "requirements": [
+    "google-genai>=1.14.0",
+    "openai>=1.40.0",
+    "Pillow>=10.0.0"
+  ],
+  "version": "2.4.0"
 }
