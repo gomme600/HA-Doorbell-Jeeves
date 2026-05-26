@@ -1160,12 +1160,12 @@ class ReolinkAudioHandler:
     def _extract_audio_from_stream(self, body: bytes) -> None:
         """Parse BcMedia packets from a cmd 3 stream chunk and extract ADPCM audio.
 
-        BcMedia multiplexes video and audio. We look for ADPCM packets
-        (magic 0x62773130 = "01wb" LE) and AAC packets (magic 0x62773530 = "05wb" LE).
-        We only extract ADPCM since that matches our codec.
+        BcMedia multiplexes video and audio. We ONLY extract ADPCM packets
+        using fast bytes.find() to skip video frames efficiently.
+        This runs in the protocol callback (event loop) so must be FAST.
 
         BcMedia ADPCM packet layout:
-          - 4 bytes: magic (0x62773130)
+          - 4 bytes: magic (0x62773130 = "01wb" LE)
           - 2 bytes: payload_size (includes 4 bytes sub-header)
           - 2 bytes: payload_size (repeated)
           - 2 bytes: data magic (0x0100)
@@ -1176,75 +1176,51 @@ class ReolinkAudioHandler:
         import struct as struct_mod  # noqa: PLC0415
 
         BCMEDIA_MAGIC_ADPCM = b"\x30\x31\x77\x62"  # 0x62773130 LE = "01wb"
-        BCMEDIA_MAGIC_AAC = b"\x30\x35\x77\x62"    # 0x62773530 LE = "05wb"
-        # Video frame magics (skip these)
-        BCMEDIA_MAGIC_IFRAME = b"\x30\x30\x64\x63"  # "00dc" LE
-        BCMEDIA_MAGIC_PFRAME = b"\x30\x31\x64\x63"  # "01dc" LE
-        BCMEDIA_MAGIC_INFO = b"\x30\x30\x62\x63"    # "00bc" LE
 
-        pos = 0
-        body_len = len(body)
-
-        # Diagnostic: log first call and first bytes
+        # Diagnostic logging (first few calls only)
         if not hasattr(self, "_stream_extract_count"):
             self._stream_extract_count = 0
         self._stream_extract_count += 1
-        if self._stream_extract_count <= 5:
+        if self._stream_extract_count <= 3:
             _LOGGER.warning(
                 "Stream data #%d: %d bytes, first16hex=%s",
-                self._stream_extract_count, body_len, body[:16].hex() if body_len >= 16 else body.hex(),
+                self._stream_extract_count, len(body),
+                body[:16].hex() if len(body) >= 16 else body.hex(),
             )
 
+        # Fast scan: use bytes.find() to jump directly to ADPCM packets (C-level speed)
+        # This avoids byte-by-byte scanning of large video frames
+        pos = body.find(BCMEDIA_MAGIC_ADPCM)
         adpcm_found = 0
-        aac_found = 0
 
-        while pos + 12 <= body_len:
-            magic = body[pos:pos + 4]
+        while pos >= 0 and pos + 12 <= len(body):
+            # Read payload_size from BcMedia header
+            payload_size = struct_mod.unpack_from("<H", body, pos + 4)[0]
 
-            if magic == BCMEDIA_MAGIC_ADPCM:
-                adpcm_found += 1
+            # ADPCM data starts after: 8 (packet header) + 4 (sub-header: magic16 + half_block16)
+            data_start = pos + 12
+            adpcm_size = payload_size - 4  # subtract sub-header
+            data_end = data_start + adpcm_size
 
-        while pos + 12 <= body_len:
-            magic = body[pos:pos + 4]
+            if data_end <= len(body) and adpcm_size > 4:
+                adpcm_block = body[data_start:data_end]
+                try:
+                    self._audio_input_buffer.put_nowait(adpcm_block)
+                    adpcm_found += 1
+                except asyncio.QueueFull:
+                    pass
 
-            if magic == BCMEDIA_MAGIC_ADPCM:
-                # Parse ADPCM audio packet
-                payload_size = struct_mod.unpack_from("<H", body, pos + 4)[0]
-                # Total packet size: 8 (header) + payload_size + padding
-                data_start = pos + 8 + 4  # skip header(8) + sub-header(4: magic+half_block)
-                adpcm_size = payload_size - 4  # subtract sub-header size
-                data_end = data_start + adpcm_size
+            # Skip past this packet (with 8-byte alignment padding) and find next
+            total = 8 + payload_size
+            total += (-total) % 8
+            next_search = pos + max(total, 12)
+            pos = body.find(BCMEDIA_MAGIC_ADPCM, next_search)
 
-                if data_end <= body_len and adpcm_size > 4:
-                    adpcm_block = body[data_start:data_end]
-                    try:
-                        self._audio_input_buffer.put_nowait(adpcm_block)
-                    except asyncio.QueueFull:
-                        pass  # Drop oldest audio if processor can't keep up
-
-                # Advance past this packet (with padding)
-                total = 8 + payload_size
-                total += (-total) % 8  # padding to 8-byte alignment
-                pos += total
-
-            elif magic in (BCMEDIA_MAGIC_AAC, BCMEDIA_MAGIC_IFRAME,
-                           BCMEDIA_MAGIC_PFRAME, BCMEDIA_MAGIC_INFO):
-                # Skip non-ADPCM packets
-                if pos + 8 <= body_len:
-                    payload_size = struct_mod.unpack_from("<H", body, pos + 4)[0]
-                    total = 8 + payload_size
-                    total += (-total) % 8
-                    pos += total
-                else:
-                    break
-
-            else:
-                # Unknown magic or encrypted Extension header — skip byte by byte
-                # This handles the initial Extension XML that precedes media data
-                pos += 1
-
-        if self._stream_extract_count <= 10 and (adpcm_found or aac_found):
-            _LOGGER.warning("Stream #%d: found %d ADPCM, %d AAC packets", self._stream_extract_count, adpcm_found, aac_found)
+        if self._stream_extract_count <= 10 and adpcm_found:
+            _LOGGER.warning(
+                "Stream #%d: extracted %d ADPCM blocks",
+                self._stream_extract_count, adpcm_found,
+            )
 
     async def _audio_input_processor(self) -> None:
         """Process ADPCM audio blocks from the Baichuan stream into PCM for Gemini.
