@@ -18,6 +18,7 @@ class EntityAction:
     description: str  # Sent to the AI as the tool description
     service: str  # HA service to call (e.g., "lock.unlock")
     service_data: dict[str, Any] = field(default_factory=dict)
+    steps: list[dict[str, Any]] = field(default_factory=list)
 
     # Per-action security policy
     security_mode: str = "auto"
@@ -34,6 +35,7 @@ class EntityAction:
             "description": self.description,
             "service": self.service,
             "service_data": self.service_data,
+            "steps": self.steps,
             "security_mode": self.security_mode,
             "require_visual_match": self.require_visual_match,
             "require_camera_feed": self.require_camera_feed,
@@ -50,6 +52,7 @@ class EntityAction:
             description=data.get("description", ""),
             service=data["service"],
             service_data=data.get("service_data", {}),
+            steps=data.get("steps", []),
             security_mode=data.get("security_mode", "auto"),
             require_visual_match=data.get("require_visual_match", False),
             require_camera_feed=data.get("require_camera_feed", False),

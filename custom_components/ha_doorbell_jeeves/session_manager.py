@@ -168,11 +168,20 @@ class JeevesSessionManager:
         else:
             _LOGGER.warning("go2rtc not available — 2-way audio may not work")
 
+    async def _safe_start_session(self) -> None:
+        """Wrapper for async_start_session that catches and logs all errors."""
+        try:
+            await self.async_start_session()
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Failed to start session from trigger")
+
     async def async_start_session(self) -> None:
         """Start the AI concierge session."""
         if self._active:
             _LOGGER.warning("Session already active — ignoring")
             return
+
+        _LOGGER.warning("async_start_session: beginning startup sequence")
 
         # Lazy Reolink go2rtc setup (deferred from entry load for timing)
         if getattr(self, "reolink_needs_setup", False):
@@ -189,6 +198,11 @@ class JeevesSessionManager:
             model = DEFAULT_MODEL_GEMINI
             _LOGGER.warning("Replaced invalid model %s → %s", config.get(CONF_MODEL), model)
         dual_model = config.get(CONF_DUAL_MODEL_ENABLED, False)
+
+        _LOGGER.warning(
+            "Session config: provider=%s, model=%s, audio_mode=%s, camera=%s",
+            provider, model, config.get(CONF_AUDIO_MODE), config.get(CONF_CAMERA_ENTITY),
+        )
 
         # Build full system prompt with entity context
         base_prompt: str = config.get(CONF_SYSTEM_PROMPT, DEFAULT_SYSTEM_PROMPT)
@@ -245,12 +259,17 @@ class JeevesSessionManager:
         self._security.start_session()
 
         # Connect voice client
+        _LOGGER.warning("Connecting to %s API...", provider)
         await self._client.connect()
         self._active = True
+        _LOGGER.warning("Connected! Session is now active.")
 
         # ─── Start Reolink audio handler ──────────────────────────────────
         if config.get(CONF_AUDIO_MODE) == AUDIO_MODE_REOLINK:
+            _LOGGER.warning("Starting Reolink 2-way audio handler")
             await self._start_reolink_audio(config)
+        else:
+            _LOGGER.warning("Audio mode is '%s' (not reolink)", config.get(CONF_AUDIO_MODE))
 
         # ─── Start tool router ────────────────────────────────────────────
         if self._tool_router:
@@ -271,7 +290,7 @@ class JeevesSessionManager:
         self._register_stop_triggers()
 
         self.hass.bus.async_fire(EVENT_SESSION_STARTED, {"entry_id": self.entry.entry_id})
-        _LOGGER.info(
+        _LOGGER.warning(
             "Session started (provider=%s, model=%s, fps=%.1f, dual_model=%s)",
             provider, model, fps, dual_model,
         )
@@ -467,7 +486,7 @@ class JeevesSessionManager:
                     return
                 if not self._active:
                     _LOGGER.warning("Start trigger FIRED → starting session")
-                    self.hass.async_create_task(self.async_start_session())
+                    self.hass.async_create_task(self._safe_start_session())
                 else:
                     _LOGGER.warning("Start trigger matched but session already active")
 

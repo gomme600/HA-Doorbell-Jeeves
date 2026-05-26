@@ -28,6 +28,8 @@ from .const import (
     CONF_REOLINK_ENTRY_ID,
     DEFAULT_MODEL_GEMINI,
     DOMAIN,
+    GLOBAL_ACTIONS_ENTITY_ID,
+    GLOBAL_ACTIONS_ENTITY_NAME,
     SERVICE_ADD_ACTION,
     SERVICE_ADD_ENTITY,
     SERVICE_ADD_IDENTITY,
@@ -235,16 +237,36 @@ def _register_services(hass: HomeAssistant) -> None:
         manager = await _get_manager(call)
         if not manager:
             return
-        entity = manager.store.get_entity(call.data["entity_id"])
+        entity_id = call.data["entity_id"]
+        entity = manager.store.get_entity(entity_id)
+        if not entity and entity_id == GLOBAL_ACTIONS_ENTITY_ID:
+            entity = ManagedEntity(
+                entity_id=GLOBAL_ACTIONS_ENTITY_ID,
+                name=GLOBAL_ACTIONS_ENTITY_NAME,
+                description="Standalone actions not tied to a single entity.",
+            )
         if not entity:
-            _LOGGER.error("Entity %s not managed — add it first", call.data["entity_id"])
+            _LOGGER.error("Entity %s not managed — add it first", entity_id)
             return
+        steps = list(call.data.get("steps", []))
+        service_data = dict(call.data.get("service_data", {}))
+        if not steps and service_data:
+            if any(key in service_data for key in ("action", "service", "target", "data")):
+                steps = []
+            else:
+                steps = []
+        service = call.data.get("service") or ""
+        if not service and steps:
+            service = steps[0].get("action") or steps[0].get("service") or ""
+        if not service and service_data:
+            service = service_data.get("action") or service_data.get("service") or ""
         action = EntityAction(
             id=call.data["action_id"],
             name=call.data["action_name"],
             description=call.data.get("description", ""),
-            service=call.data["service"],
-            service_data=call.data.get("service_data", {}),
+            service=service,
+            service_data=service_data,
+            steps=steps,
             security_mode=call.data.get("security_mode", "auto"),
             require_visual_match=call.data.get("require_visual_match", False),
             require_camera_feed=call.data.get("require_camera_feed", False),
@@ -269,12 +291,13 @@ def _register_services(hass: HomeAssistant) -> None:
         DOMAIN, SERVICE_ADD_ACTION, handle_add_action,
         schema=vol.Schema({
             vol.Optional("entry_id"): cv.string,
-            vol.Required("entity_id"): cv.entity_id,
+            vol.Required("entity_id"): cv.string,
             vol.Required("action_id"): cv.string,
             vol.Required("action_name"): cv.string,
             vol.Optional("description", default=""): cv.string,
-            vol.Required("service"): cv.string,
+            vol.Optional("service", default=""): cv.string,
             vol.Optional("service_data", default={}): dict,
+            vol.Optional("steps", default=[]): list,
             vol.Optional("security_mode", default="auto"): cv.string,
             vol.Optional("require_visual_match", default=False): cv.boolean,
             vol.Optional("require_camera_feed", default=False): cv.boolean,

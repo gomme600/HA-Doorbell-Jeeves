@@ -19,6 +19,8 @@ from homeassistant.core import HomeAssistant
 from .const import (
     DEFAULT_CALENDAR_DAYS,
     DEFAULT_HISTORY_HOURS,
+    GLOBAL_ACTIONS_ENTITY_ID,
+    GLOBAL_ACTIONS_ENTITY_NAME,
     MAX_CALENDAR_DAYS,
     MAX_HISTORY_HOURS,
     TOOL_GET_CALENDAR,
@@ -32,6 +34,11 @@ from .store import DataStore
 _LOGGER = logging.getLogger(__name__)
 
 
+def _readable_entities(store: DataStore) -> list[ManagedEntity]:
+    """Return managed entities that should be exposed for read/history tools."""
+    return [entity for entity in store.managed_entities if entity.entity_id != GLOBAL_ACTIONS_ENTITY_ID]
+
+
 def build_system_context(store: DataStore, hass: HomeAssistant) -> str:
     """Build the entity/action context block appended to the system prompt.
 
@@ -40,10 +47,12 @@ def build_system_context(store: DataStore, hass: HomeAssistant) -> str:
     """
     lines: list[str] = []
 
-    # Readable entities (all managed entities)
-    if store.managed_entities:
+    readable_entities = _readable_entities(store)
+
+    # Readable entities (all managed entities except the standalone-actions pseudo entity)
+    if readable_entities:
         lines.append("\n--- AVAILABLE ENTITIES (you can read their state) ---")
-        for entity in store.managed_entities:
+        for entity in readable_entities:
             state = hass.states.get(entity.entity_id)
             current = state.state if state else "unavailable"
             lines.append(f"• {entity.name} [{entity.entity_id}]: {entity.description} (current: {current})")
@@ -57,10 +66,11 @@ def build_system_context(store: DataStore, hass: HomeAssistant) -> str:
     if all_actions:
         lines.append("\n--- AVAILABLE ACTIONS (you can call these as tools) ---")
         for entity, action in all_actions:
-            lines.append(f"• {action.name} (tool: {action.id}): {action.description} [on {entity.name}]")
+            entity_name = GLOBAL_ACTIONS_ENTITY_NAME if entity.entity_id == GLOBAL_ACTIONS_ENTITY_ID else entity.name
+            lines.append(f"• {action.name} (tool: {action.id}): {action.description} [on {entity_name}]")
 
     # Camera viewing capability
-    camera_entities = [e for e in store.managed_entities if e.entity_id.startswith("camera.")]
+    camera_entities = [e for e in readable_entities if e.entity_id.startswith("camera.")]
     if camera_entities:
         lines.append("\n--- CAMERAS (you can view any of these on demand) ---")
         for cam in camera_entities:
@@ -68,7 +78,7 @@ def build_system_context(store: DataStore, hass: HomeAssistant) -> str:
         lines.append("Use the 'view_camera' tool to get a live snapshot from any camera above.")
 
     # Calendar capability
-    calendar_entities = [e for e in store.managed_entities if e.entity_id.startswith("calendar.")]
+    calendar_entities = [e for e in readable_entities if e.entity_id.startswith("calendar.")]
     if calendar_entities:
         lines.append("\n--- CALENDARS (you can check schedules) ---")
         for cal in calendar_entities:
@@ -76,7 +86,7 @@ def build_system_context(store: DataStore, hass: HomeAssistant) -> str:
         lines.append("Use the 'get_calendar_events' tool to check upcoming events.")
 
     # History/search capability (always available if entities exist)
-    if store.managed_entities:
+    if readable_entities:
         lines.append("\n--- SMART CAPABILITIES ---")
         lines.append("• get_entity_history: View recent state changes for any managed entity")
         lines.append("• search_events: Search across all entity history for specific events/objects")
@@ -96,10 +106,11 @@ def build_gemini_tools(store: DataStore) -> list[Any]:
     from google.genai import types  # noqa: PLC0415
 
     declarations: list[types.FunctionDeclaration] = []
+    readable_entities = _readable_entities(store)
 
     # ─── Read entity state (always available if entities exist) ────────────────
-    if store.managed_entities:
-        entity_ids = [e.entity_id for e in store.managed_entities]
+    if readable_entities:
+        entity_ids = [e.entity_id for e in readable_entities]
         declarations.append(types.FunctionDeclaration(
             name="read_entity_state",
             description="Read the current state and attributes of an entity.",
@@ -117,7 +128,7 @@ def build_gemini_tools(store: DataStore) -> list[Any]:
         ))
 
     # ─── View camera on demand ────────────────────────────────────────────────
-    camera_entities = [e for e in store.managed_entities if e.entity_id.startswith("camera.")]
+    camera_entities = [e for e in readable_entities if e.entity_id.startswith("camera.")]
     if camera_entities:
         camera_ids = [e.entity_id for e in camera_entities]
         declarations.append(types.FunctionDeclaration(
@@ -145,7 +156,7 @@ def build_gemini_tools(store: DataStore) -> list[Any]:
         ))
 
     # ─── Get calendar events ──────────────────────────────────────────────────
-    calendar_entities = [e for e in store.managed_entities if e.entity_id.startswith("calendar.")]
+    calendar_entities = [e for e in readable_entities if e.entity_id.startswith("calendar.")]
     if calendar_entities:
         calendar_ids = [e.entity_id for e in calendar_entities]
         declarations.append(types.FunctionDeclaration(
@@ -173,8 +184,8 @@ def build_gemini_tools(store: DataStore) -> list[Any]:
         ))
 
     # ─── Get entity history ───────────────────────────────────────────────────
-    if store.managed_entities:
-        entity_ids = [e.entity_id for e in store.managed_entities]
+    if readable_entities:
+        entity_ids = [e.entity_id for e in readable_entities]
         declarations.append(types.FunctionDeclaration(
             name=TOOL_GET_HISTORY,
             description=(
@@ -200,7 +211,7 @@ def build_gemini_tools(store: DataStore) -> list[Any]:
         ))
 
     # ─── Search across all events ─────────────────────────────────────────────
-    if store.managed_entities:
+    if readable_entities:
         declarations.append(types.FunctionDeclaration(
             name=TOOL_SEARCH_EVENTS,
             description=(
@@ -285,10 +296,11 @@ def build_gemini_tools(store: DataStore) -> list[Any]:
 def build_openai_tools(store: DataStore) -> list[dict[str, Any]]:
     """Build OpenAI-format tool declarations from managed entities."""
     tools: list[dict[str, Any]] = []
+    readable_entities = _readable_entities(store)
 
     # Read entity state
-    if store.managed_entities:
-        entity_ids = [e.entity_id for e in store.managed_entities]
+    if readable_entities:
+        entity_ids = [e.entity_id for e in readable_entities]
         tools.append({
             "type": "function",
             "name": "read_entity_state",
@@ -307,7 +319,7 @@ def build_openai_tools(store: DataStore) -> list[dict[str, Any]]:
         })
 
     # View camera
-    camera_entities = [e for e in store.managed_entities if e.entity_id.startswith("camera.")]
+    camera_entities = [e for e in readable_entities if e.entity_id.startswith("camera.")]
     if camera_entities:
         camera_ids = [e.entity_id for e in camera_entities]
         tools.append({
@@ -335,7 +347,7 @@ def build_openai_tools(store: DataStore) -> list[dict[str, Any]]:
         })
 
     # Calendar events
-    calendar_entities = [e for e in store.managed_entities if e.entity_id.startswith("calendar.")]
+    calendar_entities = [e for e in readable_entities if e.entity_id.startswith("calendar.")]
     if calendar_entities:
         calendar_ids = [e.entity_id for e in calendar_entities]
         tools.append({
@@ -362,8 +374,8 @@ def build_openai_tools(store: DataStore) -> list[dict[str, Any]]:
         })
 
     # Entity history
-    if store.managed_entities:
-        entity_ids = [e.entity_id for e in store.managed_entities]
+    if readable_entities:
+        entity_ids = [e.entity_id for e in readable_entities]
         tools.append({
             "type": "function",
             "name": TOOL_GET_HISTORY,
@@ -389,7 +401,7 @@ def build_openai_tools(store: DataStore) -> list[dict[str, Any]]:
         })
 
     # Search events
-    if store.managed_entities:
+    if readable_entities:
         tools.append({
             "type": "function",
             "name": TOOL_SEARCH_EVENTS,
@@ -629,7 +641,7 @@ async def _execute_get_history(
     hours_back = min(int(arguments.get("hours_back", DEFAULT_HISTORY_HOURS)), MAX_HISTORY_HOURS)
 
     # Validate entity is managed
-    allowed = [e.entity_id for e in store.managed_entities]
+    allowed = [e.entity_id for e in _readable_entities(store)]
     if entity_id not in allowed:
         return {"error": f"Entity '{entity_id}' not in managed entities."}
 
@@ -713,7 +725,7 @@ async def _execute_search_events(
 
     now = datetime.now(timezone.utc)
     start = now - timedelta(hours=hours_back)
-    entity_ids = [e.entity_id for e in store.managed_entities]
+    entity_ids = [e.entity_id for e in _readable_entities(store)]
 
     matches: list[dict[str, Any]] = []
 
@@ -804,7 +816,7 @@ async def _execute_read_state(
 ) -> dict[str, Any]:
     """Read entity state — only allowed entities."""
     entity_id = arguments.get("entity_id", "")
-    allowed = [e.entity_id for e in store.managed_entities]
+    allowed = [e.entity_id for e in _readable_entities(store)]
     if entity_id not in allowed:
         _LOGGER.warning("BLOCKED read of non-managed entity: %s", entity_id)
         return {"error": f"Access denied: '{entity_id}' not in managed entities."}
@@ -869,19 +881,55 @@ async def _execute_action(
     if not arguments.get("confirm", False):
         return {"error": "Action not confirmed. Set confirm=true to proceed."}
 
-    # Parse service
-    if "." in action.service:
-        domain, svc = action.service.split(".", 1)
-    else:
-        return {"error": f"Invalid service format: {action.service}"}
+    step_results: list[dict[str, Any]] = []
+    step_configs = action.steps or [action.service_data or {"action": action.service}]
 
-    # Build service data — substitute entity_id if present
-    service_data = dict(action.service_data)
-    if "entity_id" not in service_data:
+    for index, step_config in enumerate(step_configs, start=1):
+        service_name, service_data = _prepare_service_call(entity, action, step_config)
+        if "." not in service_name:
+            return {"error": f"Invalid service format: {service_name}"}
+
+        domain, svc = service_name.split(".", 1)
+        await hass.services.async_call(domain, svc, service_data, blocking=True)
+        step_results.append({"step": index, "service": service_name, "service_data": service_data})
+
+    result: dict[str, Any] = {"success": True, "action": action.name}
+    if entity.entity_id != GLOBAL_ACTIONS_ENTITY_ID:
+        result["entity_id"] = entity.entity_id
+    if len(step_results) > 1:
+        result["steps_executed"] = step_results
+    elif step_results:
+        result["service"] = step_results[0]["service"]
+    return result
+
+
+def _prepare_service_call(
+    entity: ManagedEntity,
+    action: Any,
+    step_config: dict[str, Any] | None,
+) -> tuple[str, dict[str, Any]]:
+    """Normalize selector-style and legacy action configs into a service call."""
+    config = dict(step_config or {})
+
+    if any(key in config for key in ("action", "service", "target", "data")):
+        service_name = config.get("action") or config.get("service") or action.service
+        target = dict(config.get("target") or {})
+        data = dict(config.get("data") or {})
+
+        if (
+            entity.entity_id != GLOBAL_ACTIONS_ENTITY_ID
+            and "entity_id" not in target
+            and "entity_id" not in data
+        ):
+            target["entity_id"] = entity.entity_id
+
+        return service_name, {**target, **data}
+
+    service_name = action.service
+    service_data = dict(config)
+    if entity.entity_id != GLOBAL_ACTIONS_ENTITY_ID and "entity_id" not in service_data:
         service_data["entity_id"] = entity.entity_id
-
-    await hass.services.async_call(domain, svc, service_data, blocking=True)
-    return {"success": True, "action": action.name, "entity_id": entity.entity_id}
+    return service_name, service_data
 
 
 def _slugify(text: str) -> str:
