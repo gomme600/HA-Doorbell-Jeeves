@@ -1137,18 +1137,10 @@ class ReolinkAudioHandler:
                 # Extract body from the full packet (skip Baichuan header)
                 body = data[len_header:] if len(data) > len_header else b""
 
-                # Check if this message has a payload_offset (first response vs continuation)
-                if len_header == 24 and len(data) >= 24:
-                    payload_offset = int.from_bytes(data[20:24], byteorder="little")
-                    if payload_offset > 0 and len(body) > payload_offset:
-                        # First response: Extension XML is encrypted (skip it),
-                        # binary payload AFTER it also needs decryption
-                        body = body[payload_offset:]
-
+                # For messages with payload_offset=0 arriving via push_callback,
+                # the body IS the raw binary stream data (NOT encrypted).
+                # Messages with payload_offset!=0 are handled by patched_parse_data.
                 if body:
-                    # Decrypt the binary body (AES-CFB-128)
-                    body = self._decrypt_binary_body(body)
-
                     if not hasattr(self, "_push_count"):
                         self._push_count = 0
                     self._push_count += 1
@@ -1223,9 +1215,19 @@ class ReolinkAudioHandler:
             rec_mess_id = int.from_bytes(protocol._data[12:16], byteorder="little")
             len_header = 24
 
+            # Track how many messages we process
+            if not hasattr(handler, "_parse_count"):
+                handler._parse_count = 0
+            handler._parse_count += 1
+
             len_body = len(protocol._data) - len_header
             if len_body < rec_len_body:
                 # Wait for the rest of the body
+                if handler._parse_count <= 10:
+                    _LOGGER.warning(
+                        "Patched parse: msg#%d cmd=%d waiting for body (%d/%d bytes)",
+                        handler._parse_count, rec_cmd_id, len_body, rec_len_body,
+                    )
                 return
 
             # Extract the full chunk
@@ -1252,17 +1254,18 @@ class ReolinkAudioHandler:
                 return
 
             # Extract binary payload (after the Extension XML)
-            # The ENTIRE body (Extension + binary) is encrypted as one AES-CFB stream
-            # Must decrypt the whole thing, then split
+            # The Extension XML portion IS encrypted, but the binary payload IS NOT.
+            # This matches neolink's behavior: binary payloads are raw (unencrypted).
             full_body = data_chunk[len_header:]
-            full_body_decrypted = handler._decrypt_binary_body(full_body)
-            binary_data = full_body_decrypted[rec_payload_offset:] if rec_payload_offset < len(full_body_decrypted) else b""
+            # Split at payload_offset: Extension (encrypted) | Binary (raw)
+            binary_data = full_body[rec_payload_offset:] if rec_payload_offset < len(full_body) else b""
 
             # Resolve any waiting receive_future (first response to send())
             receive_future = protocol.receive_futures.get(rec_cmd_id, {}).get(rec_mess_id)
             if receive_future is not None and not receive_future.done():
-                # Return Extension XML part to the caller (decrypted)
-                ext_data = full_body_decrypted[:rec_payload_offset]
+                # Return Extension XML part to the caller (decrypt it)
+                ext_encrypted = full_body[:rec_payload_offset]
+                ext_data = handler._decrypt_binary_body(ext_encrypted)
                 receive_future.set_result((ext_data, len_header))
 
             # Route binary data directly to audio extraction
