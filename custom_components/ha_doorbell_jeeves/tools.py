@@ -1,12 +1,31 @@
-"""Dynamic tool generation and execution from admin-configured entities/actions."""
+"""Dynamic tool generation and execution from admin-configured entities/actions.
+
+Smart tools are auto-generated based on entity domains:
+  - camera.* entities → view_camera tool (on-demand snapshots)
+  - calendar.* entities → get_calendar_events tool
+  - All entities → get_entity_history tool (recent state changes)
+  - Global → search_events (cross-entity event search)
+"""
 
 from __future__ import annotations
 
+import base64
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from homeassistant.core import HomeAssistant
 
+from .const import (
+    DEFAULT_CALENDAR_DAYS,
+    DEFAULT_HISTORY_HOURS,
+    MAX_CALENDAR_DAYS,
+    MAX_HISTORY_HOURS,
+    TOOL_GET_CALENDAR,
+    TOOL_GET_HISTORY,
+    TOOL_SEARCH_EVENTS,
+    TOOL_VIEW_CAMERA,
+)
 from .models import ManagedEntity, NotificationTarget
 from .store import DataStore
 
@@ -16,7 +35,8 @@ _LOGGER = logging.getLogger(__name__)
 def build_system_context(store: DataStore, hass: HomeAssistant) -> str:
     """Build the entity/action context block appended to the system prompt.
 
-    This tells the AI what entities it can see and what actions it can perform.
+    This tells the AI what entities it can see, what actions it can perform,
+    and what smart capabilities are available (cameras, calendars, history).
     """
     lines: list[str] = []
 
@@ -39,6 +59,29 @@ def build_system_context(store: DataStore, hass: HomeAssistant) -> str:
         for entity, action in all_actions:
             lines.append(f"• {action.name} (tool: {action.id}): {action.description} [on {entity.name}]")
 
+    # Camera viewing capability
+    camera_entities = [e for e in store.managed_entities if e.entity_id.startswith("camera.")]
+    if camera_entities:
+        lines.append("\n--- CAMERAS (you can view any of these on demand) ---")
+        for cam in camera_entities:
+            lines.append(f"• {cam.name} [{cam.entity_id}]: {cam.description}")
+        lines.append("Use the 'view_camera' tool to get a live snapshot from any camera above.")
+
+    # Calendar capability
+    calendar_entities = [e for e in store.managed_entities if e.entity_id.startswith("calendar.")]
+    if calendar_entities:
+        lines.append("\n--- CALENDARS (you can check schedules) ---")
+        for cal in calendar_entities:
+            lines.append(f"• {cal.name} [{cal.entity_id}]: {cal.description}")
+        lines.append("Use the 'get_calendar_events' tool to check upcoming events.")
+
+    # History/search capability (always available if entities exist)
+    if store.managed_entities:
+        lines.append("\n--- SMART CAPABILITIES ---")
+        lines.append("• get_entity_history: View recent state changes for any managed entity")
+        lines.append("• search_events: Search across all entity history for specific events/objects")
+        lines.append("These are useful for answering questions about what happened recently.")
+
     # Notification targets
     if store.notification_targets:
         lines.append("\n--- NOTIFICATION TARGETS ---")
@@ -54,7 +97,7 @@ def build_gemini_tools(store: DataStore) -> list[Any]:
 
     declarations: list[types.FunctionDeclaration] = []
 
-    # Read entity state tool (if there are readable entities)
+    # ─── Read entity state (always available if entities exist) ────────────────
     if store.managed_entities:
         entity_ids = [e.entity_id for e in store.managed_entities]
         declarations.append(types.FunctionDeclaration(
@@ -73,7 +116,116 @@ def build_gemini_tools(store: DataStore) -> list[Any]:
             },
         ))
 
-    # Custom actions
+    # ─── View camera on demand ────────────────────────────────────────────────
+    camera_entities = [e for e in store.managed_entities if e.entity_id.startswith("camera.")]
+    if camera_entities:
+        camera_ids = [e.entity_id for e in camera_entities]
+        declarations.append(types.FunctionDeclaration(
+            name=TOOL_VIEW_CAMERA,
+            description=(
+                "Get a live snapshot from a camera. Use this to look at different areas "
+                "of the property, check for objects, people, or events. The image will be "
+                "shown to you for analysis."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "camera_entity_id": {
+                        "type": "string",
+                        "description": "Which camera to view",
+                        "enum": camera_ids,
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Brief note on why you're checking this camera (for audit)",
+                    },
+                },
+                "required": ["camera_entity_id"],
+            },
+        ))
+
+    # ─── Get calendar events ──────────────────────────────────────────────────
+    calendar_entities = [e for e in store.managed_entities if e.entity_id.startswith("calendar.")]
+    if calendar_entities:
+        calendar_ids = [e.entity_id for e in calendar_entities]
+        declarations.append(types.FunctionDeclaration(
+            name=TOOL_GET_CALENDAR,
+            description=(
+                "Get upcoming calendar events to check schedules. Use this to answer "
+                "questions about availability, appointments, or whether someone will be "
+                "home at a certain time. Returns events for the next few days."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "calendar_entity_id": {
+                        "type": "string",
+                        "description": "Which calendar to check",
+                        "enum": calendar_ids,
+                    },
+                    "days_ahead": {
+                        "type": "integer",
+                        "description": "How many days ahead to look (1-14, default 3)",
+                    },
+                },
+                "required": ["calendar_entity_id"],
+            },
+        ))
+
+    # ─── Get entity history ───────────────────────────────────────────────────
+    if store.managed_entities:
+        entity_ids = [e.entity_id for e in store.managed_entities]
+        declarations.append(types.FunctionDeclaration(
+            name=TOOL_GET_HISTORY,
+            description=(
+                "Get recent state change history for an entity. Use this to see what "
+                "happened in the past hours — motion detections, door openings, sensor "
+                "changes, detected objects, etc."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "entity_id": {
+                        "type": "string",
+                        "description": "The entity to get history for",
+                        "enum": entity_ids,
+                    },
+                    "hours_back": {
+                        "type": "integer",
+                        "description": "How many hours back to look (1-48, default 4)",
+                    },
+                },
+                "required": ["entity_id"],
+            },
+        ))
+
+    # ─── Search across all events ─────────────────────────────────────────────
+    if store.managed_entities:
+        declarations.append(types.FunctionDeclaration(
+            name=TOOL_SEARCH_EVENTS,
+            description=(
+                "Search across ALL managed entity history for specific events, objects, "
+                "or patterns. Use this to answer questions like 'was a ball detected?', "
+                "'did anyone come to the door earlier?', 'were there any motion events?'. "
+                "Searches state changes, attributes, and event descriptions."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "What to search for (e.g., 'ball', 'person', 'motion', 'package')",
+                    },
+                    "hours_back": {
+                        "type": "integer",
+                        "description": "How many hours back to search (1-48, default 4)",
+                    },
+                },
+                "required": ["query"],
+            },
+        ))
+
+    # ─── Custom actions ───────────────────────────────────────────────────────
     for entity in store.managed_entities:
         for action in entity.actions:
             declarations.append(types.FunctionDeclaration(
@@ -91,7 +243,7 @@ def build_gemini_tools(store: DataStore) -> list[Any]:
                 },
             ))
 
-    # Notification tools
+    # ─── Notification tools ───────────────────────────────────────────────────
     for target in store.notification_targets:
         tool_name = f"notify_{_slugify(target.name)}"
         declarations.append(types.FunctionDeclaration(
@@ -112,7 +264,7 @@ def build_gemini_tools(store: DataStore) -> list[Any]:
             },
         ))
 
-    # PIN verification (always available if PIN is configured)
+    # ─── PIN verification ─────────────────────────────────────────────────────
     declarations.append(types.FunctionDeclaration(
         name="verify_pin",
         description="Verify a PIN code spoken by the visitor for protected actions.",
@@ -151,6 +303,113 @@ def build_openai_tools(store: DataStore) -> list[dict[str, Any]]:
                     }
                 },
                 "required": ["entity_id"],
+            },
+        })
+
+    # View camera
+    camera_entities = [e for e in store.managed_entities if e.entity_id.startswith("camera.")]
+    if camera_entities:
+        camera_ids = [e.entity_id for e in camera_entities]
+        tools.append({
+            "type": "function",
+            "name": TOOL_VIEW_CAMERA,
+            "description": (
+                "Get a live snapshot from a camera. Use this to look at different areas "
+                "of the property, check for objects, people, or events."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "camera_entity_id": {
+                        "type": "string",
+                        "description": "Which camera to view",
+                        "enum": camera_ids,
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Brief note on why you're checking this camera",
+                    },
+                },
+                "required": ["camera_entity_id"],
+            },
+        })
+
+    # Calendar events
+    calendar_entities = [e for e in store.managed_entities if e.entity_id.startswith("calendar.")]
+    if calendar_entities:
+        calendar_ids = [e.entity_id for e in calendar_entities]
+        tools.append({
+            "type": "function",
+            "name": TOOL_GET_CALENDAR,
+            "description": (
+                "Get upcoming calendar events. Use to check availability and schedules."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "calendar_entity_id": {
+                        "type": "string",
+                        "description": "Which calendar to check",
+                        "enum": calendar_ids,
+                    },
+                    "days_ahead": {
+                        "type": "integer",
+                        "description": "Days ahead to look (1-14, default 3)",
+                    },
+                },
+                "required": ["calendar_entity_id"],
+            },
+        })
+
+    # Entity history
+    if store.managed_entities:
+        entity_ids = [e.entity_id for e in store.managed_entities]
+        tools.append({
+            "type": "function",
+            "name": TOOL_GET_HISTORY,
+            "description": (
+                "Get recent state change history for an entity. Shows what happened "
+                "in the past hours — motion, door openings, detected objects, etc."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "entity_id": {
+                        "type": "string",
+                        "description": "The entity to get history for",
+                        "enum": entity_ids,
+                    },
+                    "hours_back": {
+                        "type": "integer",
+                        "description": "Hours back to look (1-48, default 4)",
+                    },
+                },
+                "required": ["entity_id"],
+            },
+        })
+
+    # Search events
+    if store.managed_entities:
+        tools.append({
+            "type": "function",
+            "name": TOOL_SEARCH_EVENTS,
+            "description": (
+                "Search ALL entity history for specific events, objects, or patterns. "
+                "E.g., 'was a ball detected?', 'any motion events?', 'did a package arrive?'"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "What to search for",
+                    },
+                    "hours_back": {
+                        "type": "integer",
+                        "description": "Hours back to search (1-48, default 4)",
+                    },
+                },
+                "required": ["query"],
             },
         })
 
@@ -228,6 +487,16 @@ async def execute_tool_call(
         if function_name == "verify_pin":
             return {"success": True, "message": "PIN received for verification"}
 
+        # Smart tools
+        if function_name == TOOL_VIEW_CAMERA:
+            return await _execute_view_camera(hass, store, arguments)
+        if function_name == TOOL_GET_CALENDAR:
+            return await _execute_get_calendar(hass, store, arguments)
+        if function_name == TOOL_GET_HISTORY:
+            return await _execute_get_history(hass, store, arguments)
+        if function_name == TOOL_SEARCH_EVENTS:
+            return await _execute_search_events(hass, store, arguments)
+
         # Notification
         if function_name.startswith("notify_"):
             return await _execute_notification(hass, store, function_name, arguments)
@@ -238,6 +507,296 @@ async def execute_tool_call(
     except Exception as err:
         _LOGGER.exception("Tool execution error: %s", function_name)
         return {"error": str(err)}
+
+
+# ─── Smart Tool Implementations ───────────────────────────────────────────────
+
+
+async def _execute_view_camera(
+    hass: HomeAssistant, store: DataStore, arguments: dict[str, Any]
+) -> dict[str, Any]:
+    """Capture a snapshot from a camera and return it for AI analysis.
+
+    The image is injected into the conversation as an inline image so the AI
+    can visually analyze it (look for objects, people, etc.).
+    """
+    camera_id = arguments.get("camera_entity_id", "")
+    reason = arguments.get("reason", "on-demand check")
+
+    # Validate entity is managed
+    allowed = [e.entity_id for e in store.managed_entities if e.entity_id.startswith("camera.")]
+    if camera_id not in allowed:
+        return {"error": f"Camera '{camera_id}' not in managed entities."}
+
+    try:
+        image = await hass.components.camera.async_get_image(camera_id, timeout=10)
+        if not image:
+            return {"error": f"Could not get image from {camera_id}"}
+
+        # Return base64 image — the session manager will inject this into the model
+        image_b64 = base64.b64encode(image.content).decode("ascii")
+        managed = store.get_entity(camera_id)
+        cam_name = managed.name if managed else camera_id
+
+        return {
+            "success": True,
+            "camera": cam_name,
+            "reason": reason,
+            "_image_base64": image_b64,  # Special key: session manager injects as image
+            "_image_mime": "image/jpeg",
+            "message": f"Here is the current view from {cam_name}. Analyze what you see.",
+        }
+    except Exception as err:
+        return {"error": f"Failed to capture from {camera_id}: {err}"}
+
+
+async def _execute_get_calendar(
+    hass: HomeAssistant, store: DataStore, arguments: dict[str, Any]
+) -> dict[str, Any]:
+    """Get upcoming events from a calendar entity.
+
+    Uses HA's calendar.get_events service to retrieve scheduled events.
+    """
+    calendar_id = arguments.get("calendar_entity_id", "")
+    days_ahead = min(int(arguments.get("days_ahead", DEFAULT_CALENDAR_DAYS)), MAX_CALENDAR_DAYS)
+
+    # Validate entity is managed
+    allowed = [e.entity_id for e in store.managed_entities if e.entity_id.startswith("calendar.")]
+    if calendar_id not in allowed:
+        return {"error": f"Calendar '{calendar_id}' not in managed entities."}
+
+    now = datetime.now(timezone.utc)
+    end = now + timedelta(days=days_ahead)
+
+    try:
+        # Use the calendar.get_events service
+        result = await hass.services.async_call(
+            "calendar", "get_events",
+            {
+                "entity_id": calendar_id,
+                "start_date_time": now.isoformat(),
+                "end_date_time": end.isoformat(),
+            },
+            blocking=True,
+            return_response=True,
+        )
+
+        # Parse the response
+        events_data = result.get(calendar_id, {}).get("events", []) if result else []
+
+        if not events_data:
+            managed = store.get_entity(calendar_id)
+            cal_name = managed.name if managed else calendar_id
+            return {
+                "success": True,
+                "calendar": cal_name,
+                "events": [],
+                "message": f"No events found in {cal_name} for the next {days_ahead} day(s).",
+            }
+
+        # Format events for the AI
+        formatted_events = []
+        for event in events_data:
+            formatted_events.append({
+                "summary": event.get("summary", "Untitled"),
+                "start": event.get("start", ""),
+                "end": event.get("end", ""),
+                "location": event.get("location", ""),
+                "description": (event.get("description", "") or "")[:200],
+            })
+
+        managed = store.get_entity(calendar_id)
+        cal_name = managed.name if managed else calendar_id
+        return {
+            "success": True,
+            "calendar": cal_name,
+            "days_ahead": days_ahead,
+            "event_count": len(formatted_events),
+            "events": formatted_events,
+        }
+    except Exception as err:
+        return {"error": f"Failed to get calendar events: {err}"}
+
+
+async def _execute_get_history(
+    hass: HomeAssistant, store: DataStore, arguments: dict[str, Any]
+) -> dict[str, Any]:
+    """Get recent state change history for an entity.
+
+    Uses HA's history component to retrieve past states.
+    """
+    entity_id = arguments.get("entity_id", "")
+    hours_back = min(int(arguments.get("hours_back", DEFAULT_HISTORY_HOURS)), MAX_HISTORY_HOURS)
+
+    # Validate entity is managed
+    allowed = [e.entity_id for e in store.managed_entities]
+    if entity_id not in allowed:
+        return {"error": f"Entity '{entity_id}' not in managed entities."}
+
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(hours=hours_back)
+
+    try:
+        # Use HA's history API
+        from homeassistant.components.recorder import get_instance  # noqa: PLC0415
+        from homeassistant.components.recorder.history import state_changes_during_period  # noqa: PLC0415
+
+        history = await get_instance(hass).async_add_executor_job(
+            state_changes_during_period,
+            hass,
+            start,
+            now,
+            entity_id,
+        )
+
+        states = history.get(entity_id, [])
+        if not states:
+            return {
+                "success": True,
+                "entity_id": entity_id,
+                "hours_back": hours_back,
+                "changes": [],
+                "message": f"No state changes recorded for {entity_id} in the past {hours_back} hour(s).",
+            }
+
+        # Format state changes
+        changes = []
+        for state in states[-50:]:  # Last 50 changes max
+            change_entry: dict[str, Any] = {
+                "state": state.state,
+                "time": state.last_changed.isoformat() if state.last_changed else "",
+            }
+            # Include useful attributes
+            attrs = state.attributes or {}
+            for key in ("friendly_name", "device_class", "detection_type",
+                        "object_type", "label", "score", "count"):
+                if key in attrs:
+                    change_entry[key] = attrs[key]
+            changes.append(change_entry)
+
+        managed = store.get_entity(entity_id)
+        entity_name = managed.name if managed else entity_id
+        return {
+            "success": True,
+            "entity": entity_name,
+            "entity_id": entity_id,
+            "hours_back": hours_back,
+            "total_changes": len(changes),
+            "changes": changes,
+        }
+    except Exception as err:
+        _LOGGER.debug("History query failed for %s: %s", entity_id, err)
+        # Fallback: return current state only
+        state = hass.states.get(entity_id)
+        return {
+            "success": True,
+            "entity_id": entity_id,
+            "note": "Full history unavailable, showing current state only",
+            "current_state": state.state if state else "unknown",
+            "current_attributes": dict(state.attributes) if state else {},
+        }
+
+
+async def _execute_search_events(
+    hass: HomeAssistant, store: DataStore, arguments: dict[str, Any]
+) -> dict[str, Any]:
+    """Search across all managed entity history for matching events.
+
+    This is the "smart search" — looks for keywords in state values,
+    attributes, and entity names across all managed entities.
+    """
+    query = arguments.get("query", "").lower().strip()
+    hours_back = min(int(arguments.get("hours_back", DEFAULT_HISTORY_HOURS)), MAX_HISTORY_HOURS)
+
+    if not query:
+        return {"error": "Search query cannot be empty."}
+
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(hours=hours_back)
+    entity_ids = [e.entity_id for e in store.managed_entities]
+
+    matches: list[dict[str, Any]] = []
+
+    try:
+        from homeassistant.components.recorder import get_instance  # noqa: PLC0415
+        from homeassistant.components.recorder.history import state_changes_during_period  # noqa: PLC0415
+
+        # Search through all managed entities' history
+        for eid in entity_ids:
+            try:
+                history = await get_instance(hass).async_add_executor_job(
+                    state_changes_during_period,
+                    hass,
+                    start,
+                    now,
+                    eid,
+                )
+                states = history.get(eid, [])
+                for state in states:
+                    # Search in state value
+                    searchable = state.state.lower()
+                    # Search in attributes
+                    attrs = state.attributes or {}
+                    attr_text = " ".join(str(v).lower() for v in attrs.values())
+                    searchable += " " + attr_text
+
+                    if query in searchable:
+                        managed = store.get_entity(eid)
+                        matches.append({
+                            "entity": managed.name if managed else eid,
+                            "entity_id": eid,
+                            "state": state.state,
+                            "time": state.last_changed.isoformat() if state.last_changed else "",
+                            "relevant_attributes": {
+                                k: v for k, v in attrs.items()
+                                if query in str(v).lower() or k in ("label", "object_type", "detection_type", "score")
+                            },
+                        })
+            except Exception:
+                continue
+
+        if not matches:
+            return {
+                "success": True,
+                "query": query,
+                "hours_back": hours_back,
+                "matches": [],
+                "message": f"No events matching '{query}' found in the past {hours_back} hour(s) across {len(entity_ids)} entities.",
+            }
+
+        # Sort by time (most recent first) and limit
+        matches.sort(key=lambda m: m.get("time", ""), reverse=True)
+        matches = matches[:30]
+
+        return {
+            "success": True,
+            "query": query,
+            "hours_back": hours_back,
+            "match_count": len(matches),
+            "matches": matches,
+        }
+    except Exception as err:
+        _LOGGER.debug("Event search failed: %s", err)
+        # Fallback: search current states
+        current_matches = []
+        for eid in entity_ids:
+            state = hass.states.get(eid)
+            if state and query in (state.state.lower() + " " + str(state.attributes).lower()):
+                managed = store.get_entity(eid)
+                current_matches.append({
+                    "entity": managed.name if managed else eid,
+                    "entity_id": eid,
+                    "state": state.state,
+                })
+        return {
+            "success": True,
+            "query": query,
+            "note": "Full history search unavailable, showing current state matches",
+            "matches": current_matches,
+        }
+
+
+# ─── Standard Tool Implementations ───────────────────────────────────────────
 
 
 async def _execute_read_state(
@@ -254,7 +813,6 @@ async def _execute_read_state(
     if state is None:
         return {"error": f"Entity '{entity_id}' not found or unavailable"}
 
-    # Find the friendly description
     managed = store.get_entity(entity_id)
     return {
         "entity_id": entity_id,
@@ -263,7 +821,9 @@ async def _execute_read_state(
         "unit": state.attributes.get("unit_of_measurement", ""),
         "attributes": {
             k: v for k, v in state.attributes.items()
-            if k in ("friendly_name", "temperature", "humidity", "battery", "device_class")
+            if k in ("friendly_name", "temperature", "humidity", "battery",
+                     "device_class", "last_triggered", "current_position",
+                     "media_title", "source", "detection_type", "label")
         },
     }
 
@@ -272,7 +832,6 @@ async def _execute_notification(
     hass: HomeAssistant, store: DataStore, function_name: str, arguments: dict[str, Any]
 ) -> dict[str, Any]:
     """Send a notification to a configured target."""
-    # Match tool name to target
     target = None
     for t in store.notification_targets:
         if f"notify_{_slugify(t.name)}" == function_name:

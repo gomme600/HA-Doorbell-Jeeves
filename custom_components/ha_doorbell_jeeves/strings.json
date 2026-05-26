@@ -99,12 +99,32 @@
         "title": "Entities & Actions",
         "description": "Manage the entities and actions available to the AI agent. {entity_summary}",
         "menu_options": {
-          "add_entity": "➕ Add Entity",
-          "remove_entity": "➖ Remove Entity",
-          "add_notification": "🔔 Add Notification Target",
-          "remove_notification": "🗑️ Remove Notification Target",
+          "add_camera": "📷 Add Camera (on-demand viewing)",
+          "add_calendar": "📅 Add Calendar (schedule access)",
+          "add_entity": "🏠 Add Other Entity",
           "add_action": "⚡ Add Action to Entity",
+          "add_notification": "🔔 Add Notification Target",
+          "remove_entity": "➖ Remove Entity",
+          "remove_notification": "🗑️ Remove Notification Target",
           "init": "← Back to Menu"
+        }
+      },
+      "add_camera": {
+        "title": "Add Camera",
+        "description": "Add a camera the AI can view on demand. When a visitor asks about something (e.g., 'is my ball in your garden?'), the AI can check this camera live.",
+        "data": {
+          "entity_id": "Camera Entity",
+          "name": "Camera Name (for AI, e.g., 'Garden Camera')",
+          "description": "Description (e.g., 'Shows the back garden and lawn area')"
+        }
+      },
+      "add_calendar": {
+        "title": "Add Calendar",
+        "description": "Add a calendar so the AI can check schedules. When asked about availability (e.g., 'will you be home tomorrow?'), the AI reads this calendar.",
+        "data": {
+          "entity_id": "Calendar Entity",
+          "name": "Calendar Name (e.g., 'Owner's Work Schedule')",
+          "description": "Description (e.g., 'Main work and personal calendar — use to determine availability')"
         }
       },
       "add_entity": {

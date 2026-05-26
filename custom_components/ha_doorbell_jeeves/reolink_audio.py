@@ -66,25 +66,34 @@ async def setup_go2rtc_stream(
 ) -> bool:
     """Register a stream in go2rtc with backchannel support.
 
-    go2rtc's API allows dynamic stream creation:
-      PUT /api/streams?src=<name>&url=<rtsp_url>
+    go2rtc requires TWO source entries for 2-way audio:
+      1. The RTSP URL (camera → HA: video + audio)
+      2. An ffmpeg backchannel source (HA → camera: audio)
 
-    The backchannel is automatically available when the camera supports it
-    (Reolink does via its RTSP implementation).
+    Reference: https://community.home-assistant.io/t/2-way-audio-intercom-for-reolink-doorbell-made-easy/832189
     """
     try:
         session = aiohttp.ClientSession()
         try:
-            # Add the main RTSP stream
             url = f"{GO2RTC_BASE}/api/streams"
-            params = {"src": stream_name, "url": rtsp_url}
-            async with session.put(url, params=params) as resp:
+
+            # Source 1: RTSP stream (receives video + audio from doorbell)
+            params1 = {"src": stream_name, "url": rtsp_url}
+            async with session.put(url, params=params1) as resp:
                 if resp.status not in (200, 201):
                     text = await resp.text()
-                    _LOGGER.error("Failed to register go2rtc stream: %s", text)
+                    _LOGGER.error("Failed to register go2rtc RTSP source: %s", text)
                     return False
 
-            _LOGGER.info("Registered go2rtc stream '%s'", stream_name)
+            # Source 2: ffmpeg backchannel (sends audio TO doorbell speaker)
+            backchannel_url = f"ffmpeg:{stream_name}#audio=opus#audio=copy"
+            params2 = {"src": stream_name, "url": backchannel_url}
+            async with session.put(url, params=params2) as resp:
+                if resp.status not in (200, 201):
+                    text = await resp.text()
+                    _LOGGER.warning("Failed to register go2rtc backchannel: %s (2-way audio may not work)", text)
+
+            _LOGGER.info("Registered go2rtc stream '%s' with backchannel", stream_name)
             return True
         finally:
             await session.close()

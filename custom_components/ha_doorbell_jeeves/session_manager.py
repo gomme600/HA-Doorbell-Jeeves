@@ -369,35 +369,49 @@ class JeevesSessionManager:
             verified = self._security.check_pin(pin)
             return {"success": verified, "message": "PIN verified." if verified else "Incorrect PIN."}
 
-        # Security evaluation
-        mode, _, _ = self._security.get_action_security(function_name)
-        if mode != SECURITY_MODE_AUTO:
-            conversation_summary = self._client.conversation_summary if self._client else ""
-            claimed_identity = self._extract_claimed_identity(conversation_summary)
+        # Security evaluation (skip for read-only smart tools)
+        read_only_tools = ("view_camera", "get_calendar_events", "get_entity_history",
+                           "search_events", "read_entity_state")
+        if function_name not in read_only_tools and not function_name.startswith("notify_"):
+            mode, _, _ = self._security.get_action_security(function_name)
+            if mode != SECURITY_MODE_AUTO:
+                conversation_summary = self._client.conversation_summary if self._client else ""
+                claimed_identity = self._extract_claimed_identity(conversation_summary)
 
-            current_frame: str | None = None
-            reference_image: str | None = None
-            _entity, action = self.store.get_action(function_name)
-            if action and action.require_camera_feed:
-                current_frame = await self._security._get_camera_frame()
-            if action and action.require_visual_match:
-                reference_image = self._get_reference_for_identity(claimed_identity)
+                current_frame: str | None = None
+                reference_image: str | None = None
+                _entity, action = self.store.get_action(function_name)
+                if action and action.require_camera_feed:
+                    current_frame = await self._security._get_camera_frame()
+                if action and action.require_visual_match:
+                    reference_image = self._get_reference_for_identity(claimed_identity)
 
-            approved, reason = await self._security.evaluate_action(
-                action_id=function_name,
-                arguments=arguments,
-                conversation_summary=conversation_summary,
-                claimed_identity=claimed_identity,
-                current_frame_b64=current_frame,
-                reference_image_b64=reference_image,
-            )
-            if not approved:
-                _LOGGER.warning("BLOCKED %s: %s", function_name, reason)
-                return {"error": f"Action blocked: {reason}", "instruction": "Inform the visitor this action cannot be completed."}
+                approved, reason = await self._security.evaluate_action(
+                    action_id=function_name,
+                    arguments=arguments,
+                    conversation_summary=conversation_summary,
+                    claimed_identity=claimed_identity,
+                    current_frame_b64=current_frame,
+                    reference_image_b64=reference_image,
+                )
+                if not approved:
+                    _LOGGER.warning("BLOCKED %s: %s", function_name, reason)
+                    return {"error": f"Action blocked: {reason}", "instruction": "Inform the visitor this action cannot be completed."}
 
         # Execute
         result = await execute_tool_call(self.hass, self.store, function_name, arguments)
-        if result.get("success"):
+
+        # Special handling: if tool returned an image, inject it into the session
+        if result.get("_image_base64") and self._client:
+            await self._client.send_image(
+                result["_image_base64"],
+                mime_type=result.get("_image_mime", "image/jpeg"),
+            )
+            # Remove the internal keys from the result sent back to the model
+            result.pop("_image_base64", None)
+            result.pop("_image_mime", None)
+
+        if result.get("success") and function_name not in read_only_tools:
             self._security.record_action(function_name)
         return result
 

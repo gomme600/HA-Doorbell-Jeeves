@@ -456,28 +456,97 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
             for n in store.notification_targets
         ]
 
-        desc = "**Managed Entities:**\n"
-        if entity_list:
-            desc += "\n".join(f"• {e}" for e in entity_list)
-        else:
-            desc += "None configured"
-        desc += "\n\n**Notification Targets:**\n"
+        # Categorize entities by type
+        cameras = [e for e in store.managed_entities if e.entity_id.startswith("camera.")]
+        calendars = [e for e in store.managed_entities if e.entity_id.startswith("calendar.")]
+        others = [e for e in store.managed_entities
+                  if not e.entity_id.startswith("camera.") and not e.entity_id.startswith("calendar.")]
+
+        desc = ""
+        if cameras:
+            desc += "**📷 Cameras (AI can view on demand):**\n"
+            desc += "\n".join(f"• {e.name}" for e in cameras) + "\n\n"
+        if calendars:
+            desc += "**📅 Calendars (AI can check schedules):**\n"
+            desc += "\n".join(f"• {e.name}" for e in calendars) + "\n\n"
+        if others:
+            desc += "**🏠 Other Entities:**\n"
+            desc += "\n".join(f"• {e.name} - {len(e.actions)} action(s)" for e in others) + "\n\n"
         if notif_list:
+            desc += "**🔔 Notifications:**\n"
             desc += "\n".join(f"• {n}" for n in notif_list)
-        else:
-            desc += "None configured"
+        if not desc:
+            desc = "No entities configured yet. Add cameras, calendars, and devices below."
 
         return self.async_show_menu(
             step_id="entities",
             menu_options=[
+                "add_camera",
+                "add_calendar",
                 "add_entity",
-                "remove_entity",
-                "add_notification",
-                "remove_notification",
                 "add_action",
+                "add_notification",
+                "remove_entity",
+                "remove_notification",
                 "init",
             ],
             description_placeholders={"entity_summary": desc},
+        )
+
+    async def async_step_add_camera(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Add a camera for on-demand AI viewing."""
+        if user_input is not None:
+            from .models import ManagedEntity  # noqa: PLC0415
+            from .store import DataStore  # noqa: PLC0415
+
+            store = DataStore(self.hass, self._config_entry.entry_id)
+            await store.async_load()
+
+            entity = ManagedEntity(
+                entity_id=user_input["entity_id"],
+                name=user_input["name"],
+                description=user_input.get("description", "Camera the AI can view on demand"),
+            )
+            await store.async_add_entity(entity)
+            return await self.async_step_entities()
+
+        return self.async_show_form(
+            step_id="add_camera",
+            data_schema=vol.Schema({
+                vol.Required("entity_id"): EntitySelector(EntitySelectorConfig(domain="camera")),
+                vol.Required("name"): TextSelector(),
+                vol.Required("description", default="Camera feed the AI can view to check this area"): TextSelector(
+                    TextSelectorConfig(multiline=True)
+                ),
+            }),
+        )
+
+    async def async_step_add_calendar(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Add a calendar for schedule queries."""
+        if user_input is not None:
+            from .models import ManagedEntity  # noqa: PLC0415
+            from .store import DataStore  # noqa: PLC0415
+
+            store = DataStore(self.hass, self._config_entry.entry_id)
+            await store.async_load()
+
+            entity = ManagedEntity(
+                entity_id=user_input["entity_id"],
+                name=user_input["name"],
+                description=user_input.get("description", "Calendar for checking availability"),
+            )
+            await store.async_add_entity(entity)
+            return await self.async_step_entities()
+
+        return self.async_show_form(
+            step_id="add_calendar",
+            data_schema=vol.Schema({
+                vol.Required("entity_id"): EntitySelector(EntitySelectorConfig(domain="calendar")),
+                vol.Required("name"): TextSelector(),
+                vol.Required("description", default="Owner's calendar — use to check if they are available"): TextSelector(
+                    TextSelectorConfig(multiline=True)
+                ),
+            }),
         )
 
     async def async_step_add_entity(self, user_input: dict[str, Any] | None = None) -> FlowResult:
