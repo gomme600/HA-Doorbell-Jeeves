@@ -1,92 +1,319 @@
-"""Doorbell Jeeves – Production-ready multimodal AI concierge."""
+"""Doorbell Jeeves – AI-powered multimodal doorbell concierge for Home Assistant.
+
+This integration connects a 2-way audio camera to Google Gemini or OpenAI's
+real-time audio APIs, enabling an autonomous AI agent that can greet visitors,
+identify known people, and execute configured home automation actions with
+configurable security policies.
+"""
 
 from __future__ import annotations
 
 import logging
-from typing import Any, TypeAlias
+from typing import Any
 
 import voluptuous as vol
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.typing import ConfigType
 
 from .const import (
+    AUDIO_MODE_REOLINK,
+    AUDIO_OUTPUT_GO2RTC,
+    CONF_AUDIO_MODE,
+    CONF_AUDIO_OUTPUT_MODE,
+    CONF_CAMERA_ENTITY,
+    CONF_REOLINK_ENTRY_ID,
     DOMAIN,
+    SERVICE_ADD_ACTION,
+    SERVICE_ADD_ENTITY,
+    SERVICE_ADD_IDENTITY,
+    SERVICE_REMOVE_ACTION,
+    SERVICE_REMOVE_ENTITY,
+    SERVICE_REMOVE_IDENTITY,
     SERVICE_SEND_AUDIO,
     SERVICE_START_SESSION,
     SERVICE_STOP_SESSION,
 )
+from .models import EntityAction, KnownIdentity, ManagedEntity
 from .session_manager import JeevesSessionManager
 
 _LOGGER = logging.getLogger(__name__)
 
-JeevesConfigEntry: TypeAlias = ConfigEntry
+# Type alias for runtime data stored on the config entry
+JeevesData = JeevesSessionManager
 
 
-async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Set up integration (UI-only, no YAML)."""
-    hass.data.setdefault(DOMAIN, {})
-    return True
-
-
-async def async_setup_entry(hass: HomeAssistant, entry: JeevesConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Doorbell Jeeves from a config entry."""
+    hass.data.setdefault(DOMAIN, {})
+
+    # Create session manager
     manager = JeevesSessionManager(hass, entry)
     await manager.async_initialize()
     hass.data[DOMAIN][entry.entry_id] = manager
 
-    _register_services(hass)
-    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+    # Reolink auto-configuration (set up go2rtc stream if needed)
+    config = dict(entry.data) | dict(entry.options)
+    if config.get(CONF_AUDIO_MODE) == AUDIO_MODE_REOLINK:
+        await _setup_reolink(hass, entry, config)
 
-    _LOGGER.info("Doorbell Jeeves ready (entry=%s)", entry.entry_id)
+    # Register services (only once globally)
+    if not hass.services.has_service(DOMAIN, SERVICE_START_SESSION):
+        _register_services(hass)
+
+    # Listen for options updates
+    entry.async_on_unload(entry.add_update_listener(_async_update_options))
+
+    _LOGGER.info(
+        "Doorbell Jeeves loaded: entry=%s, camera=%s",
+        entry.entry_id[:8],
+        config.get(CONF_CAMERA_ENTITY, "none"),
+    )
     return True
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: JeevesConfigEntry) -> bool:
-    """Unload and stop any active session."""
-    manager: JeevesSessionManager = hass.data[DOMAIN].pop(entry.entry_id)
-    await manager.async_stop_session()
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Unload a Doorbell Jeeves config entry."""
+    manager: JeevesSessionManager = hass.data[DOMAIN].pop(entry.entry_id, None)
+    if manager:
+        await manager.async_stop_session()
+        manager.unregister_start_triggers()
     return True
 
 
-async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Reload on options change."""
+async def _async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Handle options update — reload the integration."""
     await hass.config_entries.async_reload(entry.entry_id)
 
 
-def _register_services(hass: HomeAssistant) -> None:
-    """Register domain services (idempotent)."""
-    if hass.services.has_service(DOMAIN, SERVICE_START_SESSION):
+async def _setup_reolink(hass: HomeAssistant, entry: ConfigEntry, config: dict[str, Any]) -> None:
+    """Configure go2rtc for Reolink doorbell 2-way audio."""
+    from .reolink_audio import auto_configure_reolink  # noqa: PLC0415
+
+    camera_entity = config.get(CONF_CAMERA_ENTITY, "")
+    if not camera_entity:
         return
 
-    async def handle_start(call: ServiceCall) -> None:
-        entry_id = call.data["entry_id"]
-        manager: JeevesSessionManager | None = hass.data[DOMAIN].get(entry_id)
+    result = await auto_configure_reolink(hass, camera_entity)
+    if result:
+        _LOGGER.info(
+            "Reolink go2rtc configured: stream=%s, host=%s",
+            result.get("stream_name"),
+            result.get("host"),
+        )
+        # Store the stream name in options for session use
+        new_options = dict(entry.options)
+        new_options["go2rtc_stream_name"] = result["stream_name"]
+        hass.config_entries.async_update_entry(entry, options=new_options)
+    else:
+        _LOGGER.warning(
+            "Could not auto-configure Reolink go2rtc. 2-way audio may not work. "
+            "Ensure the Reolink integration is loaded and the camera has valid credentials."
+        )
+
+
+# ─── Service Registration ─────────────────────────────────────────────────────
+
+
+def _register_services(hass: HomeAssistant) -> None:
+    """Register all Doorbell Jeeves services."""
+
+    async def _get_manager(call: ServiceCall) -> JeevesSessionManager | None:
+        """Resolve the session manager from entry_id in service data."""
+        entry_id = call.data.get("entry_id", "")
+        # If only one entry, use it
+        managers = hass.data.get(DOMAIN, {})
+        if not entry_id and len(managers) == 1:
+            return next(iter(managers.values()))
+        return managers.get(entry_id)
+
+    # ─── Session Services ─────────────────────────────────────────────────────
+
+    async def handle_start_session(call: ServiceCall) -> None:
+        """Start the AI concierge session."""
+        manager = await _get_manager(call)
+        if manager:
+            await manager.async_start_session()
+        else:
+            _LOGGER.error("No Doorbell Jeeves instance found for entry_id: %s", call.data.get("entry_id"))
+
+    async def handle_stop_session(call: ServiceCall) -> None:
+        """Stop the active AI concierge session."""
+        manager = await _get_manager(call)
+        if manager:
+            await manager.async_stop_session()
+
+    async def handle_send_audio(call: ServiceCall) -> None:
+        """Send audio data to the AI session."""
+        manager = await _get_manager(call)
+        if manager:
+            audio_b64 = call.data.get("audio_base64", "")
+            await manager.async_send_audio(audio_b64)
+
+    hass.services.async_register(
+        DOMAIN, SERVICE_START_SESSION, handle_start_session,
+        schema=vol.Schema({vol.Optional("entry_id"): cv.string}),
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_STOP_SESSION, handle_stop_session,
+        schema=vol.Schema({vol.Optional("entry_id"): cv.string}),
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_SEND_AUDIO, handle_send_audio,
+        schema=vol.Schema({
+            vol.Optional("entry_id"): cv.string,
+            vol.Required("audio_base64"): cv.string,
+        }),
+    )
+
+    # ─── Entity Management Services ──────────────────────────────────────────
+
+    async def handle_add_entity(call: ServiceCall) -> None:
+        """Add or update a managed entity."""
+        manager = await _get_manager(call)
         if not manager:
-            _LOGGER.error("No instance for entry_id=%s", entry_id)
             return
-        await manager.async_start_session()
+        entity = ManagedEntity(
+            entity_id=call.data["entity_id"],
+            name=call.data["name"],
+            description=call.data.get("description", ""),
+            security_mode=call.data.get("security_mode", "auto"),
+            require_visual_match=call.data.get("require_visual_match", False),
+            require_camera_feed=call.data.get("require_camera_feed", False),
+        )
+        await manager.store.async_add_entity(entity)
 
-    async def handle_stop(call: ServiceCall) -> None:
-        entry_id = call.data["entry_id"]
-        manager: JeevesSessionManager | None = hass.data[DOMAIN].get(entry_id)
+    async def handle_remove_entity(call: ServiceCall) -> None:
+        """Remove a managed entity."""
+        manager = await _get_manager(call)
+        if manager:
+            await manager.store.async_remove_entity(call.data["entity_id"])
+
+    hass.services.async_register(
+        DOMAIN, SERVICE_ADD_ENTITY, handle_add_entity,
+        schema=vol.Schema({
+            vol.Optional("entry_id"): cv.string,
+            vol.Required("entity_id"): cv.entity_id,
+            vol.Required("name"): cv.string,
+            vol.Optional("description", default=""): cv.string,
+            vol.Optional("security_mode", default="auto"): cv.string,
+            vol.Optional("require_visual_match", default=False): cv.boolean,
+            vol.Optional("require_camera_feed", default=False): cv.boolean,
+        }),
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_REMOVE_ENTITY, handle_remove_entity,
+        schema=vol.Schema({
+            vol.Optional("entry_id"): cv.string,
+            vol.Required("entity_id"): cv.entity_id,
+        }),
+    )
+
+    # ─── Action Management Services ──────────────────────────────────────────
+
+    async def handle_add_action(call: ServiceCall) -> None:
+        """Add an action to a managed entity."""
+        manager = await _get_manager(call)
         if not manager:
             return
-        await manager.async_stop_session()
+        entity = manager.store.get_entity(call.data["entity_id"])
+        if not entity:
+            _LOGGER.error("Entity %s not managed — add it first", call.data["entity_id"])
+            return
+        action = EntityAction(
+            id=call.data["action_id"],
+            name=call.data["action_name"],
+            description=call.data.get("description", ""),
+            service=call.data["service"],
+            service_data=call.data.get("service_data", {}),
+            security_mode=call.data.get("security_mode", "auto"),
+            require_visual_match=call.data.get("require_visual_match", False),
+            require_camera_feed=call.data.get("require_camera_feed", False),
+            max_per_session=call.data.get("max_per_session", 0),
+            cooldown_seconds=call.data.get("cooldown_seconds", 0.0),
+            validator_prompt=call.data.get("validator_prompt", ""),
+        )
+        entity.actions.append(action)
+        await manager.store.async_add_entity(entity)
 
-    async def handle_audio(call: ServiceCall) -> None:
-        entry_id = call.data["entry_id"]
-        manager: JeevesSessionManager | None = hass.data[DOMAIN].get(entry_id)
+    async def handle_remove_action(call: ServiceCall) -> None:
+        """Remove an action by ID."""
+        manager = await _get_manager(call)
         if not manager:
             return
-        await manager.async_send_audio(call.data["audio_base64"])
+        action_id = call.data["action_id"]
+        for entity in manager.store.managed_entities:
+            entity.actions = [a for a in entity.actions if a.id != action_id]
+        await manager.store.async_save_entities()
 
-    schema_start = vol.Schema({vol.Required("entry_id"): cv.string})
-    schema_stop = vol.Schema({vol.Required("entry_id"): cv.string})
-    schema_audio = vol.Schema({vol.Required("entry_id"): cv.string, vol.Required("audio_base64"): cv.string})
+    hass.services.async_register(
+        DOMAIN, SERVICE_ADD_ACTION, handle_add_action,
+        schema=vol.Schema({
+            vol.Optional("entry_id"): cv.string,
+            vol.Required("entity_id"): cv.entity_id,
+            vol.Required("action_id"): cv.string,
+            vol.Required("action_name"): cv.string,
+            vol.Optional("description", default=""): cv.string,
+            vol.Required("service"): cv.string,
+            vol.Optional("service_data", default={}): dict,
+            vol.Optional("security_mode", default="auto"): cv.string,
+            vol.Optional("require_visual_match", default=False): cv.boolean,
+            vol.Optional("require_camera_feed", default=False): cv.boolean,
+            vol.Optional("max_per_session", default=0): int,
+            vol.Optional("cooldown_seconds", default=0.0): vol.Coerce(float),
+            vol.Optional("validator_prompt", default=""): cv.string,
+        }),
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_REMOVE_ACTION, handle_remove_action,
+        schema=vol.Schema({
+            vol.Optional("entry_id"): cv.string,
+            vol.Required("action_id"): cv.string,
+        }),
+    )
 
-    hass.services.async_register(DOMAIN, SERVICE_START_SESSION, handle_start, schema=schema_start)
-    hass.services.async_register(DOMAIN, SERVICE_STOP_SESSION, handle_stop, schema=schema_stop)
-    hass.services.async_register(DOMAIN, SERVICE_SEND_AUDIO, handle_audio, schema=schema_audio)
+    # ─── Identity Management Services ─────────────────────────────────────────
+
+    async def handle_add_identity(call: ServiceCall) -> None:
+        """Add a known identity (person/animal/object)."""
+        manager = await _get_manager(call)
+        if not manager:
+            return
+        identity = KnownIdentity(
+            name=call.data["name"],
+            identity_type=call.data.get("identity_type", "person"),
+            relationship=call.data.get("relationship", "guest"),
+            description=call.data.get("description", ""),
+            access_level=call.data.get("access_level", "guest"),
+            image_base64=call.data.get("image_base64"),
+            notes=call.data.get("notes", ""),
+        )
+        await manager.store.async_add_identity(identity)
+
+    async def handle_remove_identity(call: ServiceCall) -> None:
+        """Remove a known identity by name."""
+        manager = await _get_manager(call)
+        if manager:
+            await manager.store.async_remove_identity(call.data["name"])
+
+    hass.services.async_register(
+        DOMAIN, SERVICE_ADD_IDENTITY, handle_add_identity,
+        schema=vol.Schema({
+            vol.Optional("entry_id"): cv.string,
+            vol.Required("name"): cv.string,
+            vol.Optional("identity_type", default="person"): cv.string,
+            vol.Optional("relationship", default="guest"): cv.string,
+            vol.Optional("description", default=""): cv.string,
+            vol.Optional("access_level", default="guest"): cv.string,
+            vol.Optional("image_base64"): cv.string,
+            vol.Optional("notes", default=""): cv.string,
+        }),
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_REMOVE_IDENTITY, handle_remove_identity,
+        schema=vol.Schema({
+            vol.Optional("entry_id"): cv.string,
+            vol.Required("name"): cv.string,
+        }),
+    )

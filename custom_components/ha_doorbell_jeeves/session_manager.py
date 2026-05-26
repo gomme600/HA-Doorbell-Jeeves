@@ -1,4 +1,4 @@
-"""Session manager – orchestrates client, vision, security, identity, and auto-stop."""
+"""Session manager – orchestrates client, vision, security, and auto-stop."""
 
 from __future__ import annotations
 
@@ -13,13 +13,14 @@ from homeassistant.helpers.event import async_track_state_change_event
 
 from .client_base import BaseRealtimeClient
 from .const import (
-    CONF_ALLOWED_ENTITIES,
     CONF_API_BASE_URL,
     CONF_API_KEY,
     CONF_CAMERA_ENTITY,
     CONF_FRAME_MAX_HEIGHT,
     CONF_FRAME_MAX_WIDTH,
     CONF_FRAME_QUALITY,
+    CONF_IDENTITY_MODE,
+    CONF_FACE_SENSOR_ENTITY,
     CONF_MEDIA_PLAYER_ENTITY,
     CONF_MODEL,
     CONF_PROVIDER,
@@ -43,29 +44,22 @@ from .const import (
     EVENT_SESSION_ENDED,
     EVENT_SESSION_STARTED,
     EVENT_TOOL_CALL,
+    IDENTITY_MODE_BOTH,
+    IDENTITY_MODE_REFERENCE_IMAGES,
+    IDENTITY_MODE_SENSOR,
     PROVIDER_GEMINI,
-    PROVIDER_OPENAI,
     SECURITY_MODE_AUTO,
 )
 from .frame_processor import process_frame
-from .identity import IdentityManager
 from .security import SecurityManager
-from .tools import build_openai_tool_declarations, build_tool_declarations, execute_tool_call
+from .store import DataStore
+from .tools import build_gemini_tools, build_openai_tools, build_system_context, execute_tool_call
 
 _LOGGER = logging.getLogger(__name__)
 
 
 class JeevesSessionManager:
-    """Orchestrates the full concierge session lifecycle.
-
-    Manages:
-      - Provider-agnostic AI client (Gemini or OpenAI-compatible)
-      - Vision loop with configurable FPS (0.1–60) and frame downscaling
-      - Per-action security evaluation
-      - Identity context injection
-      - Auto-stop triggers (entity state changes, HA events)
-      - Session timeout
-    """
+    """Orchestrates the full concierge session lifecycle."""
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         self.hass = hass
@@ -74,16 +68,15 @@ class JeevesSessionManager:
         self._vision_task: asyncio.Task[None] | None = None
         self._timeout_task: asyncio.Task[None] | None = None
         self._active = False
-
-        # Merge data + options
         self._config = dict(entry.data) | dict(entry.options)
 
-        # Sub-managers
-        self._identity = IdentityManager(hass, entry.entry_id, self._config)
-        self._security = SecurityManager(hass, self._config)
+        # Data store (entities, actions, identities)
+        self.store = DataStore(hass, entry.entry_id)
+        self._security = SecurityManager(hass, self._config, self.store)
 
-        # Auto-stop listener handles
+        # Auto-stop & auto-start listener handles
         self._stop_unsubs: list[CALLBACK_TYPE] = []
+        self._start_unsubs: list[CALLBACK_TYPE] = []
 
     @property
     def is_active(self) -> bool:
@@ -93,13 +86,10 @@ class JeevesSessionManager:
     def security(self) -> SecurityManager:
         return self._security
 
-    @property
-    def identity_manager(self) -> IdentityManager:
-        return self._identity
-
     async def async_initialize(self) -> None:
-        """Load persistent data on integration setup."""
-        await self._identity.async_load()
+        """Load persistent data and register start triggers."""
+        await self.store.async_load()
+        self._register_start_triggers()
 
     async def async_start_session(self) -> None:
         """Start the AI concierge session."""
@@ -111,26 +101,29 @@ class JeevesSessionManager:
         provider = config.get(CONF_PROVIDER, PROVIDER_GEMINI)
         api_key: str = config[CONF_API_KEY]
         model: str = config.get(CONF_MODEL, DEFAULT_MODEL_GEMINI)
-        system_prompt: str = config.get(CONF_SYSTEM_PROMPT, DEFAULT_SYSTEM_PROMPT)
 
-        # Build identity context
-        identity_context = await self._identity.build_identity_context()
-        full_prompt = f"{system_prompt}\n\n{identity_context}" if identity_context else system_prompt
+        # Build full system prompt with entity context
+        base_prompt: str = config.get(CONF_SYSTEM_PROMPT, DEFAULT_SYSTEM_PROMPT)
+        entity_context = build_system_context(self.store, self.hass)
+        identity_context = self._build_identity_context()
+        full_prompt = base_prompt
+        if entity_context:
+            full_prompt += f"\n\n{entity_context}"
+        if identity_context:
+            full_prompt += f"\n\n{identity_context}"
 
         # Reference images
-        reference_images = self._identity.get_reference_images_for_session()
+        reference_images = self._get_reference_images()
 
-        # Create provider-specific client
-        if provider == PROVIDER_OPENAI:
-            voice = config.get(CONF_VOICE, DEFAULT_VOICE_OPENAI)
-            self._client = await self._create_openai_client(
-                api_key, model, full_prompt, voice, reference_images, config
-            )
-        else:
+        # Create client
+        if provider == PROVIDER_GEMINI:
             voice = config.get(CONF_VOICE, DEFAULT_VOICE_GEMINI)
-            self._client = await self._create_gemini_client(
-                api_key, model, full_prompt, voice, reference_images, config
-            )
+            tools = build_gemini_tools(self.store)
+            self._client = await self._create_gemini_client(api_key, model, full_prompt, voice, tools, reference_images)
+        else:
+            voice = config.get(CONF_VOICE, DEFAULT_VOICE_OPENAI)
+            tools = build_openai_tools(self.store)
+            self._client = await self._create_openai_client(api_key, model, full_prompt, voice, tools, reference_images, config)
 
         # Security reset
         self._security.start_session()
@@ -139,39 +132,33 @@ class JeevesSessionManager:
         await self._client.connect()
         self._active = True
 
-        # Start vision loop
+        # Vision loop
         fps = config.get(CONF_VISION_FPS, DEFAULT_VISION_FPS)
         camera_entity = config.get(CONF_CAMERA_ENTITY, "")
         if camera_entity:
             self._vision_task = asyncio.create_task(self._vision_loop(camera_entity, fps))
 
-        # Session timeout
+        # Timeout
         timeout = config.get(CONF_SESSION_TIMEOUT, DEFAULT_SESSION_TIMEOUT)
         if timeout > 0:
             self._timeout_task = asyncio.create_task(self._session_timeout(timeout))
 
-        # Register auto-stop triggers
+        # Stop triggers
         self._register_stop_triggers()
 
         self.hass.bus.async_fire(EVENT_SESSION_STARTED, {"entry_id": self.entry.entry_id})
-        _LOGGER.info(
-            "Session started (provider=%s, model=%s, fps=%.1f, timeout=%ds)",
-            provider, model, fps, timeout,
-        )
+        _LOGGER.info("Session started (provider=%s, model=%s, fps=%.1f)", provider, model, fps)
 
     async def async_stop_session(self) -> None:
         """Tear down the active session."""
         if not self._active:
             return
-
         self._active = False
 
-        # Unregister stop triggers
         for unsub in self._stop_unsubs:
             unsub()
         self._stop_unsubs.clear()
 
-        # Cancel tasks
         for task in (self._vision_task, self._timeout_task):
             if task and not task.done():
                 task.cancel()
@@ -182,7 +169,6 @@ class JeevesSessionManager:
         self._vision_task = None
         self._timeout_task = None
 
-        # Disconnect client
         if self._client:
             await self._client.disconnect()
             self._client = None
@@ -191,82 +177,90 @@ class JeevesSessionManager:
         _LOGGER.info("Session ended (audit entries: %d)", len(self._security.audit_log))
 
     async def async_send_audio(self, audio_base64: str) -> None:
-        """Forward PCM audio into the active session."""
         if not self._client or not self._active:
             return
         await self._client.send_audio(base64.b64decode(audio_base64))
 
-    # ─── Auto-Stop Triggers ───────────────────────────────────────────────────
+    # ─── Start Triggers ───────────────────────────────────────────────────────
+
+    def _register_start_triggers(self) -> None:
+        """Register entity listeners that auto-start the session."""
+        for trigger in self.store.start_triggers:
+            entity_id = trigger.entity_id
+            to_state = trigger.to_state
+            from_state = trigger.from_state
+
+            @callback
+            def _on_start_trigger(event: Event, _to: str = to_state, _from: str = from_state) -> None:
+                new_state = event.data.get("new_state")
+                old_state = event.data.get("old_state")
+                if new_state is None:
+                    return
+                if new_state.state != _to:
+                    return
+                if _from and old_state and old_state.state != _from:
+                    return
+                if not self._active:
+                    _LOGGER.info("Start trigger: %s → %s", event.data.get("entity_id"), _to)
+                    self.hass.async_create_task(self.async_start_session())
+
+            unsub = async_track_state_change_event(self.hass, [entity_id], _on_start_trigger)
+            self._start_unsubs.append(unsub)
+
+    def unregister_start_triggers(self) -> None:
+        """Remove start trigger listeners (called on unload)."""
+        for unsub in self._start_unsubs:
+            unsub()
+        self._start_unsubs.clear()
+
+    # ─── Stop Triggers ────────────────────────────────────────────────────────
 
     def _register_stop_triggers(self) -> None:
-        """Register HA state listeners and event listeners that stop the session.
-
-        This handles:
-          - Homeowner taking over via Reolink app (entity becomes 'on')
-          - Front door opening (lock entity state change)
-          - Any custom HA event
-        """
         config = self._config
-
-        # Entity state-based triggers
         stop_entities = config.get(CONF_STOP_ENTITIES, [])
         stop_states = config.get(CONF_STOP_ENTITY_STATES, {})
 
         if stop_entities:
             @callback
-            def _on_entity_change(event: Event) -> None:
-                """Stop session when a monitored entity reaches its target state."""
+            def _on_stop(event: Event) -> None:
                 entity_id = event.data.get("entity_id", "")
                 new_state = event.data.get("new_state")
                 if new_state is None:
                     return
-
-                # Check if this entity has a specific target state configured
                 target = stop_states.get(entity_id)
                 if target:
                     if new_state.state == target:
-                        _LOGGER.info("Auto-stop: %s reached state '%s'", entity_id, target)
+                        _LOGGER.info("Auto-stop: %s → %s", entity_id, target)
                         self.hass.async_create_task(self.async_stop_session())
                 else:
-                    # Default: any state change stops session
-                    _LOGGER.info("Auto-stop: %s state changed", entity_id)
+                    _LOGGER.info("Auto-stop: %s changed", entity_id)
                     self.hass.async_create_task(self.async_stop_session())
 
-            unsub = async_track_state_change_event(self.hass, stop_entities, _on_entity_change)
+            unsub = async_track_state_change_event(self.hass, stop_entities, _on_stop)
             self._stop_unsubs.append(unsub)
 
-        # Event-based triggers
-        stop_events = config.get(CONF_STOP_EVENTS, [])
-        for event_type in stop_events:
+        for event_type in config.get(CONF_STOP_EVENTS, []):
             @callback
-            def _on_event(event: Event, evt_type: str = event_type) -> None:
-                _LOGGER.info("Auto-stop: event '%s' fired", evt_type)
+            def _on_event(event: Event, evt: str = event_type) -> None:
+                _LOGGER.info("Auto-stop: event '%s'", evt)
                 self.hass.async_create_task(self.async_stop_session())
-
             unsub = self.hass.bus.async_listen(event_type, _on_event)
             self._stop_unsubs.append(unsub)
 
     # ─── Vision Loop ──────────────────────────────────────────────────────────
 
     async def _vision_loop(self, camera_entity: str, fps: float) -> None:
-        """Capture, downscale, and inject camera frames at configured FPS."""
         interval = 1.0 / max(fps, 0.1)
         max_w = self._config.get(CONF_FRAME_MAX_WIDTH, DEFAULT_FRAME_MAX_WIDTH)
         max_h = self._config.get(CONF_FRAME_MAX_HEIGHT, DEFAULT_FRAME_MAX_HEIGHT)
         quality = self._config.get(CONF_FRAME_QUALITY, DEFAULT_FRAME_QUALITY)
 
-        _LOGGER.debug("Vision loop: %.1f FPS, max %dx%d, quality=%d", fps, max_w, max_h, quality)
-
         while self._active:
             try:
-                image = await self.hass.components.camera.async_get_image(
-                    camera_entity, timeout=5
-                )
+                image = await self.hass.components.camera.async_get_image(camera_entity, timeout=5)
                 if image and self._client:
-                    # Downscale in executor to avoid blocking event loop
                     processed = await self.hass.async_add_executor_job(
-                        process_frame, image.content,
-                        max_w, max_h, quality,
+                        process_frame, image.content, max_w, max_h, quality,
                     )
                     frame_b64 = base64.b64encode(processed).decode("ascii")
                     await self._client.send_image(frame_b64, mime_type="image/jpeg")
@@ -274,10 +268,7 @@ class JeevesSessionManager:
                 break
             except Exception:
                 _LOGGER.debug("Vision frame failed", exc_info=True)
-
             await asyncio.sleep(interval)
-
-    # ─── Session Timeout ──────────────────────────────────────────────────────
 
     async def _session_timeout(self, timeout_seconds: int) -> None:
         try:
@@ -288,46 +279,65 @@ class JeevesSessionManager:
         except asyncio.CancelledError:
             pass
 
+    # ─── Identity Context ─────────────────────────────────────────────────────
+
+    def _build_identity_context(self) -> str:
+        mode = self._config.get(CONF_IDENTITY_MODE, "none")
+        parts: list[str] = []
+
+        if mode in (IDENTITY_MODE_SENSOR, IDENTITY_MODE_BOTH):
+            sensor_id = self._config.get(CONF_FACE_SENSOR_ENTITY)
+            if sensor_id:
+                state = self.hass.states.get(sensor_id)
+                if state and state.state not in ("unknown", "unavailable", ""):
+                    parts.append(f"[IDENTITY SENSOR: Current visitor identified as '{state.state}']")
+
+        if mode in (IDENTITY_MODE_REFERENCE_IMAGES, IDENTITY_MODE_BOTH):
+            if self.store.known_identities:
+                lines = ["[KNOWN IDENTITIES:]"]
+                for ident in self.store.known_identities:
+                    lines.append(
+                        f"- {ident.name} ({ident.identity_type}): {ident.description} "
+                        f"[{ident.relationship}, access: {ident.access_level}]"
+                    )
+                parts.append("\n".join(lines))
+
+        return "\n\n".join(parts)
+
+    def _get_reference_images(self) -> list[dict[str, str]]:
+        mode = self._config.get(CONF_IDENTITY_MODE, "none")
+        if mode not in (IDENTITY_MODE_REFERENCE_IMAGES, IDENTITY_MODE_BOTH):
+            return []
+        images = []
+        for ident in self.store.known_identities:
+            if ident.image_base64:
+                images.append({
+                    "image_base64": ident.image_base64,
+                    "caption": f"{ident.name} ({ident.relationship}): {ident.description}",
+                })
+        return images
+
     # ─── Client Factories ─────────────────────────────────────────────────────
 
-    async def _create_gemini_client(
-        self, api_key: str, model: str, prompt: str, voice: str,
-        reference_images: list[dict[str, str]], config: dict[str, Any],
-    ) -> BaseRealtimeClient:
+    async def _create_gemini_client(self, api_key: str, model: str, prompt: str,
+                                     voice: str, tools: list, reference_images: list) -> BaseRealtimeClient:
         from .gemini_client import GeminiLiveClient  # noqa: PLC0415
-        from google.genai import types  # noqa: PLC0415
-
-        tools = build_tool_declarations(config)
-
         return GeminiLiveClient(
-            api_key=api_key,
-            model=model,
-            system_prompt=prompt,
-            tools=tools,
-            voice=voice,
-            reference_images=reference_images,
+            api_key=api_key, model=model, system_prompt=prompt, tools=tools,
+            voice=voice, reference_images=reference_images,
             on_audio_output=self._handle_audio_output,
             on_tool_call=self._handle_tool_call,
             on_session_end=self._handle_session_end,
             on_transcript=self._handle_transcript,
         )
 
-    async def _create_openai_client(
-        self, api_key: str, model: str, prompt: str, voice: str,
-        reference_images: list[dict[str, str]], config: dict[str, Any],
-    ) -> BaseRealtimeClient:
+    async def _create_openai_client(self, api_key: str, model: str, prompt: str,
+                                     voice: str, tools: list, reference_images: list,
+                                     config: dict) -> BaseRealtimeClient:
         from .openai_client import OpenAIRealtimeClient  # noqa: PLC0415
-
-        base_url = config.get(CONF_API_BASE_URL) or None
-        tools = build_openai_tool_declarations(config)
-
         return OpenAIRealtimeClient(
-            api_key=api_key,
-            model=model,
-            base_url=base_url,
-            system_prompt=prompt,
-            tools=tools,
-            voice=voice,
+            api_key=api_key, model=model, base_url=config.get(CONF_API_BASE_URL) or None,
+            system_prompt=prompt, tools=tools, voice=voice,
             reference_images=reference_images,
             on_audio_output=self._handle_audio_output,
             on_tool_call=self._handle_tool_call,
@@ -345,10 +355,7 @@ class JeevesSessionManager:
             "media_player": self._config.get(CONF_MEDIA_PLAYER_ENTITY, ""),
         })
 
-    async def _handle_tool_call(
-        self, function_name: str, arguments: dict[str, Any]
-    ) -> dict[str, Any]:
-        """Evaluate security policy and execute tool."""
+    async def _handle_tool_call(self, function_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         self._security.log_event("tool_call_request", function_name, {"arguments": arguments})
         self.hass.bus.async_fire(EVENT_TOOL_CALL, {
             "entry_id": self.entry.entry_id,
@@ -356,50 +363,42 @@ class JeevesSessionManager:
             "arguments": arguments,
         })
 
-        # PIN verification bypass
+        # PIN verification
         if function_name == "verify_pin":
             pin = arguments.get("pin", "")
             verified = self._security.check_pin(pin)
-            self._security.log_event("pin_attempt", function_name, {"verified": verified})
-            if verified:
-                return {"success": True, "message": "PIN verified."}
-            return {"success": False, "message": "Incorrect PIN."}
+            return {"success": verified, "message": "PIN verified." if verified else "Incorrect PIN."}
 
         # Security evaluation
-        policy = self._security.get_policy(function_name)
-        if policy.security_mode != SECURITY_MODE_AUTO:
+        mode, _, _ = self._security.get_action_security(function_name)
+        if mode != SECURITY_MODE_AUTO:
             conversation_summary = self._client.conversation_summary if self._client else ""
             claimed_identity = self._extract_claimed_identity(conversation_summary)
 
             current_frame: str | None = None
-            if policy.require_camera_feed:
-                current_frame = await self._security.get_camera_frame()
-
             reference_image: str | None = None
-            if policy.require_visual_match:
+            _entity, action = self.store.get_action(function_name)
+            if action and action.require_camera_feed:
+                current_frame = await self._security._get_camera_frame()
+            if action and action.require_visual_match:
                 reference_image = self._get_reference_for_identity(claimed_identity)
 
             approved, reason = await self._security.evaluate_action(
-                action=function_name,
+                action_id=function_name,
                 arguments=arguments,
                 conversation_summary=conversation_summary,
                 claimed_identity=claimed_identity,
                 current_frame_b64=current_frame,
                 reference_image_b64=reference_image,
             )
-
             if not approved:
                 _LOGGER.warning("BLOCKED %s: %s", function_name, reason)
-                return {
-                    "error": f"Action blocked: {reason}",
-                    "instruction": "Inform the visitor this action cannot be completed.",
-                }
+                return {"error": f"Action blocked: {reason}", "instruction": "Inform the visitor this action cannot be completed."}
 
         # Execute
-        result = await execute_tool_call(self.hass, self._config, function_name, arguments)
+        result = await execute_tool_call(self.hass, self.store, function_name, arguments)
         if result.get("success"):
             self._security.record_action(function_name)
-        self._security.log_event("tool_call_executed", function_name, {"result": result}, approved=True)
         return result
 
     def _handle_session_end(self) -> None:
@@ -412,11 +411,11 @@ class JeevesSessionManager:
 
     def _extract_claimed_identity(self, conversation_summary: str) -> str:
         summary_lower = conversation_summary.lower()
-        for face in self._identity.known_faces:
-            if face.name.lower() in summary_lower:
-                return face.name
+        for ident in self.store.known_identities:
+            if ident.name.lower() in summary_lower:
+                return ident.name
         return "unknown"
 
     def _get_reference_for_identity(self, name: str) -> str | None:
-        face = self._identity.get_face_by_name(name)
-        return face.image_base64 if face and face.image_base64 else None
+        ident = self.store.get_identity(name)
+        return ident.image_base64 if ident and ident.image_base64 else None

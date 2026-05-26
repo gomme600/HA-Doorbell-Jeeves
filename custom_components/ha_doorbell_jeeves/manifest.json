@@ -3,10 +3,10 @@
   "name": "Doorbell Jeeves",
   "codeowners": ["@gomme600"],
   "config_flow": true,
-  "dependencies": ["camera", "media_player", "persistent_notification"],
+  "dependencies": ["camera"],
   "documentation": "https://github.com/gomme600/HA-Doorbell-Jeeves",
   "iot_class": "cloud_push",
   "issue_tracker": "https://github.com/gomme600/HA-Doorbell-Jeeves/issues",
   "requirements": ["google-genai>=1.14.0", "openai>=1.40.0", "Pillow>=10.0.0"],
-  "version": "1.0.0"
+  "version": "2.0.0"
 }

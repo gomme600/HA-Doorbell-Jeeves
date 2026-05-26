@@ -8,11 +8,7 @@ from typing import Any
 
 
 class BaseRealtimeClient(ABC):
-    """Protocol for real-time audio/vision streaming clients.
-
-    Both Gemini Live and OpenAI Realtime implement this interface,
-    allowing the session manager to be provider-agnostic.
-    """
+    """Protocol for real-time audio/vision streaming clients."""
 
     @property
     @abstractmethod

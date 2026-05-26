@@ -1,44 +1,311 @@
 start_session:
-  name: Start Jeeves Session
-  description: >-
-    Start the AI concierge session. Connects to the configured provider
-    (Gemini or OpenAI), begins the vision loop, and registers auto-stop triggers.
+  name: Start Session
+  description: Start the AI doorbell concierge session.
   fields:
     entry_id:
-      name: Config Entry ID
-      description: The config entry ID of the Doorbell Jeeves instance.
-      required: true
+      name: Entry ID
+      description: Config entry ID (optional if only one instance).
+      example: "abc123"
+      required: false
       selector:
         text:
 
 stop_session:
-  name: Stop Jeeves Session
-  description: >-
-    Stop the active session. Use from automations for human takeover
-    or programmatic interruption.
+  name: Stop Session
+  description: Stop the active AI doorbell concierge session.
   fields:
     entry_id:
-      name: Config Entry ID
-      description: The config entry ID to stop.
-      required: true
+      name: Entry ID
+      description: Config entry ID (optional if only one instance).
+      required: false
       selector:
         text:
 
 send_audio:
-  name: Send Audio Chunk
-  description: >-
-    Send raw PCM audio (base64-encoded) into the active session.
-    Format: 24000 Hz, mono, 16-bit little-endian PCM.
+  name: Send Audio
+  description: Send raw PCM audio (base64-encoded) to the active AI session.
   fields:
     entry_id:
-      name: Config Entry ID
-      description: The active instance entry ID.
-      required: true
+      name: Entry ID
+      description: Config entry ID (optional if only one instance).
+      required: false
       selector:
         text:
     audio_base64:
-      name: Audio Data (Base64)
-      description: Base64-encoded PCM audio (24kHz, mono, 16-bit LE).
+      name: Audio Data
+      description: Base64-encoded PCM audio (16-bit, 24kHz, mono).
+      required: true
+      selector:
+        text:
+
+add_entity:
+  name: Add Managed Entity
+  description: Add or update an entity exposed to the AI agent.
+  fields:
+    entry_id:
+      name: Entry ID
+      required: false
+      selector:
+        text:
+    entity_id:
+      name: Entity
+      description: The Home Assistant entity to manage.
+      required: true
+      selector:
+        entity:
+    name:
+      name: Display Name
+      description: Name shown to the AI (e.g., "Porch Light").
+      required: true
+      selector:
+        text:
+    description:
+      name: Description
+      description: Description sent to the AI explaining what this entity is.
+      required: false
+      selector:
+        text:
+          multiline: true
+    security_mode:
+      name: Security Mode
+      description: Default security policy for this entity.
+      required: false
+      default: "auto"
+      selector:
+        select:
+          options:
+            - "auto"
+            - "validated"
+            - "pin"
+            - "pin_and_validated"
+    require_visual_match:
+      name: Require Visual Match
+      description: Require camera visual identity verification.
+      required: false
+      default: false
+      selector:
+        boolean:
+    require_camera_feed:
+      name: Require Camera Feed
+      description: Send current camera frame to security validator.
+      required: false
+      default: false
+      selector:
+        boolean:
+
+remove_entity:
+  name: Remove Managed Entity
+  description: Remove an entity from AI agent access.
+  fields:
+    entry_id:
+      name: Entry ID
+      required: false
+      selector:
+        text:
+    entity_id:
+      name: Entity
+      description: The entity to remove.
+      required: true
+      selector:
+        entity:
+
+add_action:
+  name: Add Entity Action
+  description: Add a custom action the AI can perform on a managed entity.
+  fields:
+    entry_id:
+      name: Entry ID
+      required: false
+      selector:
+        text:
+    entity_id:
+      name: Target Entity
+      description: The managed entity this action belongs to.
+      required: true
+      selector:
+        entity:
+    action_id:
+      name: Action ID
+      description: Unique identifier (e.g., "unlock_gate").
+      required: true
+      selector:
+        text:
+    action_name:
+      name: Action Name
+      description: Human-readable name (e.g., "Unlock the gate").
+      required: true
+      selector:
+        text:
+    description:
+      name: Description
+      description: Description of what this action does (sent to AI).
+      required: false
+      selector:
+        text:
+          multiline: true
+    service:
+      name: Service
+      description: HA service to call (e.g., "lock.unlock").
+      required: true
+      selector:
+        text:
+    service_data:
+      name: Service Data
+      description: Additional service call data (JSON object).
+      required: false
+      selector:
+        object:
+    security_mode:
+      name: Security Mode
+      description: Security policy for this specific action.
+      required: false
+      default: "auto"
+      selector:
+        select:
+          options:
+            - "auto"
+            - "validated"
+            - "pin"
+            - "pin_and_validated"
+    require_visual_match:
+      name: Require Visual Match
+      required: false
+      default: false
+      selector:
+        boolean:
+    require_camera_feed:
+      name: Require Camera Feed
+      required: false
+      default: false
+      selector:
+        boolean:
+    max_per_session:
+      name: Max Uses Per Session
+      description: Maximum times this action can be used per session (0 = unlimited).
+      required: false
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 50
+          mode: box
+    cooldown_seconds:
+      name: Cooldown (seconds)
+      description: Minimum time between uses.
+      required: false
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 300
+          mode: box
+    validator_prompt:
+      name: Validator Instructions
+      description: Custom instructions for the security validator agent.
+      required: false
+      selector:
+        text:
+          multiline: true
+
+remove_action:
+  name: Remove Entity Action
+  description: Remove an action by its ID.
+  fields:
+    entry_id:
+      name: Entry ID
+      required: false
+      selector:
+        text:
+    action_id:
+      name: Action ID
+      description: The action ID to remove.
+      required: true
+      selector:
+        text:
+
+add_identity:
+  name: Add Known Identity
+  description: Add a known person, animal, or object for recognition.
+  fields:
+    entry_id:
+      name: Entry ID
+      required: false
+      selector:
+        text:
+    name:
+      name: Name
+      description: The name of the identity (e.g., "John", "Buddy the dog").
+      required: true
+      selector:
+        text:
+    identity_type:
+      name: Type
+      required: false
+      default: "person"
+      selector:
+        select:
+          options:
+            - "person"
+            - "animal"
+            - "object"
+    relationship:
+      name: Relationship
+      required: false
+      default: "guest"
+      selector:
+        select:
+          options:
+            - "owner"
+            - "family"
+            - "friend"
+            - "pet"
+            - "delivery"
+            - "guest"
+    description:
+      name: Physical Description
+      description: Visual description for the AI to match against camera feed.
+      required: false
+      selector:
+        text:
+          multiline: true
+    access_level:
+      name: Access Level
+      required: false
+      default: "guest"
+      selector:
+        select:
+          options:
+            - "full"
+            - "limited"
+            - "guest"
+            - "none"
+    image_base64:
+      name: Reference Image (Base64)
+      description: Base64-encoded reference image for visual matching.
+      required: false
+      selector:
+        text:
+          multiline: true
+    notes:
+      name: Notes
+      description: Additional notes about this identity.
+      required: false
+      selector:
+        text:
+          multiline: true
+
+remove_identity:
+  name: Remove Known Identity
+  description: Remove a known identity by name.
+  fields:
+    entry_id:
+      name: Entry ID
+      required: false
+      selector:
+        text:
+    name:
+      name: Name
+      description: Name of the identity to remove.
       required: true
       selector:
         text:

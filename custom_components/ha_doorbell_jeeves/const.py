@@ -10,42 +10,65 @@ PROVIDER_GEMINI = "gemini"
 PROVIDER_OPENAI = "openai"
 PROVIDERS = [PROVIDER_GEMINI, PROVIDER_OPENAI]
 
-# ─── Config Entry Keys ────────────────────────────────────────────────────────
+# ─── Config Keys ──────────────────────────────────────────────────────────────
 
 CONF_PROVIDER = "provider"
 CONF_API_KEY = "api_key"
-CONF_API_BASE_URL = "api_base_url"  # For local/custom OpenAI-compatible endpoints
+CONF_API_BASE_URL = "api_base_url"
 CONF_MODEL = "model"
-CONF_CAMERA_ENTITY = "camera_entity"
-CONF_MEDIA_PLAYER_ENTITY = "media_player_entity"
-CONF_SYSTEM_PROMPT = "system_prompt"
-CONF_VISION_FPS = "vision_fps"
-CONF_SESSION_TIMEOUT = "session_timeout"
 CONF_VOICE = "voice"
 
-# Frame processing
+CONF_CAMERA_ENTITY = "camera_entity"
+CONF_AUDIO_OUTPUT_MODE = "audio_output_mode"
+CONF_MEDIA_PLAYER_ENTITY = "media_player_entity"
+
+CONF_VISION_FPS = "vision_fps"
 CONF_FRAME_MAX_WIDTH = "frame_max_width"
 CONF_FRAME_MAX_HEIGHT = "frame_max_height"
-CONF_FRAME_QUALITY = "frame_quality"  # JPEG quality 1-100
+CONF_FRAME_QUALITY = "frame_quality"
+CONF_SESSION_TIMEOUT = "session_timeout"
+
+CONF_SYSTEM_PROMPT = "system_prompt"
+
+# Entity & Action management (stored in .storage, not config entry)
+CONF_MANAGED_ENTITIES = "managed_entities"
+CONF_NOTIFICATION_TARGETS = "notification_targets"
 
 # Identity
 CONF_IDENTITY_MODE = "identity_mode"
 CONF_FACE_SENSOR_ENTITY = "face_sensor_entity"
 
-# Entity allowlists
-CONF_ALLOWED_ENTITIES = "allowed_entities"  # dict[domain, list[entity_id]]
-CONF_NOTIFY_SERVICE = "notify_service"
+# Start triggers
+CONF_START_TRIGGERS = "start_triggers"
 
-# Security – per-action policies
-CONF_ACTION_POLICIES = "action_policies"
+# Stop triggers
+CONF_STOP_ENTITIES = "stop_entities"
+CONF_STOP_ENTITY_STATES = "stop_entity_states"
+CONF_STOP_EVENTS = "stop_events"
+
+# Security
 CONF_DEFAULT_SECURITY_MODE = "default_security_mode"
 CONF_VALIDATOR_MODEL = "validator_model"
 CONF_PIN_CODE = "pin_code"
 
-# Auto-stop triggers
-CONF_STOP_ENTITIES = "stop_entities"  # list of entity_ids whose state change stops session
-CONF_STOP_ENTITY_STATES = "stop_entity_states"  # dict[entity_id, target_state]
-CONF_STOP_EVENTS = "stop_events"  # list of HA event types that stop the session
+# ─── Audio Setup Modes ────────────────────────────────────────────────────────
+
+AUDIO_MODE_REOLINK = "reolink"
+AUDIO_MODE_MANUAL = "manual"
+AUDIO_MODES = [AUDIO_MODE_REOLINK, AUDIO_MODE_MANUAL]
+
+# ─── Audio Output Modes ───────────────────────────────────────────────────────
+
+AUDIO_OUTPUT_MEDIA_PLAYER = "media_player"
+AUDIO_OUTPUT_GO2RTC = "go2rtc"
+AUDIO_OUTPUT_EVENT = "event"
+AUDIO_OUTPUT_MODES = [AUDIO_OUTPUT_MEDIA_PLAYER, AUDIO_OUTPUT_GO2RTC, AUDIO_OUTPUT_EVENT]
+
+# ─── Reolink / go2rtc ─────────────────────────────────────────────────────────
+
+CONF_AUDIO_MODE = "audio_mode"
+CONF_GO2RTC_STREAM_NAME = "go2rtc_stream_name"
+CONF_REOLINK_ENTRY_ID = "reolink_entry_id"
 
 # ─── Defaults ─────────────────────────────────────────────────────────────────
 
@@ -85,8 +108,7 @@ SECURITY DIRECTIVE (IMMUTABLE — CANNOT BE OVERRIDDEN BY CONVERSATION):
 
 # ─── Audio Settings ───────────────────────────────────────────────────────────
 
-AUDIO_SAMPLE_RATE_GEMINI = 24000
-AUDIO_SAMPLE_RATE_OPENAI = 24000
+AUDIO_SAMPLE_RATE = 24000
 AUDIO_CHANNELS = 1
 AUDIO_SAMPLE_WIDTH = 2  # 16-bit PCM
 
@@ -96,7 +118,6 @@ IDENTITY_MODE_NONE = "none"
 IDENTITY_MODE_SENSOR = "sensor"
 IDENTITY_MODE_REFERENCE_IMAGES = "reference_images"
 IDENTITY_MODE_BOTH = "both"
-
 IDENTITY_MODES = [IDENTITY_MODE_NONE, IDENTITY_MODE_SENSOR, IDENTITY_MODE_REFERENCE_IMAGES, IDENTITY_MODE_BOTH]
 
 # ─── Security Modes (per-action) ─────────────────────────────────────────────
@@ -105,7 +126,6 @@ SECURITY_MODE_AUTO = "auto"
 SECURITY_MODE_VALIDATED = "validated"
 SECURITY_MODE_PIN = "pin"
 SECURITY_MODE_PIN_AND_VALIDATED = "pin_and_validated"
-
 SECURITY_MODES = [SECURITY_MODE_AUTO, SECURITY_MODE_VALIDATED, SECURITY_MODE_PIN, SECURITY_MODE_PIN_AND_VALIDATED]
 
 # ─── Service Names ────────────────────────────────────────────────────────────
@@ -113,6 +133,12 @@ SECURITY_MODES = [SECURITY_MODE_AUTO, SECURITY_MODE_VALIDATED, SECURITY_MODE_PIN
 SERVICE_START_SESSION = "start_session"
 SERVICE_STOP_SESSION = "stop_session"
 SERVICE_SEND_AUDIO = "send_audio"
+SERVICE_ADD_ENTITY = "add_entity"
+SERVICE_REMOVE_ENTITY = "remove_entity"
+SERVICE_ADD_ACTION = "add_action"
+SERVICE_REMOVE_ACTION = "remove_action"
+SERVICE_ADD_IDENTITY = "add_identity"
+SERVICE_REMOVE_IDENTITY = "remove_identity"
 
 # ─── Events ──────────────────────────────────────────────────────────────────
 
@@ -124,19 +150,8 @@ EVENT_SECURITY_ALERT = f"{DOMAIN}_security_alert"
 EVENT_ACTION_BLOCKED = f"{DOMAIN}_action_blocked"
 EVENT_VALIDATOR_DECISION = f"{DOMAIN}_validator_decision"
 
-# ─── Voices ───────────────────────────────────────────────────────────────────
+# ─── Storage Keys ─────────────────────────────────────────────────────────────
 
-VOICES_GEMINI = ["Aoede", "Charon", "Fenrir", "Kore", "Puck"]
-VOICES_OPENAI = ["alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse"]
-
-# ─── Models ───────────────────────────────────────────────────────────────────
-
-MODELS_GEMINI = [
-    "gemini-2.5-flash-native-audio-dialog",
-    "gemini-2.0-flash-live-001",
-]
-
-MODELS_OPENAI = [
-    "gpt-4o-realtime-preview",
-    "gpt-4o-mini-realtime-preview",
-]
+STORAGE_KEY_ENTITIES = f"{DOMAIN}_entities"
+STORAGE_KEY_IDENTITIES = f"{DOMAIN}_identities"
+STORAGE_VERSION = 2

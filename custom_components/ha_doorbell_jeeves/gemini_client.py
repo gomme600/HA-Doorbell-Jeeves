@@ -12,16 +12,13 @@ from google import genai
 from google.genai import types
 
 from .client_base import BaseRealtimeClient
-from .const import AUDIO_SAMPLE_RATE_GEMINI
+from .const import AUDIO_SAMPLE_RATE
 
 _LOGGER = logging.getLogger(__name__)
 
 
 class GeminiLiveClient(BaseRealtimeClient):
-    """Async client for the Gemini Multimodal Live streaming API.
-
-    Handles bidirectional WebSocket: audio in/out, vision frames, and tool calls.
-    """
+    """Async client for the Gemini Multimodal Live streaming API."""
 
     def __init__(
         self,
@@ -115,7 +112,7 @@ class GeminiLiveClient(BaseRealtimeClient):
             await self._session.send(
                 input=types.LiveClientRealtimeInput(
                     media_chunks=[
-                        types.Blob(data=pcm_bytes, mime_type=f"audio/pcm;rate={AUDIO_SAMPLE_RATE_GEMINI}")
+                        types.Blob(data=pcm_bytes, mime_type=f"audio/pcm;rate={AUDIO_SAMPLE_RATE}")
                     ]
                 )
             )
@@ -135,14 +132,12 @@ class GeminiLiveClient(BaseRealtimeClient):
         except Exception:
             _LOGGER.exception("Failed to send image")
 
-    # ─── Reference Images ─────────────────────────────────────────────────────
-
     async def _inject_reference_images(self) -> None:
         if not self._reference_images:
             return
         parts: list[types.Part] = [
             types.Part(text=(
-                "The following are reference photos of known people and animals. "
+                "The following are reference photos of known people/animals. "
                 "Use these to identify visitors in the live camera feed."
             )),
         ]
@@ -159,8 +154,6 @@ class GeminiLiveClient(BaseRealtimeClient):
             )
         except Exception:
             _LOGGER.exception("Failed to inject reference images")
-
-    # ─── Receive Loop ─────────────────────────────────────────────────────────
 
     async def _receive_loop(self) -> None:
         try:

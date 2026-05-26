@@ -2,147 +2,220 @@
   "config": {
     "step": {
       "user": {
-        "title": "Provider & Credentials",
-        "description": "Choose your AI provider and enter credentials. For local models, select OpenAI and set the base URL to your server (e.g., http://localhost:8080/v1).",
+        "title": "Setup Mode",
+        "description": "Choose how to set up your doorbell audio. **Reolink** mode auto-detects your doorbell and configures 2-way audio via go2rtc. **Manual** mode lets you configure any camera and speaker.",
         "data": {
-          "provider": "Provider",
-          "api_key": "API Key",
-          "api_base_url": "Custom API Base URL (for local/self-hosted models)",
-          "model": "Model name (e.g., gemini-2.5-flash-native-audio-dialog or gpt-4o-realtime-preview)",
-          "voice": "Voice name"
+          "audio_mode": "Setup Mode"
         }
       },
-      "devices": {
-        "title": "Camera & Audio",
-        "description": "Configure the doorbell camera and audio output. Higher FPS gives the AI better temporal awareness but uses more bandwidth. Frame downscaling reduces latency.",
+      "reolink": {
+        "title": "Reolink Doorbell",
+        "description": "Select your Reolink doorbell camera. The integration will automatically configure 2-way audio using go2rtc and the existing Reolink integration.",
+        "data": {
+          "camera_entity": "Doorbell Camera"
+        }
+      },
+      "provider": {
+        "title": "AI Provider",
+        "description": "Configure the AI model that will power your doorbell concierge. For **Gemini**, use the native audio dialog model. For **OpenAI**, any realtime-capable model works. You can also use local models with an OpenAI-compatible API by setting the Base URL.",
+        "data": {
+          "provider": "AI Provider",
+          "api_key": "API Key",
+          "api_base_url": "API Base URL (optional, for local/custom models)",
+          "model": "Model Name",
+          "voice": "Voice Name"
+        }
+      },
+      "camera": {
+        "title": "Camera & Vision",
+        "description": "Configure the camera feed and how often video frames are sent to the AI model. Higher FPS gives better situational awareness but costs more tokens.",
         "data": {
           "camera_entity": "Camera Entity",
-          "media_player_entity": "Media Player (Speaker)",
-          "vision_fps": "Vision FPS (0.1 = one frame every 10s, 60 = real-time video)",
+          "audio_output_mode": "Audio Output Mode",
+          "media_player_entity": "Media Player (for speaker output)",
+          "vision_fps": "Vision Frame Rate (FPS)",
           "frame_max_width": "Max Frame Width (px)",
           "frame_max_height": "Max Frame Height (px)",
-          "frame_quality": "JPEG Quality (lower = faster, smaller)",
-          "session_timeout": "Session Timeout (0 = no limit)"
+          "frame_quality": "JPEG Quality (%)"
         }
       },
-      "entities": {
-        "title": "Allowed Entities",
-        "description": "The AI can ONLY interact with entities listed here. Leave a category empty to disable those tools entirely.",
+      "prompt": {
+        "title": "System Prompt",
+        "description": "Define the AI agent's personality and rules. This is the core instruction set that governs how Jeeves behaves, greets visitors, and makes decisions.",
         "data": {
-          "allowed_lights": "Lights",
-          "allowed_locks": "Locks / Gates",
-          "allowed_switches": "Switches",
-          "allowed_covers": "Covers (garage, gates)",
-          "allowed_sensors": "Sensors (read-only)",
-          "notify_service": "Notification service (e.g., notify.mobile_app_phone)"
-        }
-      },
-      "security": {
-        "title": "Security Policies",
-        "description": "Configure per-action security. 'Validated' actions are independently verified by a second AI agent before execution. 'PIN' actions require the visitor to speak a code.",
-        "data": {
-          "default_security_mode": "Default mode for unlisted actions",
-          "validated_actions": "Actions requiring validator approval",
-          "pin_actions": "Actions requiring PIN",
-          "validator_uses_camera": "Validator receives camera frame",
-          "validator_requires_visual": "Validator must confirm visual identity match",
-          "max_per_session": "Max executions per session (0 = unlimited)",
-          "cooldown_seconds": "Cooldown between same action (seconds)",
-          "validator_model": "Validator model (any Gemini/OpenAI model)",
-          "pin_code": "PIN Code"
-        }
-      },
-      "stop_triggers": {
-        "title": "Auto-Stop Triggers",
-        "description": "Configure what automatically stops the AI session. Use this for human takeover (e.g., Reolink app becomes active) or physical events (e.g., front door opens).",
-        "data": {
-          "stop_entities": "Stop when these entities change state",
-          "stop_entity_state_map": "State conditions (one per line: entity_id: state)",
-          "stop_events": "Stop on these HA events (comma-separated)"
-        }
-      },
-      "identity": {
-        "title": "Identity & Prompt",
-        "description": "Configure face recognition and the AI's personality/rules.",
-        "data": {
-          "identity_mode": "Identity Mode",
-          "face_sensor_entity": "Face Sensor Entity",
-          "system_prompt": "System Prompt"
+          "system_prompt": "System Prompt",
+          "session_timeout": "Session Timeout"
         }
       }
     },
     "error": {
-      "invalid_credentials": "Could not validate credentials. Check your API key, model, and base URL."
+      "invalid_api_key": "Could not validate the API key. Please check it and try again.",
+      "no_reolink_found": "No active Reolink integrations found. Please set up your Reolink doorbell in Home Assistant first."
+    },
+    "abort": {
+      "already_configured": "This doorbell is already configured."
     }
   },
   "options": {
     "step": {
       "init": {
-        "title": "Configure Doorbell Jeeves",
-        "description": "Select which settings to modify.",
-        "data": { "section": "Section" }
+        "title": "Doorbell Jeeves Settings",
+        "description": "Choose a section to configure:",
+        "menu_options": {
+          "general": "General (AI model, voice, timeout)",
+          "vision": "Camera & Vision (FPS, resolution)",
+          "entities": "Entities & Actions (devices the AI controls)",
+          "security": "Security (PIN, validation policies)",
+          "triggers": "Triggers (auto-start/stop conditions)",
+          "identities": "Known Identities (people, animals)",
+          "prompt": "System Prompt"
+        }
       },
       "general": {
         "title": "General Settings",
+        "description": "Configure the AI provider, model, and session behavior.",
         "data": {
-          "provider": "Provider",
+          "provider": "AI Provider",
           "api_key": "API Key",
-          "api_base_url": "Custom Base URL",
-          "model": "Model",
-          "voice": "Voice",
-          "session_timeout": "Timeout (s)"
+          "api_base_url": "API Base URL (optional)",
+          "model": "Model Name",
+          "voice": "Voice Name",
+          "session_timeout": "Session Timeout",
+          "validator_model": "Security Validator Model"
         }
       },
       "vision": {
-        "title": "Vision & Camera",
+        "title": "Camera & Vision",
+        "description": "Configure the camera feed sent to the AI. Lower resolution and FPS reduce token costs and improve response time.",
         "data": {
-          "camera_entity": "Camera",
-          "media_player_entity": "Speaker",
-          "vision_fps": "FPS",
-          "frame_max_width": "Max Width",
-          "frame_max_height": "Max Height",
-          "frame_quality": "JPEG Quality"
+          "camera_entity": "Camera Entity",
+          "vision_fps": "Frame Rate (FPS)",
+          "frame_max_width": "Max Width (px)",
+          "frame_max_height": "Max Height (px)",
+          "frame_quality": "JPEG Quality (%)"
         }
       },
       "entities": {
-        "title": "Allowed Entities",
+        "title": "Entities & Actions",
+        "description": "Manage the entities and actions available to the AI agent. {entity_summary}",
+        "menu_options": {
+          "add_entity": "➕ Add Entity",
+          "remove_entity": "➖ Remove Entity",
+          "add_notification": "🔔 Add Notification Target",
+          "remove_notification": "🗑️ Remove Notification Target",
+          "add_action": "⚡ Add Action to Entity",
+          "init": "← Back to Menu"
+        }
+      },
+      "add_entity": {
+        "title": "Add Managed Entity",
+        "description": "Add an entity that the AI can see and optionally control. The description tells the AI what this entity is and how to use it.",
         "data": {
-          "allowed_lights": "Lights",
-          "allowed_locks": "Locks",
-          "allowed_switches": "Switches",
-          "allowed_covers": "Covers",
-          "allowed_sensors": "Sensors",
-          "notify_service": "Notify Service"
+          "entity_id": "Entity",
+          "name": "Display Name (for AI)",
+          "description": "Description (what is this entity?)",
+          "security_mode": "Default Security Mode",
+          "require_visual_match": "Require Visual Identity Match",
+          "require_camera_feed": "Send Camera Feed to Validator"
+        }
+      },
+      "remove_entity": {
+        "title": "Remove Managed Entity",
+        "description": "Select an entity to remove from AI access.",
+        "data": {
+          "entity_id": "Entity to Remove"
+        }
+      },
+      "add_action": {
+        "title": "Add Action",
+        "description": "Create a custom action the AI can perform. Actions are tools the AI calls during conversation — e.g., 'Toggle the porch light' calls `light.toggle`.",
+        "data": {
+          "target_entity": "Target Entity",
+          "action_id": "Action ID (e.g., unlock_gate)",
+          "action_name": "Action Name (e.g., Unlock the gate)",
+          "action_description": "Description (tells AI when to use this)",
+          "service": "HA Service (e.g., lock.unlock)",
+          "action_security_mode": "Security Mode",
+          "action_visual_match": "Require Visual Match",
+          "action_camera_feed": "Send Camera to Validator",
+          "max_per_session": "Max Uses Per Session (0=unlimited)",
+          "cooldown_seconds": "Cooldown Between Uses (seconds)",
+          "validator_prompt": "Custom Validator Instructions (optional)"
+        }
+      },
+      "add_notification": {
+        "title": "Add Notification Target",
+        "description": "Add a notification service the AI can use to alert you (e.g., push notification, alarm).",
+        "data": {
+          "service": "Service (e.g., notify.mobile_app_phone)",
+          "name": "Display Name (e.g., Admin Phone)",
+          "description": "Description (tells AI when to use this)"
+        }
+      },
+      "remove_notification": {
+        "title": "Remove Notification Target",
+        "data": {
+          "service": "Notification to Remove"
         }
       },
       "security": {
-        "title": "Security Policies",
+        "title": "Security Settings",
+        "description": "Configure global security defaults. Per-entity and per-action overrides are configured in the Entities section.",
         "data": {
-          "default_security_mode": "Default Mode",
-          "validated_actions": "Validated Actions",
-          "pin_actions": "PIN Actions",
-          "validator_uses_camera": "Camera to validator",
-          "validator_requires_visual": "Visual match required",
-          "max_per_session": "Max/session",
-          "cooldown_seconds": "Cooldown (s)",
-          "custom_validator_prompt": "Custom validator instructions",
-          "validator_model": "Validator Model",
-          "pin_code": "PIN"
+          "default_security_mode": "Default Security Mode",
+          "pin_code": "PIN Code (for PIN-protected actions)",
+          "validator_model": "Validator Model (for AI-validated actions)"
         }
       },
-      "stop_triggers": {
-        "title": "Auto-Stop Triggers",
+      "triggers": {
+        "title": "Start & Stop Triggers",
+        "description": "Configure which entities trigger the AI session. **Start triggers** automatically activate Jeeves (e.g., doorbell press). **Stop triggers** end the session (e.g., front door opens).",
         "data": {
-          "stop_entities": "Stop entities",
-          "stop_entity_state_map": "State map (entity: state)",
-          "stop_events": "Stop events"
+          "start_entities": "Start Trigger Entities (e.g., doorbell button)",
+          "stop_entities": "Stop Trigger Entities (e.g., front door sensor)"
+        }
+      },
+      "identities": {
+        "title": "Known Identities",
+        "description": "Manage known people, animals, and objects that the AI should recognize. {identity_summary}",
+        "menu_options": {
+          "add_identity": "➕ Add Identity",
+          "remove_identity": "➖ Remove Identity",
+          "identity_settings": "⚙️ Identity Detection Settings",
+          "init": "← Back to Menu"
+        }
+      },
+      "add_identity": {
+        "title": "Add Known Identity",
+        "description": "Add a person, animal, or object for the AI to recognize. Provide a clear physical description and optionally a reference image URL or local path.",
+        "data": {
+          "name": "Name",
+          "identity_type": "Type",
+          "relationship": "Relationship",
+          "description": "Physical Description (for visual matching)",
+          "access_level": "Access Level",
+          "reference_image": "Reference Image (URL, local path, or base64)",
+          "notes": "Additional Notes"
+        }
+      },
+      "remove_identity": {
+        "title": "Remove Known Identity",
+        "data": {
+          "name": "Identity to Remove"
+        }
+      },
+      "identity_settings": {
+        "title": "Identity Detection Settings",
+        "description": "Choose how the AI identifies visitors. You can use an external face recognition sensor (like Frigate), reference images sent to the AI model, or both.",
+        "data": {
+          "identity_mode": "Identity Mode",
+          "face_sensor_entity": "Face Sensor Entity (for sensor mode)"
         }
       },
       "prompt": {
-        "title": "Identity & Prompt",
+        "title": "System Prompt",
+        "description": "Edit the AI agent's core instructions. This defines personality, rules, and behavior boundaries.",
         "data": {
-          "identity_mode": "Identity Mode",
-          "face_sensor_entity": "Face Sensor",
           "system_prompt": "System Prompt"
         }
       }
