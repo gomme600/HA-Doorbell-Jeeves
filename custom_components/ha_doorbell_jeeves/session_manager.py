@@ -387,9 +387,11 @@ class JeevesSessionManager:
             if self._client and self._active:
                 await self._client.send_audio(audio_bytes)
 
+        camera_entity = config.get(CONF_CAMERA_ENTITY, "")
         self._audio_handler = ReolinkAudioHandler(
             self.hass, stream_name, on_audio_received=_on_doorbell_audio
         )
+        self._audio_handler._camera_entity_id = camera_entity
         await self._audio_handler.start()
         _LOGGER.info("Reolink audio handler active (stream=%s)", stream_name)
 
