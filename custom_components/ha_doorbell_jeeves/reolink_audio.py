@@ -1094,15 +1094,41 @@ class ReolinkAudioHandler:
         # Start the input processor task (decodes ADPCM → PCM and sends to Gemini)
         self._input_processor_task = asyncio.create_task(self._audio_input_processor())
 
+    def _decrypt_binary_body(self, body: bytes) -> bytes:
+        """Decrypt AES-CFB-128 encrypted binary stream body.
+
+        Reolink cameras encrypt ALL body data (including binary stream payloads)
+        with AES-CFB when in AES mode. Unlike neolink's assumption, Reolink's
+        implementation DOES encrypt the binary stream.
+
+        Uses the same key/IV as the Extension XML decryption.
+        """
+        if not self._listen_bc or not hasattr(self._listen_bc, "_aes_key"):
+            return body
+        aes_key = self._listen_bc._aes_key
+        if aes_key is None:
+            return body
+
+        try:
+            from Cryptodome.Cipher import AES as AES_Cipher  # noqa: PLC0415
+
+            AES_IV = b"0123456789abcdef"
+            cipher = AES_Cipher.new(key=aes_key, mode=AES_Cipher.MODE_CFB, iv=AES_IV, segment_size=128)
+            return cipher.decrypt(body)
+        except Exception as exc:
+            if not hasattr(self, "_decrypt_err_logged"):
+                self._decrypt_err_logged = True
+                _LOGGER.warning("Binary stream decrypt failed: %s", exc)
+            return body
+
     def _stream_push_callback(self, cmd_id: int, data: bytes, len_header: int) -> None:
         """Intercept Baichuan push messages to extract audio from cmd 3 stream.
 
         Called by the TCP protocol whenever an unsolicited message arrives.
         For cmd 3 (preview stream), we parse BcMedia packets and queue audio.
 
-        IMPORTANT: After the first cmd 3 response, the camera sends binary mode
-        continuation messages (payload_offset=0, body=raw BcMedia binary).
-        These arrive here because there's no receive_future registered for them.
+        The camera encrypts binary stream data with AES-CFB-128 (same key as
+        Extension XML). We decrypt before parsing BcMedia packets.
         """
         if cmd_id == 3 and self._listen_active:
             # Extract body from the full packet (skip Baichuan header)
@@ -1112,10 +1138,14 @@ class ReolinkAudioHandler:
             if len_header == 24 and len(data) >= 24:
                 payload_offset = int.from_bytes(data[20:24], byteorder="little")
                 if payload_offset > 0 and len(body) > payload_offset:
-                    # First response: skip Extension XML, take only binary payload
+                    # First response: Extension XML is encrypted (skip it),
+                    # binary payload AFTER it also needs decryption
                     body = body[payload_offset:]
 
             if body:
+                # Decrypt the binary body (AES-CFB-128)
+                body = self._decrypt_binary_body(body)
+
                 if not hasattr(self, "_push_count"):
                     self._push_count = 0
                 self._push_count += 1
@@ -1215,6 +1245,10 @@ class ReolinkAudioHandler:
             # Extract binary payload (after the Extension XML)
             binary_start = len_header + rec_payload_offset
             binary_data = data_chunk[binary_start:] if binary_start < len(data_chunk) else b""
+
+            # Decrypt binary payload (AES-CFB-128)
+            if binary_data:
+                binary_data = handler._decrypt_binary_body(binary_data)
 
             # Resolve any waiting receive_future (first response to send())
             receive_future = protocol.receive_futures.get(rec_cmd_id, {}).get(rec_mess_id)
