@@ -1147,6 +1147,8 @@ class ReolinkAudioHandler:
             # Route binary data directly to audio extraction
             if binary_data and handler._listen_active:
                 handler._extract_audio_from_stream(binary_data)
+            elif not binary_data and handler._listen_active:
+                _LOGGER.warning("Patched parse_data: binary_data empty (offset=%d, chunk_len=%d)", rec_payload_offset, len(data_chunk))
 
             # Continue parsing if there's more data in the buffer
             if protocol._data and len(protocol._data) >= 4:
@@ -1182,6 +1184,25 @@ class ReolinkAudioHandler:
 
         pos = 0
         body_len = len(body)
+
+        # Diagnostic: log first call and first bytes
+        if not hasattr(self, "_stream_extract_count"):
+            self._stream_extract_count = 0
+        self._stream_extract_count += 1
+        if self._stream_extract_count <= 5:
+            _LOGGER.warning(
+                "Stream data #%d: %d bytes, first16hex=%s",
+                self._stream_extract_count, body_len, body[:16].hex() if body_len >= 16 else body.hex(),
+            )
+
+        adpcm_found = 0
+        aac_found = 0
+
+        while pos + 12 <= body_len:
+            magic = body[pos:pos + 4]
+
+            if magic == BCMEDIA_MAGIC_ADPCM:
+                adpcm_found += 1
 
         while pos + 12 <= body_len:
             magic = body[pos:pos + 4]
@@ -1221,6 +1242,9 @@ class ReolinkAudioHandler:
                 # Unknown magic or encrypted Extension header — skip byte by byte
                 # This handles the initial Extension XML that precedes media data
                 pos += 1
+
+        if self._stream_extract_count <= 10 and (adpcm_found or aac_found):
+            _LOGGER.warning("Stream #%d: found %d ADPCM, %d AAC packets", self._stream_extract_count, adpcm_found, aac_found)
 
     async def _audio_input_processor(self) -> None:
         """Process ADPCM audio blocks from the Baichuan stream into PCM for Gemini.
