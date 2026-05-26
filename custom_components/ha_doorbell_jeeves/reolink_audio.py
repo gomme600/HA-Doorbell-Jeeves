@@ -188,8 +188,8 @@ class ReolinkAudioHandler:
     """Handles 2-way audio for Reolink doorbells via go2rtc.
 
     Audio flow:
-      Visitor speaks → RTSP → go2rtc → WebSocket → extract PCM → send to AI
-      AI responds → PCM 24kHz → ffmpeg transcode → PCMA 8kHz → go2rtc WS → doorbell speaker
+      INPUT:  Visitor speaks → RTSP → go2rtc → WebSocket → PCM → AI
+      OUTPUT: AI responds → PCM 24kHz → ffmpeg → PCMA 8kHz → go2rtc exec play → speaker
     """
 
     def __init__(
@@ -202,14 +202,14 @@ class ReolinkAudioHandler:
         self._stream_name = stream_name
         self._on_audio_received = on_audio_received
         self._ws_task: asyncio.Task[None] | None = None
-        self._send_ws: aiohttp.ClientWebSocketResponse | None = None
-        self._send_ws_task: asyncio.Task[None] | None = None
         self._ffmpeg_proc: asyncio.subprocess.Process | None = None
         self._ffmpeg_reader_task: asyncio.Task[None] | None = None
         self._session: aiohttp.ClientSession | None = None
         self._owns_session = True
         self._active = False
         self._go2rtc_url: str | None = None
+        self._talk_session: aiohttp.ClientSession | None = None
+        self._send_error_count = 0
 
     @property
     def is_active(self) -> bool:
@@ -220,13 +220,13 @@ class ReolinkAudioHandler:
         if self._active:
             return
 
-        # Discover go2rtc URL before starting
+        # Discover go2rtc URL
         self._go2rtc_url = await _discover_go2rtc_url(self._hass)
         if not self._go2rtc_url:
             _LOGGER.error("Cannot start audio handler — go2rtc not found")
             return
 
-        # Use HA's authenticated session if available
+        # Use HA authenticated session for go2rtc
         ha_session = _get_go2rtc_session(self._hass)
         if ha_session:
             self._session = ha_session
@@ -235,15 +235,15 @@ class ReolinkAudioHandler:
             self._session = aiohttp.ClientSession()
             self._owns_session = True
 
+        # Separate session for go2rtc play API (no auth conflicts)
+        self._talk_session = aiohttp.ClientSession()
+
         self._active = True
 
         # Start ffmpeg transcoder: 24kHz s16le PCM → 8kHz PCMA (G.711 A-law)
         await self._start_ffmpeg_transcoder()
 
-        # Start send WebSocket (for backchannel audio to doorbell speaker)
-        self._send_ws_task = asyncio.create_task(self._send_ws_loop())
-
-        # Start receive WebSocket (for doorbell mic → AI)
+        # Start receive WebSocket (doorbell mic → AI)
         self._ws_task = asyncio.create_task(self._audio_receive_loop())
 
         _LOGGER.warning(
@@ -266,7 +266,7 @@ class ReolinkAudioHandler:
         self._ffmpeg_proc = None
 
         # Cancel tasks
-        for task in (self._ws_task, self._send_ws_task, self._ffmpeg_reader_task):
+        for task in (self._ws_task, self._ffmpeg_reader_task):
             if task and not task.done():
                 task.cancel()
                 try:
@@ -274,29 +274,24 @@ class ReolinkAudioHandler:
                 except asyncio.CancelledError:
                     pass
         self._ws_task = None
-        self._send_ws_task = None
         self._ffmpeg_reader_task = None
-
-        # Close send WebSocket
-        if self._send_ws and not self._send_ws.closed:
-            await self._send_ws.close()
-        self._send_ws = None
 
         if self._session and self._owns_session:
             await self._session.close()
         self._session = None
+        if self._talk_session:
+            await self._talk_session.close()
+            self._talk_session = None
         _LOGGER.warning("Reolink audio handler stopped")
 
     async def send_audio(self, pcm_bytes: bytes) -> None:
         """Send AI audio to the doorbell speaker.
 
-        Accepts 24kHz 16-bit PCM from Gemini, feeds it to ffmpeg for transcoding.
-        The ffmpeg reader task picks up transcoded PCMA and sends it via WebSocket.
+        Accepts 24kHz 16-bit PCM from Gemini, feeds to ffmpeg for transcoding.
         """
         if not self._active or not self._ffmpeg_proc:
             return
         if self._ffmpeg_proc.returncode is not None:
-            _LOGGER.warning("ffmpeg transcoder died (rc=%d)", self._ffmpeg_proc.returncode)
             return
         try:
             self._ffmpeg_proc.stdin.write(pcm_bytes)
@@ -317,78 +312,91 @@ class ReolinkAudioHandler:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            # Start reader that forwards transcoded audio to the send WebSocket
             self._ffmpeg_reader_task = asyncio.create_task(self._ffmpeg_output_loop())
             _LOGGER.warning("ffmpeg transcoder started (24kHz PCM → 8kHz PCMA)")
         except FileNotFoundError:
-            _LOGGER.error("ffmpeg not found — cannot transcode audio for doorbell speaker")
+            _LOGGER.error("ffmpeg not found — cannot transcode audio")
             self._ffmpeg_proc = None
         except Exception:
             _LOGGER.exception("Failed to start ffmpeg transcoder")
             self._ffmpeg_proc = None
 
     async def _ffmpeg_output_loop(self) -> None:
-        """Read transcoded PCMA from ffmpeg stdout and send to go2rtc WebSocket."""
+        """Read transcoded PCMA from ffmpeg and send to doorbell via go2rtc play API."""
+        import os  # noqa: PLC0415
         send_count = 0
+        buffer = bytearray()
+        # Buffer 500ms of audio before sending (4000 bytes at 8kHz alaw mono)
+        CHUNK_SIZE = 4000
+
         try:
             while self._active and self._ffmpeg_proc:
-                # Read in 320-byte chunks (40ms of 8kHz mono alaw = 320 bytes)
-                chunk = await self._ffmpeg_proc.stdout.read(320)
-                if not chunk:
+                data = await self._ffmpeg_proc.stdout.read(800)
+                if not data:
                     break
-                # Send to go2rtc via WebSocket
-                if self._send_ws and not self._send_ws.closed:
-                    try:
-                        await self._send_ws.send_bytes(chunk)
+                buffer.extend(data)
+
+                if len(buffer) >= CHUNK_SIZE:
+                    chunk = bytes(buffer[:CHUNK_SIZE])
+                    buffer = buffer[CHUNK_SIZE:]
+                    sent = await self._play_audio_chunk(chunk, send_count)
+                    if sent:
                         send_count += 1
                         if send_count == 1:
-                            _LOGGER.warning("First audio chunk sent to doorbell speaker")
-                    except Exception:
-                        if send_count < 5:
-                            _LOGGER.warning("Failed to send audio chunk #%d via WS", send_count)
-                        # Don't break — WS might reconnect
-                        await asyncio.sleep(0.05)
-                else:
-                    # WS not ready yet, wait briefly
-                    await asyncio.sleep(0.05)
+                            _LOGGER.warning("First audio chunk sent to doorbell speaker!")
+            # Flush remaining buffer
+            if buffer and self._active:
+                await self._play_audio_chunk(bytes(buffer), send_count)
         except asyncio.CancelledError:
             pass
         except Exception:
             _LOGGER.warning("ffmpeg output loop error", exc_info=True)
+        finally:
+            _LOGGER.warning("Audio output loop ended (sent %d chunks)", send_count)
 
-    async def _send_ws_loop(self) -> None:
-        """Maintain a persistent WebSocket connection for sending audio to go2rtc backchannel."""
-        # Use dst= to indicate we're PRODUCING audio for this stream's backchannel
-        ws_url = f"{self._go2rtc_url}/api/ws?src={self._stream_name}&media=&backchannel=1"
-        _LOGGER.warning("Send WS connecting to: %s", ws_url)
+    async def _play_audio_chunk(self, alaw_bytes: bytes, chunk_num: int) -> bool:
+        """Play an audio chunk to the doorbell via go2rtc\'s stream-to-camera API.
 
-        while self._active:
+        Uses: POST /api/streams?dst=STREAM_NAME&src=ffmpeg:FILE#audio=pcma#input=file
+        """
+        if not self._talk_session or not self._go2rtc_url:
+            return False
+
+        import os  # noqa: PLC0415
+        tmp_path = f"/tmp/jeeves_talk_{os.getpid()}_{chunk_num}.alaw"
+        try:
+            with open(tmp_path, "wb") as f:
+                f.write(alaw_bytes)
+
+            # go2rtc play-to-stream: plays audio file into stream\'s backchannel
+            src = f"ffmpeg:{tmp_path}#audio=pcma#input=file"
+            url = f"{self._go2rtc_url}/api/streams"
+            params = {"dst": self._stream_name, "src": src}
+
+            async with self._talk_session.post(url, params=params) as resp:
+                if resp.status in (200, 201, 204):
+                    return True
+                text = await resp.text()
+                self._send_error_count += 1
+                if self._send_error_count <= 3:
+                    _LOGGER.warning(
+                        "go2rtc play-to-stream failed (status=%d): %s",
+                        resp.status, text[:200],
+                    )
+                return False
+        except Exception:
+            self._send_error_count += 1
+            if self._send_error_count <= 3:
+                _LOGGER.warning("Error sending audio to doorbell", exc_info=True)
+            return False
+        finally:
             try:
-                if not self._session:
-                    break
-                async with self._session.ws_connect(ws_url) as ws:
-                    self._send_ws = ws
-                    _LOGGER.warning("Send WS connected for backchannel audio")
-                    # Keep connection alive by reading (discard any incoming data)
-                    while self._active:
-                        try:
-                            msg = await asyncio.wait_for(ws.receive(), timeout=30)
-                            if msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE):
-                                _LOGGER.warning("Send WS closed by server: %s", msg.type)
-                                break
-                            # Discard any incoming data (video/audio from stream)
-                        except asyncio.TimeoutError:
-                            # Send ping to keep alive
-                            await ws.ping()
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                _LOGGER.warning("Send WS error, retrying in 2s", exc_info=True)
-                await asyncio.sleep(2)
-        self._send_ws = None
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
     async def _audio_receive_loop(self) -> None:
-        """Connect to go2rtc WebSocket and receive audio frames from the doorbell mic."""
+        """Connect to go2rtc WebSocket and receive audio from the doorbell mic."""
         ws_url = f"{self._go2rtc_url}/api/ws?src={self._stream_name}&media=audio"
         _LOGGER.warning("Audio receive loop connecting to: %s", ws_url)
 
@@ -396,23 +404,20 @@ class ReolinkAudioHandler:
             try:
                 if not self._session:
                     break
-
                 async with self._session.ws_connect(ws_url) as ws:
                     _LOGGER.warning("Connected to go2rtc audio receive WebSocket")
                     async for msg in ws:
                         if not self._active:
                             break
                         if msg.type == aiohttp.WSMsgType.BINARY:
-                            # Raw audio data from the doorbell microphone
                             await self._on_audio_received(msg.data)
                         elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
-                            _LOGGER.warning("Receive WS closed/error: %s", msg.type)
+                            _LOGGER.warning("Receive WS closed: %s", msg.type)
                             break
-
             except asyncio.CancelledError:
                 break
             except Exception:
-                _LOGGER.warning("go2rtc audio receive WS error, retrying in 2s", exc_info=True)
+                _LOGGER.warning("go2rtc audio receive error, retrying in 2s", exc_info=True)
                 await asyncio.sleep(2)
 
 
