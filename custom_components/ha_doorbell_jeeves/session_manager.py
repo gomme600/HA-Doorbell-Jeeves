@@ -129,9 +129,9 @@ class JeevesSessionManager:
         result = await auto_configure_reolink(self.hass, camera_entity)
         if result:
             _LOGGER.info("Reolink go2rtc configured: stream=%s", result.get("stream_name"))
-            new_options = dict(self._entry.options)
+            new_options = dict(self.entry.options)
             new_options["go2rtc_stream_name"] = result["stream_name"]
-            self.hass.config_entries.async_update_entry(self._entry, options=new_options)
+            self.hass.config_entries.async_update_entry(self.entry, options=new_options)
         else:
             _LOGGER.warning("go2rtc not available — 2-way audio may not work")
 
