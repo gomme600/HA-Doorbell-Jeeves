@@ -365,8 +365,15 @@ class JeevesSessionManager:
 
         stream_name = config.get(CONF_GO2RTC_STREAM_NAME, "")
         if not stream_name:
-            _LOGGER.warning("No go2rtc stream configured — Reolink audio disabled")
-            return
+            # Fallback: Use camera entity ID as stream name
+            # The Reolink integration registers streams using the entity ID
+            camera = config.get(CONF_CAMERA_ENTITY, "")
+            if camera:
+                stream_name = camera
+                _LOGGER.warning("No explicit go2rtc stream — using camera entity: %s", stream_name)
+            else:
+                _LOGGER.warning("No go2rtc stream configured — Reolink audio disabled")
+                return
 
         # Shared takeover callback
         async def _on_human_takeover() -> None:
