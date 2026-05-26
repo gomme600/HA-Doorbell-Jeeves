@@ -116,6 +116,18 @@ class JeevesSessionManager:
     async def async_initialize(self) -> None:
         """Load persistent data and register start triggers."""
         await self.store.async_load()
+
+        # Always sync start triggers from config entry data into the store
+        # (config_flow saves to entry.data["start_triggers_config"],
+        #  but _register_start_triggers reads from self.store.start_triggers)
+        triggers_config = self._config.get("start_triggers_config", [])
+        if triggers_config:
+            from .models import StartTrigger  # noqa: PLC0415
+            triggers = [StartTrigger.from_dict(t) for t in triggers_config]
+            if triggers != self.store.start_triggers:
+                await self.store.async_set_start_triggers(triggers)
+                _LOGGER.info("Synced %d start triggers from config", len(triggers))
+
         self._register_start_triggers()
 
     async def _lazy_setup_reolink(self) -> None:
