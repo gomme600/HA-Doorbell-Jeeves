@@ -1137,10 +1137,21 @@ class ReolinkAudioHandler:
                 # Extract body from the full packet (skip Baichuan header)
                 body = data[len_header:] if len(data) > len_header else b""
 
-                # For messages with payload_offset=0 arriving via push_callback,
-                # the body IS the raw binary stream data (NOT encrypted).
-                # Messages with payload_offset!=0 are handled by patched_parse_data.
                 if body:
+                    # Check if body is valid BcMedia (unencrypted) or needs decryption
+                    KNOWN_MAGICS = (
+                        b"\x31\x30\x30\x32", b"\x31\x30\x30\x31",
+                        b"\x30\x31\x77\x62", b"\x30\x35\x77\x62",
+                    )
+                    if len(body) >= 4:
+                        first4 = body[:4]
+                        is_plaintext = (
+                            first4 in KNOWN_MAGICS
+                            or (len(body) > 3 and body[2:4] == b"\x64\x63")
+                        )
+                        if not is_plaintext:
+                            body = self._decrypt_binary_body(body)
+
                     if not hasattr(self, "_push_count"):
                         self._push_count = 0
                     self._push_count += 1
@@ -1204,6 +1215,20 @@ class ReolinkAudioHandler:
                 return
 
             rec_payload_offset = int.from_bytes(protocol._data[20:24], byteorder="little")
+
+            # Diagnostic: log the first 10 messages' routing
+            if not hasattr(handler, "_route_count"):
+                handler._route_count = 0
+            handler._route_count += 1
+            if handler._route_count <= 10:
+                rec_cmd_id_peek = int.from_bytes(protocol._data[4:8], byteorder="little")
+                rec_len_body_peek = int.from_bytes(protocol._data[8:12], byteorder="little")
+                _LOGGER.warning(
+                    "Patched parse route #%d: cmd=%d, payload_offset=%d, body_len=%d, class=%s",
+                    handler._route_count, rec_cmd_id_peek, rec_payload_offset,
+                    rec_len_body_peek, mess_class,
+                )
+
             if rec_payload_offset == 0:
                 # Standard message — use original parser
                 original_parse_data()
@@ -1254,11 +1279,26 @@ class ReolinkAudioHandler:
                 return
 
             # Extract binary payload (after the Extension XML)
-            # The Extension XML portion IS encrypted, but the binary payload IS NOT.
-            # This matches neolink's behavior: binary payloads are raw (unencrypted).
+            # The first response's binary is NOT encrypted; continuation messages ARE.
+            # Strategy: try raw first, if first 4 bytes match a known BcMedia magic use it.
+            # Otherwise, decrypt and use the decrypted version.
             full_body = data_chunk[len_header:]
-            # Split at payload_offset: Extension (encrypted) | Binary (raw)
             binary_data = full_body[rec_payload_offset:] if rec_payload_offset < len(full_body) else b""
+
+            # Check if binary_data is already valid BcMedia (unencrypted)
+            KNOWN_MAGICS = (
+                b"\x31\x30\x30\x32", b"\x31\x30\x30\x31",  # InfoV2, InfoV1
+                b"\x30\x31\x77\x62", b"\x30\x35\x77\x62",  # ADPCM, AAC
+            )
+            if binary_data and len(binary_data) >= 4:
+                first4 = binary_data[:4]
+                is_plaintext = (
+                    first4 in KNOWN_MAGICS
+                    or (len(binary_data) > 3 and binary_data[2:4] == b"\x64\x63")  # IFrame/PFrame
+                )
+                if not is_plaintext:
+                    # Try decryption
+                    binary_data = handler._decrypt_binary_body(binary_data)
 
             # Resolve any waiting receive_future (first response to send())
             receive_future = protocol.receive_futures.get(rec_cmd_id, {}).get(rec_mess_id)
