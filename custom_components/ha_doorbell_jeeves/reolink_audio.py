@@ -992,7 +992,7 @@ class ReolinkAudioHandler:
 
         Sends 20ms PCM chunks to Gemini via the audio callback.
         """
-        # Build list of URLs to try (sub first, then main stream)
+        # Build list of URLs to try (sub first, then main stream, then RTMP)
         urls_to_try = [self._reolink_rtsp_url]
         if self._reolink_host and self._reolink_user and self._reolink_pass:
             from urllib.parse import quote  # noqa: PLC0415
@@ -1004,6 +1004,10 @@ class ReolinkAudioHandler:
                 f"{base}/h264Preview_01_sub",
                 f"{base}/Preview_01_sub",
                 f"{base}/h264Preview_01_main",
+                # RTMP fallback (Reolink cameras support this even when RTSP is disabled)
+                f"rtmp://{self._reolink_host}/bcs/channel0_sub.bcs"
+                f"?channel=0&stream=0&user={self._reolink_user}"
+                f"&password={self._reolink_pass}",
             ]
             for alt in alternatives:
                 if alt not in urls_to_try:
@@ -1017,14 +1021,15 @@ class ReolinkAudioHandler:
                 return
             rtsp_url = url
             _LOGGER.warning(
-                "Audio input: trying RTSP URL %s",
-                url.split("@")[-1] if "@" in url else url,
+                "Audio input: trying %s",
+                url.split("@")[-1] if "@" in url else url.split("password=")[0] + "password=***",
             )
 
-            proc = await asyncio.create_subprocess_exec(
-                "ffmpeg",
-                "-hide_banner", "-loglevel", "warning",
-                "-rtsp_transport", "tcp",
+            # Build ffmpeg args — add RTSP-specific options only for rtsp:// URLs
+            ffmpeg_args = ["ffmpeg", "-hide_banner", "-loglevel", "warning"]
+            if url.startswith("rtsp://"):
+                ffmpeg_args.extend(["-rtsp_transport", "tcp"])
+            ffmpeg_args.extend([
                 "-i", url,
                 "-vn",  # No video — audio only
                 "-acodec", "pcm_s16le",
@@ -1032,6 +1037,10 @@ class ReolinkAudioHandler:
                 "-ac", "1",
                 "-f", "s16le",
                 "pipe:1",
+            ])
+
+            proc = await asyncio.create_subprocess_exec(
+                *ffmpeg_args,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
