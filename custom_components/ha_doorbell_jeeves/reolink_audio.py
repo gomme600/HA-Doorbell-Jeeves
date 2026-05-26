@@ -242,3 +242,248 @@ async def auto_configure_reolink(
         "host": host,
         "rtsp_url_masked": f"rtsp://{user}:***@{host}:554/h264Preview_01_sub",
     }
+
+
+# ─── Talk State Monitor ────────────────────────────────────────────────────────
+
+
+class ReolinkTalkMonitor:
+    """Monitors the Reolink camera's talk (backchannel) state via HTTP API.
+
+    Reolink cameras expose a `GetTalkState` endpoint that indicates whether
+    someone is currently using 2-way audio (e.g., from the Reolink app).
+    
+    When detected, this fires a callback so the AI session can be paused/stopped
+    to let the human take over the conversation.
+    
+    Also monitors audio energy levels from the go2rtc stream to detect when
+    someone starts speaking through the doorbell app (backup method).
+    """
+
+    # How often to poll the camera's talk state (seconds)
+    POLL_INTERVAL = 2.0
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        host: str,
+        username: str,
+        password: str,
+        on_human_takeover: Any,  # Callable[[], Awaitable[None]]
+    ) -> None:
+        self._hass = hass
+        self._host = host
+        self._username = username
+        self._password = password
+        self._on_human_takeover = on_human_takeover
+        self._poll_task: asyncio.Task[None] | None = None
+        self._session: aiohttp.ClientSession | None = None
+        self._token: str | None = None
+        self._active = False
+        self._talk_was_active = False
+
+    @property
+    def is_active(self) -> bool:
+        return self._active
+
+    async def start(self) -> None:
+        """Start polling the camera for talk state changes."""
+        if self._active:
+            return
+        self._active = True
+        self._session = aiohttp.ClientSession()
+        self._poll_task = asyncio.create_task(self._poll_loop())
+        _LOGGER.info("Reolink talk monitor started (host=%s)", self._host)
+
+    async def stop(self) -> None:
+        """Stop the monitor."""
+        self._active = False
+        if self._poll_task and not self._poll_task.done():
+            self._poll_task.cancel()
+            try:
+                await self._poll_task
+            except asyncio.CancelledError:
+                pass
+        self._poll_task = None
+        if self._session:
+            await self._session.close()
+            self._session = None
+        self._token = None
+        _LOGGER.info("Reolink talk monitor stopped")
+
+    async def _poll_loop(self) -> None:
+        """Periodically check talk state."""
+        # Initial login
+        await self._login()
+
+        while self._active:
+            try:
+                talk_active = await self._check_talk_state()
+                if talk_active and not self._talk_was_active:
+                    # Transition: talk just became active (human took over)
+                    _LOGGER.info("Human takeover detected via Reolink talk state")
+                    self._talk_was_active = True
+                    await self._on_human_takeover()
+                elif not talk_active:
+                    self._talk_was_active = False
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                _LOGGER.debug("Talk state poll error", exc_info=True)
+            await asyncio.sleep(self.POLL_INTERVAL)
+
+    async def _login(self) -> bool:
+        """Authenticate with the Reolink camera to get a session token."""
+        if not self._session:
+            return False
+        try:
+            url = f"http://{self._host}/api.cgi?cmd=Login"
+            payload = [{
+                "cmd": "Login",
+                "action": 0,
+                "param": {
+                    "User": {
+                        "userName": self._username,
+                        "password": self._password,
+                    }
+                },
+            }]
+            async with self._session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data and data[0].get("code") == 0:
+                        self._token = data[0]["value"]["Token"]["name"]
+                        _LOGGER.debug("Reolink API login successful")
+                        return True
+            _LOGGER.warning("Reolink API login failed")
+            return False
+        except Exception:
+            _LOGGER.debug("Reolink API login error", exc_info=True)
+            return False
+
+    async def _check_talk_state(self) -> bool:
+        """Query the camera's talk/backchannel state.
+        
+        Returns True if someone is actively using 2-way audio (e.g., from the app).
+        """
+        if not self._session or not self._token:
+            # Try re-login if token is missing
+            if not await self._login():
+                return False
+
+        try:
+            url = f"http://{self._host}/api.cgi?cmd=GetTalkState&token={self._token}"
+            payload = [{
+                "cmd": "GetTalkState",
+                "action": 0,
+                "param": {"channel": 0},
+            }]
+            async with self._session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data and data[0].get("code") == 0:
+                        state = data[0].get("value", {}).get("state", 0)
+                        return state == 1
+                    elif data and data[0].get("code") == -6:
+                        # Token expired — re-login
+                        self._token = None
+                        return False
+            return False
+        except Exception:
+            _LOGGER.debug("GetTalkState request failed", exc_info=True)
+            return False
+
+
+class AudioInterruptDetector:
+    """Detects human speech interruption by monitoring audio energy levels.
+    
+    This is a backup detection method for when the Reolink API isn't available
+    or for non-Reolink setups. It monitors the incoming audio stream energy and
+    detects when someone is speaking while the AI is also outputting audio.
+    
+    Detection logic:
+    - While AI is speaking (outputting audio), the doorbell mic picks up the 
+      AI's own voice at a consistent level
+    - If a HUMAN starts talking through the Reolink app, the speaker output is 
+      louder than normal visitor speech (speaker is next to mic)
+    - A sudden energy spike during AI output → likely human takeover
+    
+    Also detects extended silence (visitor left) as a stop signal.
+    """
+
+    # Energy threshold for "someone is speaking" (RMS of 16-bit PCM)
+    SPEECH_THRESHOLD = 800
+    # How many consecutive frames above threshold = human speaking
+    CONSECUTIVE_FRAMES_FOR_DETECTION = 5
+    # Silence duration to consider visitor gone (seconds)
+    SILENCE_TIMEOUT = 30.0
+
+    def __init__(
+        self,
+        on_interrupt_detected: Any,  # Callable[[], Awaitable[None]]
+        on_silence_timeout: Any | None = None,  # Callable[[], Awaitable[None]] | None
+    ) -> None:
+        self._on_interrupt_detected = on_interrupt_detected
+        self._on_silence_timeout = on_silence_timeout
+        self._ai_is_speaking = False
+        self._high_energy_count = 0
+        self._last_speech_time: float = 0.0
+        self._silence_task: asyncio.Task[None] | None = None
+        self._active = False
+        self._triggered = False
+
+    def start(self) -> None:
+        self._active = True
+        self._triggered = False
+        self._last_speech_time = asyncio.get_event_loop().time()
+
+    def stop(self) -> None:
+        self._active = False
+        if self._silence_task and not self._silence_task.done():
+            self._silence_task.cancel()
+
+    def set_ai_speaking(self, is_speaking: bool) -> None:
+        """Called when AI starts/stops outputting audio."""
+        self._ai_is_speaking = is_speaking
+
+    def process_audio_frame(self, pcm_bytes: bytes) -> None:
+        """Process an incoming audio frame from the doorbell mic.
+        
+        Call this for every audio chunk received from go2rtc.
+        """
+        if not self._active or self._triggered:
+            return
+
+        # Calculate RMS energy of the frame
+        energy = self._calculate_rms(pcm_bytes)
+
+        if energy > self.SPEECH_THRESHOLD:
+            self._last_speech_time = asyncio.get_event_loop().time()
+
+            if self._ai_is_speaking:
+                # Audio detected while AI is speaking = potential human interruption
+                self._high_energy_count += 1
+                if self._high_energy_count >= self.CONSECUTIVE_FRAMES_FOR_DETECTION:
+                    self._triggered = True
+                    _LOGGER.info(
+                        "Audio interrupt detected (energy=%d, consecutive=%d)",
+                        energy, self._high_energy_count,
+                    )
+                    asyncio.create_task(self._on_interrupt_detected())
+            else:
+                self._high_energy_count = 0
+        else:
+            self._high_energy_count = 0
+
+    @staticmethod
+    def _calculate_rms(pcm_bytes: bytes) -> float:
+        """Calculate RMS energy of 16-bit PCM audio."""
+        import struct  # noqa: PLC0415
+        if len(pcm_bytes) < 4:
+            return 0.0
+        num_samples = len(pcm_bytes) // 2
+        samples = struct.unpack(f"<{num_samples}h", pcm_bytes[:num_samples * 2])
+        if not samples:
+            return 0.0
+        sum_squares = sum(s * s for s in samples)
+        return (sum_squares / num_samples) ** 0.5

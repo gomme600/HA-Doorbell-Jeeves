@@ -14,11 +14,9 @@ from homeassistant.helpers.event import async_track_state_change_event
 from .client_base import BaseRealtimeClient
 from .const import (
     AUDIO_MODE_REOLINK,
-    AUDIO_OUTPUT_GO2RTC,
     CONF_API_BASE_URL,
     CONF_API_KEY,
     CONF_AUDIO_MODE,
-    CONF_AUDIO_OUTPUT_MODE,
     CONF_CAMERA_ENTITY,
     CONF_DUAL_MODEL_ENABLED,
     CONF_FRAME_MAX_HEIGHT,
@@ -30,6 +28,7 @@ from .const import (
     CONF_MEDIA_PLAYER_ENTITY,
     CONF_MODEL,
     CONF_PROVIDER,
+    CONF_REOLINK_ENTRY_ID,
     CONF_SESSION_TIMEOUT,
     CONF_STOP_ENTITIES,
     CONF_STOP_ENTITY_STATES,
@@ -88,6 +87,9 @@ class JeevesSessionManager:
 
         # Audio handler (Reolink/go2rtc)
         self._audio_handler: Any = None  # ReolinkAudioHandler or None
+
+        # Talk state monitor (detects human taking over via Reolink app)
+        self._talk_monitor: Any = None  # ReolinkTalkMonitor or None
 
         # Tool router (dual-model mode)
         self._tool_router: Any = None  # ToolRouter or None
@@ -221,6 +223,11 @@ class JeevesSessionManager:
         if self._tool_router:
             self._tool_router.stop()
 
+        # Stop talk monitor
+        if self._talk_monitor:
+            await self._talk_monitor.stop()
+            self._talk_monitor = None
+
         # Stop audio handler
         if self._audio_handler:
             await self._audio_handler.stop()
@@ -252,7 +259,11 @@ class JeevesSessionManager:
 
     async def _start_reolink_audio(self, config: dict) -> None:
         """Start the Reolink 2-way audio handler via go2rtc."""
-        from .reolink_audio import ReolinkAudioHandler  # noqa: PLC0415
+        from .reolink_audio import (  # noqa: PLC0415
+            ReolinkAudioHandler,
+            ReolinkTalkMonitor,
+            get_reolink_config,
+        )
 
         stream_name = config.get(CONF_GO2RTC_STREAM_NAME, "")
         if not stream_name:
@@ -269,6 +280,25 @@ class JeevesSessionManager:
         )
         await self._audio_handler.start()
         _LOGGER.info("Reolink audio handler active (stream=%s)", stream_name)
+
+        # Start talk state monitor (detects when human talks via Reolink app)
+        reolink_entry_id = config.get(CONF_REOLINK_ENTRY_ID, "")
+        if reolink_entry_id:
+            reolink_config = get_reolink_config(self.hass, reolink_entry_id)
+            if reolink_config and reolink_config.get("host"):
+                async def _on_human_takeover() -> None:
+                    """Human started talking via Reolink app — stop AI session."""
+                    _LOGGER.info("Human takeover via Reolink app — stopping AI session")
+                    await self.async_stop_session()
+
+                self._talk_monitor = ReolinkTalkMonitor(
+                    hass=self.hass,
+                    host=reolink_config["host"],
+                    username=reolink_config["username"],
+                    password=reolink_config["password"],
+                    on_human_takeover=_on_human_takeover,
+                )
+                await self._talk_monitor.start()
 
     # ─── Dual-Model Tool Router Setup ─────────────────────────────────────────
 
