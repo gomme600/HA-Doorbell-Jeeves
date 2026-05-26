@@ -22,6 +22,13 @@ CONF_CAMERA_ENTITY = "camera_entity"
 CONF_AUDIO_OUTPUT_MODE = "audio_output_mode"
 CONF_MEDIA_PLAYER_ENTITY = "media_player_entity"
 
+# Dual-model architecture
+CONF_DUAL_MODEL_ENABLED = "dual_model_enabled"
+CONF_TOOL_MODEL = "tool_model"
+CONF_TOOL_PROVIDER = "tool_provider"
+CONF_TOOL_API_KEY = "tool_api_key"
+CONF_TOOL_BASE_URL = "tool_base_url"
+
 CONF_VISION_FPS = "vision_fps"
 CONF_FRAME_MAX_WIDTH = "frame_max_width"
 CONF_FRAME_MAX_HEIGHT = "frame_max_height"
@@ -75,6 +82,8 @@ CONF_REOLINK_ENTRY_ID = "reolink_entry_id"
 DEFAULT_PROVIDER = PROVIDER_GEMINI
 DEFAULT_MODEL_GEMINI = "gemini-2.5-flash-native-audio-dialog"
 DEFAULT_MODEL_OPENAI = "gpt-4o-realtime-preview"
+DEFAULT_TOOL_MODEL_GEMINI = "gemini-2.5-flash"
+DEFAULT_TOOL_MODEL_OPENAI = "gpt-4.1"
 DEFAULT_VISION_FPS = 1.0
 DEFAULT_SESSION_TIMEOUT = 120
 DEFAULT_VOICE_GEMINI = "Aoede"

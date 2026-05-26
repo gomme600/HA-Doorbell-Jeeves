@@ -47,6 +47,7 @@ from .const import (
     CONF_AUDIO_OUTPUT_MODE,
     CONF_CAMERA_ENTITY,
     CONF_DEFAULT_SECURITY_MODE,
+    CONF_DUAL_MODEL_ENABLED,
     CONF_FACE_SENSOR_ENTITY,
     CONF_FRAME_MAX_HEIGHT,
     CONF_FRAME_MAX_WIDTH,
@@ -62,6 +63,10 @@ from .const import (
     CONF_STOP_ENTITIES,
     CONF_STOP_ENTITY_STATES,
     CONF_SYSTEM_PROMPT,
+    CONF_TOOL_API_KEY,
+    CONF_TOOL_BASE_URL,
+    CONF_TOOL_MODEL,
+    CONF_TOOL_PROVIDER,
     CONF_VALIDATOR_MODEL,
     CONF_VISION_FPS,
     CONF_VOICE,
@@ -72,6 +77,8 @@ from .const import (
     DEFAULT_MODEL_OPENAI,
     DEFAULT_SESSION_TIMEOUT,
     DEFAULT_SYSTEM_PROMPT,
+    DEFAULT_TOOL_MODEL_GEMINI,
+    DEFAULT_TOOL_MODEL_OPENAI,
     DEFAULT_VALIDATOR_MODEL,
     DEFAULT_VISION_FPS,
     DEFAULT_VOICE_GEMINI,
@@ -362,6 +369,7 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
             step_id="init",
             menu_options=[
                 "general",
+                "dual_model",
                 "vision",
                 "entities",
                 "security",
@@ -408,6 +416,65 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                 ),
                 vol.Optional(CONF_VALIDATOR_MODEL, default=self._data.get(CONF_VALIDATOR_MODEL, DEFAULT_VALIDATOR_MODEL)): TextSelector(),
             }),
+        )
+
+    # ─── Dual Model Settings ──────────────────────────────────────────────────
+
+    async def async_step_dual_model(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Configure dual-model architecture (separate voice + tool-calling model).
+        
+        Native audio models like gemini-2.5-flash-native-audio-dialog don't support
+        function calling. This option enables a separate text model for tool calling.
+        """
+        if user_input is not None:
+            self._data.update(user_input)
+            return self._save_options()
+
+        tool_provider = self._data.get(CONF_TOOL_PROVIDER, self._data.get(CONF_PROVIDER, PROVIDER_GEMINI))
+        default_tool_model = (
+            DEFAULT_TOOL_MODEL_GEMINI if tool_provider == PROVIDER_GEMINI else DEFAULT_TOOL_MODEL_OPENAI
+        )
+
+        return self.async_show_form(
+            step_id="dual_model",
+            data_schema=vol.Schema({
+                vol.Required(
+                    CONF_DUAL_MODEL_ENABLED,
+                    default=self._data.get(CONF_DUAL_MODEL_ENABLED, False),
+                ): BooleanSelector(),
+                vol.Optional(
+                    CONF_TOOL_PROVIDER,
+                    default=tool_provider,
+                ): SelectSelector(
+                    SelectSelectorConfig(
+                        options=[
+                            {"value": PROVIDER_GEMINI, "label": "Google Gemini"},
+                            {"value": PROVIDER_OPENAI, "label": "OpenAI / Compatible"},
+                        ],
+                        mode=SelectSelectorMode.DROPDOWN,
+                    )
+                ),
+                vol.Optional(
+                    CONF_TOOL_MODEL,
+                    default=self._data.get(CONF_TOOL_MODEL, default_tool_model),
+                ): TextSelector(),
+                vol.Optional(
+                    CONF_TOOL_API_KEY,
+                    default=self._data.get(CONF_TOOL_API_KEY, ""),
+                    description={"suffix": "(leave blank to use same as voice model)"},
+                ): TextSelector(TextSelectorConfig(type="password")),
+                vol.Optional(
+                    CONF_TOOL_BASE_URL,
+                    default=self._data.get(CONF_TOOL_BASE_URL, ""),
+                ): TextSelector(TextSelectorConfig(type="url")),
+            }),
+            description_placeholders={
+                "info": (
+                    "Native audio models (gemini-2.5-flash-native-audio-dialog) do NOT "
+                    "support function calling. Enable dual-model to use a separate text "
+                    "model for tool execution while the audio model handles conversation."
+                ),
+            },
         )
 
     # ─── Vision Settings ──────────────────────────────────────────────────────

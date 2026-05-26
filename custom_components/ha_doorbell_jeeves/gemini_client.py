@@ -132,6 +132,20 @@ class GeminiLiveClient(BaseRealtimeClient):
         except Exception:
             _LOGGER.exception("Failed to send image")
 
+    async def inject_context(self, text: str) -> None:
+        """Inject a text message into the live session (used by tool router for results)."""
+        if not self._session or not self._connected:
+            return
+        try:
+            await self._session.send(
+                input=types.LiveClientContent(
+                    turns=[types.Content(role="user", parts=[types.Part(text=text)])],
+                    turn_complete=True,
+                )
+            )
+        except Exception:
+            _LOGGER.exception("Failed to inject context")
+
     async def _inject_reference_images(self) -> None:
         if not self._reference_images:
             return

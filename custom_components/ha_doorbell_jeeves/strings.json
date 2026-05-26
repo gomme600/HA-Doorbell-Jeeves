@@ -63,6 +63,7 @@
         "description": "Choose a section to configure:",
         "menu_options": {
           "general": "General (AI model, voice, timeout)",
+          "dual_model": "Dual Model (separate tool-calling model)",
           "vision": "Camera & Vision (FPS, resolution)",
           "entities": "Entities & Actions (devices the AI controls)",
           "security": "Security (PIN, validation policies)",
@@ -82,6 +83,17 @@
           "voice": "Voice Name",
           "session_timeout": "Session Timeout",
           "validator_model": "Security Validator Model"
+        }
+      },
+      "dual_model": {
+        "title": "Dual Model Architecture",
+        "description": "Native audio models (like gemini-2.5-flash-native-audio-dialog) do NOT support function calling. Enable dual-model mode to use a separate text model for tool execution while the audio model handles the conversation.\n\nLeave disabled if your voice model supports tools natively (e.g., gpt-4o-realtime, gemini-2.0-flash-live).",
+        "data": {
+          "dual_model_enabled": "Enable Dual Model Mode",
+          "tool_provider": "Tool Model Provider",
+          "tool_model": "Tool Model Name",
+          "tool_api_key": "Tool Model API Key (blank = same as voice)",
+          "tool_base_url": "Tool Model Base URL (optional)"
         }
       },
       "vision": {

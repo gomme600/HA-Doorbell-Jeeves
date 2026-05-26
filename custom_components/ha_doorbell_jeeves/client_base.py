@@ -35,3 +35,7 @@ class BaseRealtimeClient(ABC):
     @abstractmethod
     async def send_image(self, image_base64: str, mime_type: str = "image/jpeg") -> None:
         """Inject an image frame into the session."""
+
+    @abstractmethod
+    async def inject_context(self, text: str) -> None:
+        """Inject a text context message into the session (for tool results in dual-model mode)."""

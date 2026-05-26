@@ -1,4 +1,4 @@
-"""Session manager – orchestrates client, vision, security, and auto-stop."""
+"""Session manager – orchestrates client, vision, security, audio, and dual-model routing."""
 
 from __future__ import annotations
 
@@ -13,12 +13,18 @@ from homeassistant.helpers.event import async_track_state_change_event
 
 from .client_base import BaseRealtimeClient
 from .const import (
+    AUDIO_MODE_REOLINK,
+    AUDIO_OUTPUT_GO2RTC,
     CONF_API_BASE_URL,
     CONF_API_KEY,
+    CONF_AUDIO_MODE,
+    CONF_AUDIO_OUTPUT_MODE,
     CONF_CAMERA_ENTITY,
+    CONF_DUAL_MODEL_ENABLED,
     CONF_FRAME_MAX_HEIGHT,
     CONF_FRAME_MAX_WIDTH,
     CONF_FRAME_QUALITY,
+    CONF_GO2RTC_STREAM_NAME,
     CONF_IDENTITY_MODE,
     CONF_FACE_SENSOR_ENTITY,
     CONF_MEDIA_PLAYER_ENTITY,
@@ -29,6 +35,10 @@ from .const import (
     CONF_STOP_ENTITY_STATES,
     CONF_STOP_EVENTS,
     CONF_SYSTEM_PROMPT,
+    CONF_TOOL_API_KEY,
+    CONF_TOOL_BASE_URL,
+    CONF_TOOL_MODEL,
+    CONF_TOOL_PROVIDER,
     CONF_VISION_FPS,
     CONF_VOICE,
     DEFAULT_FRAME_MAX_HEIGHT,
@@ -37,6 +47,8 @@ from .const import (
     DEFAULT_MODEL_GEMINI,
     DEFAULT_SESSION_TIMEOUT,
     DEFAULT_SYSTEM_PROMPT,
+    DEFAULT_TOOL_MODEL_GEMINI,
+    DEFAULT_TOOL_MODEL_OPENAI,
     DEFAULT_VISION_FPS,
     DEFAULT_VOICE_GEMINI,
     DEFAULT_VOICE_OPENAI,
@@ -74,6 +86,12 @@ class JeevesSessionManager:
         self.store = DataStore(hass, entry.entry_id)
         self._security = SecurityManager(hass, self._config, self.store)
 
+        # Audio handler (Reolink/go2rtc)
+        self._audio_handler: Any = None  # ReolinkAudioHandler or None
+
+        # Tool router (dual-model mode)
+        self._tool_router: Any = None  # ToolRouter or None
+
         # Auto-stop & auto-start listener handles
         self._stop_unsubs: list[CALLBACK_TYPE] = []
         self._start_unsubs: list[CALLBACK_TYPE] = []
@@ -101,6 +119,7 @@ class JeevesSessionManager:
         provider = config.get(CONF_PROVIDER, PROVIDER_GEMINI)
         api_key: str = config[CONF_API_KEY]
         model: str = config.get(CONF_MODEL, DEFAULT_MODEL_GEMINI)
+        dual_model = config.get(CONF_DUAL_MODEL_ENABLED, False)
 
         # Build full system prompt with entity context
         base_prompt: str = config.get(CONF_SYSTEM_PROMPT, DEFAULT_SYSTEM_PROMPT)
@@ -115,22 +134,58 @@ class JeevesSessionManager:
         # Reference images
         reference_images = self._get_reference_images()
 
-        # Create client
+        # Build tools
+        gemini_tools = build_gemini_tools(self.store)
+        openai_tools = build_openai_tools(self.store)
+
+        # ─── Dual-model setup ─────────────────────────────────────────────
+        if dual_model:
+            await self._setup_tool_router(config, full_prompt, gemini_tools, openai_tools)
+            # Voice client gets NO tools (native audio model can't use them)
+            voice_tools_gemini: list = []
+            voice_tools_openai: list = []
+            # Add instruction to voice model about how to request actions
+            voice_prompt = full_prompt + (
+                "\n\n--- IMPORTANT: ACTION PROTOCOL ---\n"
+                "When you want to perform an action (turn on a light, unlock a door, check "
+                "a camera, send a notification, etc.), simply state what you are going to do "
+                "clearly in your speech. For example: 'Let me turn on the porch light for you' "
+                "or 'I'll check the back camera now'. A separate system will detect your intent "
+                "and execute the action. You will receive a system message with the result.\n"
+                "Do NOT attempt to call functions directly — just speak naturally about what "
+                "you're doing and the system will handle execution.\n"
+            )
+        else:
+            voice_tools_gemini = gemini_tools
+            voice_tools_openai = openai_tools
+            voice_prompt = full_prompt
+
+        # ─── Create voice client ─────────────────────────────────────────
         if provider == PROVIDER_GEMINI:
             voice = config.get(CONF_VOICE, DEFAULT_VOICE_GEMINI)
-            tools = build_gemini_tools(self.store)
-            self._client = await self._create_gemini_client(api_key, model, full_prompt, voice, tools, reference_images)
+            self._client = await self._create_gemini_client(
+                api_key, model, voice_prompt, voice, voice_tools_gemini, reference_images
+            )
         else:
             voice = config.get(CONF_VOICE, DEFAULT_VOICE_OPENAI)
-            tools = build_openai_tools(self.store)
-            self._client = await self._create_openai_client(api_key, model, full_prompt, voice, tools, reference_images, config)
+            self._client = await self._create_openai_client(
+                api_key, model, voice_prompt, voice, voice_tools_openai, reference_images, config
+            )
 
         # Security reset
         self._security.start_session()
 
-        # Connect
+        # Connect voice client
         await self._client.connect()
         self._active = True
+
+        # ─── Start Reolink audio handler ──────────────────────────────────
+        if config.get(CONF_AUDIO_MODE) == AUDIO_MODE_REOLINK:
+            await self._start_reolink_audio(config)
+
+        # ─── Start tool router ────────────────────────────────────────────
+        if self._tool_router:
+            self._tool_router.start()
 
         # Vision loop
         fps = config.get(CONF_VISION_FPS, DEFAULT_VISION_FPS)
@@ -147,7 +202,10 @@ class JeevesSessionManager:
         self._register_stop_triggers()
 
         self.hass.bus.async_fire(EVENT_SESSION_STARTED, {"entry_id": self.entry.entry_id})
-        _LOGGER.info("Session started (provider=%s, model=%s, fps=%.1f)", provider, model, fps)
+        _LOGGER.info(
+            "Session started (provider=%s, model=%s, fps=%.1f, dual_model=%s)",
+            provider, model, fps, dual_model,
+        )
 
     async def async_stop_session(self) -> None:
         """Tear down the active session."""
@@ -158,6 +216,15 @@ class JeevesSessionManager:
         for unsub in self._stop_unsubs:
             unsub()
         self._stop_unsubs.clear()
+
+        # Stop tool router
+        if self._tool_router:
+            self._tool_router.stop()
+
+        # Stop audio handler
+        if self._audio_handler:
+            await self._audio_handler.stop()
+            self._audio_handler = None
 
         for task in (self._vision_task, self._timeout_task):
             if task and not task.done():
@@ -180,6 +247,68 @@ class JeevesSessionManager:
         if not self._client or not self._active:
             return
         await self._client.send_audio(base64.b64decode(audio_base64))
+
+    # ─── Reolink Audio Integration ────────────────────────────────────────────
+
+    async def _start_reolink_audio(self, config: dict) -> None:
+        """Start the Reolink 2-way audio handler via go2rtc."""
+        from .reolink_audio import ReolinkAudioHandler  # noqa: PLC0415
+
+        stream_name = config.get(CONF_GO2RTC_STREAM_NAME, "")
+        if not stream_name:
+            _LOGGER.warning("No go2rtc stream configured — Reolink audio disabled")
+            return
+
+        async def _on_doorbell_audio(audio_bytes: bytes) -> None:
+            """Forward audio from doorbell mic to AI client."""
+            if self._client and self._active:
+                await self._client.send_audio(audio_bytes)
+
+        self._audio_handler = ReolinkAudioHandler(
+            self.hass, stream_name, on_audio_received=_on_doorbell_audio
+        )
+        await self._audio_handler.start()
+        _LOGGER.info("Reolink audio handler active (stream=%s)", stream_name)
+
+    # ─── Dual-Model Tool Router Setup ─────────────────────────────────────────
+
+    async def _setup_tool_router(
+        self,
+        config: dict,
+        full_prompt: str,
+        gemini_tools: list,
+        openai_tools: list,
+    ) -> None:
+        """Initialize the tool router for dual-model mode."""
+        from .tool_router import ToolRouter  # noqa: PLC0415
+
+        # Tool model config (defaults to same provider/key as voice model)
+        tool_provider = config.get(CONF_TOOL_PROVIDER, config.get(CONF_PROVIDER, PROVIDER_GEMINI))
+        tool_api_key = config.get(CONF_TOOL_API_KEY, config.get(CONF_API_KEY, ""))
+        tool_base_url = config.get(CONF_TOOL_BASE_URL, config.get(CONF_API_BASE_URL))
+
+        if tool_provider == PROVIDER_GEMINI:
+            tool_model = config.get(CONF_TOOL_MODEL, DEFAULT_TOOL_MODEL_GEMINI)
+            tools = gemini_tools
+        else:
+            tool_model = config.get(CONF_TOOL_MODEL, DEFAULT_TOOL_MODEL_OPENAI)
+            tools = openai_tools
+
+        async def _inject_context(text: str) -> None:
+            """Inject tool result text back into the voice session."""
+            if self._client and self._active:
+                await self._client.inject_context(text)
+
+        self._tool_router = ToolRouter(
+            provider=tool_provider,
+            api_key=tool_api_key,
+            model=tool_model,
+            base_url=tool_base_url,
+            system_prompt=full_prompt,
+            tools=tools,
+            on_tool_call=self._handle_tool_call,
+            on_inject_context=_inject_context,
+        )
 
     # ─── Start Triggers ───────────────────────────────────────────────────────
 
@@ -348,12 +477,18 @@ class JeevesSessionManager:
     # ─── Callbacks ────────────────────────────────────────────────────────────
 
     def _handle_audio_output(self, audio_bytes: bytes) -> None:
-        audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
-        self.hass.bus.async_fire(EVENT_AUDIO_OUTPUT, {
-            "entry_id": self.entry.entry_id,
-            "audio_base64": audio_b64,
-            "media_player": self._config.get(CONF_MEDIA_PLAYER_ENTITY, ""),
-        })
+        """Handle audio output from the AI model."""
+        # If Reolink audio handler is active, send directly to doorbell speaker
+        if self._audio_handler and self._audio_handler.is_active:
+            self.hass.async_create_task(self._audio_handler.send_audio(audio_bytes))
+        else:
+            # Fall back to event-based output (for media player or external handling)
+            audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
+            self.hass.bus.async_fire(EVENT_AUDIO_OUTPUT, {
+                "entry_id": self.entry.entry_id,
+                "audio_base64": audio_b64,
+                "media_player": self._config.get(CONF_MEDIA_PLAYER_ENTITY, ""),
+            })
 
     async def _handle_tool_call(self, function_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         self._security.log_event("tool_call_request", function_name, {"arguments": arguments})
@@ -407,7 +542,6 @@ class JeevesSessionManager:
                 result["_image_base64"],
                 mime_type=result.get("_image_mime", "image/jpeg"),
             )
-            # Remove the internal keys from the result sent back to the model
             result.pop("_image_base64", None)
             result.pop("_image_mime", None)
 
@@ -422,6 +556,9 @@ class JeevesSessionManager:
 
     def _handle_transcript(self, role: str, text: str) -> None:
         self._security.log_event("transcript", f"{role}_speech", {"text": text[:500]})
+        # Forward to tool router for dual-model processing
+        if self._tool_router and self._tool_router.is_active:
+            self._tool_router.add_transcript(role, text)
 
     def _extract_claimed_identity(self, conversation_summary: str) -> str:
         summary_lower = conversation_summary.lower()

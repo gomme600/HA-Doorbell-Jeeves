@@ -10,6 +10,7 @@
 |---------|-------------|
 | 🎙️ Real-time speech | Gemini Live or OpenAI Realtime API (native audio) |
 | 🌐 Multi-provider | Google Gemini, OpenAI cloud, or any OpenAI-compatible local model |
+| 🧠 Dual-model | Separate voice model + tool-calling model for best of both worlds |
 | 📷 Configurable vision | 0.1–10 FPS with automatic frame downscaling |
 | 🖼️ Frame downscaling | Pillow-based resize before sending — faster responses |
 | 👤 Identity (sensor) | Frigate / CompreFace / Double Take integration |
@@ -22,6 +23,9 @@
 | ⏹️ Stop triggers | Auto-stop on state change, events, or human takeover |
 | 📱 Reolink Quick Setup | Auto-configures go2rtc 2-way audio |
 | 🔔 Notifications | AI can notify admin via configured targets |
+| 📷 On-demand cameras | AI can view any camera to answer visitor questions |
+| 📅 Calendar access | AI can check schedules for availability questions |
+| 📜 Event history | AI can search recent motion/detection events |
 | ⏱️ Session timeout | Configurable auto-hangup (default 120s) |
 | 🔍 Audit trail | Full session logging per action |
 | ⚙️ GUI config | No YAML required — full menu-driven options flow |
@@ -37,6 +41,37 @@
 | **Local (OpenAI-compatible)** | Any model via custom base URL | Privacy, offline, self-hosted |
 
 For local models, select "OpenAI / Compatible" and set the base URL to your server (e.g., `http://192.168.1.100:8080/v1`). Compatible with LocalAI, vLLM, Ollama (with OpenAI adapter), and any server implementing the OpenAI Realtime API.
+
+---
+
+## 🧠 Dual-Model Architecture
+
+**Problem:** Native audio models like `gemini-2.5-flash-native-audio-dialog` do NOT support function calling. They provide excellent voice quality but cannot execute tools.
+
+**Solution:** Enable **Dual Model Mode** to use two models simultaneously:
+
+| Role | Model | Purpose |
+|------|-------|---------|
+| **Voice Model** | `gemini-2.5-flash-native-audio-dialog` | Handles real-time speech conversation |
+| **Tool Model** | `gemini-2.5-flash` or `gpt-4.1` | Monitors transcript, executes tool calls |
+
+### How it works
+1. The **voice model** handles all audio I/O (speech-to-speech) with no tools declared
+2. The voice model is instructed to verbally state its intentions ("Let me turn on the porch light")
+3. A **tool router** monitors the conversation transcript in real-time
+4. When the transcript indicates an action is needed, the **tool model** decides which tools to call
+5. Tool results are injected back into the voice session as text context
+6. The voice model naturally responds with the results
+
+### Configuration
+- Go to **Options → Dual Model** in the integration settings
+- Enable "Dual Model Mode"
+- Select the tool model provider and model name
+- Optionally use a different API key for the tool model
+
+### When to use
+- ✅ **Enable** if your voice model is `gemini-2.5-flash-native-audio-dialog` (no native tool support)
+- ❌ **Disable** if using `gpt-4o-realtime-preview` or `gemini-2.0-flash-live-001` (these support tools natively)
 
 ---
 

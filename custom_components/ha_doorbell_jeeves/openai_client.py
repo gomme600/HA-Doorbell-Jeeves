@@ -118,6 +118,21 @@ class OpenAIRealtimeClient(BaseRealtimeClient):
         except Exception:
             _LOGGER.exception("Failed to send image to OpenAI")
 
+    async def inject_context(self, text: str) -> None:
+        """Inject a text message into the realtime session (used by tool router for results)."""
+        if not self._ws or not self._connected:
+            return
+        try:
+            await self._ws.conversation.item.create(
+                item={
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": text}],
+                }
+            )
+        except Exception:
+            _LOGGER.exception("Failed to inject context to OpenAI")
+
     async def _configure_session(self) -> None:
         session_config: dict[str, Any] = {
             "modalities": ["text", "audio"],
