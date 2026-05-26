@@ -24,8 +24,6 @@ from homeassistant.helpers.selector import (
     SelectSelector,
     SelectSelectorConfig,
     SelectSelectorMode,
-    ServiceSelector,
-    ServiceSelectorConfig,
     TextSelector,
     TextSelectorConfig,
 )
@@ -722,7 +720,7 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
             step_id="add_notification",
             data_schema=vol.Schema(
                 {
-                    vol.Required("service"): ServiceSelector(ServiceSelectorConfig(domain="notify")),
+                    vol.Required("service"): TextSelector(TextSelectorConfig(type="text")),
                     vol.Required("name"): TextSelector(),
                     vol.Required("description"): TextSelector(TextSelectorConfig(multiline=True)),
                 }
