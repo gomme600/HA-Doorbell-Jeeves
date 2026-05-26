@@ -452,6 +452,13 @@ class JeevesSessionManager:
             def _on_start_trigger(event: Event, _to: str = to_state, _from: str = from_state) -> None:
                 new_state = event.data.get("new_state")
                 old_state = event.data.get("old_state")
+                _LOGGER.warning(
+                    "Trigger event: entity=%s, new=%s, old=%s, expected_to=%s",
+                    event.data.get("entity_id"),
+                    new_state.state if new_state else None,
+                    old_state.state if old_state else None,
+                    _to,
+                )
                 if new_state is None:
                     return
                 if new_state.state != _to:
@@ -459,8 +466,10 @@ class JeevesSessionManager:
                 if _from and old_state and old_state.state != _from:
                     return
                 if not self._active:
-                    _LOGGER.info("Start trigger: %s → %s", event.data.get("entity_id"), _to)
+                    _LOGGER.warning("Start trigger FIRED → starting session")
                     self.hass.async_create_task(self.async_start_session())
+                else:
+                    _LOGGER.warning("Start trigger matched but session already active")
 
             unsub = async_track_state_change_event(self.hass, [entity_id], _on_start_trigger)
             self._start_unsubs.append(unsub)

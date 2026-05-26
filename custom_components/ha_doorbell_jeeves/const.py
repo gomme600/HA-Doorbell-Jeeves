@@ -40,6 +40,8 @@ CONF_SYSTEM_PROMPT = "system_prompt"
 # Entity & Action management (stored in .storage, not config entry)
 CONF_MANAGED_ENTITIES = "managed_entities"
 CONF_NOTIFICATION_TARGETS = "notification_targets"
+GLOBAL_ACTIONS_ENTITY_ID = "_global_actions_"
+GLOBAL_ACTIONS_ENTITY_NAME = "Standalone Actions"
 
 # Identity
 CONF_IDENTITY_MODE = "identity_mode"
