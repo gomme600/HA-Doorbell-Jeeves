@@ -68,10 +68,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await manager.async_initialize()
     hass.data[DOMAIN][entry.entry_id] = manager
 
-    # Reolink auto-configuration (set up go2rtc stream if needed)
+    # Reolink auto-configuration (deferred to first session start for timing)
+    # go2rtc may not be ready at entry load time, so we flag it for lazy init
     config = dict(entry.data) | dict(entry.options)
     if config.get(CONF_AUDIO_MODE) == AUDIO_MODE_REOLINK:
-        await _setup_reolink(hass, entry, config)
+        manager.reolink_needs_setup = True
+    else:
+        manager.reolink_needs_setup = False
 
     # Register services (only once globally)
     if not hass.services.has_service(DOMAIN, SERVICE_START_SESSION):

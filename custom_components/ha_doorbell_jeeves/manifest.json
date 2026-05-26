@@ -4,6 +4,7 @@
   "codeowners": ["@gomme600"],
   "config_flow": true,
   "dependencies": ["camera"],
+  "after_dependencies": ["go2rtc", "reolink"],
   "documentation": "https://github.com/gomme600/HA-Doorbell-Jeeves",
   "iot_class": "cloud_push",
   "issue_tracker": "https://github.com/gomme600/HA-Doorbell-Jeeves/issues",

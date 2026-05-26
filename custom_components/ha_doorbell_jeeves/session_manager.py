@@ -118,11 +118,33 @@ class JeevesSessionManager:
         await self.store.async_load()
         self._register_start_triggers()
 
+    async def _lazy_setup_reolink(self) -> None:
+        """Set up go2rtc stream for Reolink (deferred from boot for timing)."""
+        from .reolink_audio import auto_configure_reolink  # noqa: PLC0415
+
+        config = self._config
+        camera_entity = config.get(CONF_CAMERA_ENTITY, "")
+        if not camera_entity:
+            return
+        result = await auto_configure_reolink(self.hass, camera_entity)
+        if result:
+            _LOGGER.info("Reolink go2rtc configured: stream=%s", result.get("stream_name"))
+            new_options = dict(self._entry.options)
+            new_options["go2rtc_stream_name"] = result["stream_name"]
+            self.hass.config_entries.async_update_entry(self._entry, options=new_options)
+        else:
+            _LOGGER.warning("go2rtc not available — 2-way audio may not work")
+
     async def async_start_session(self) -> None:
         """Start the AI concierge session."""
         if self._active:
             _LOGGER.warning("Session already active — ignoring")
             return
+
+        # Lazy Reolink go2rtc setup (deferred from entry load for timing)
+        if getattr(self, "reolink_needs_setup", False):
+            await self._lazy_setup_reolink()
+            self.reolink_needs_setup = False
 
         config = self._config
         provider = config.get(CONF_PROVIDER, PROVIDER_GEMINI)
