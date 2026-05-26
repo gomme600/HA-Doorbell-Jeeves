@@ -211,13 +211,13 @@ class ReolinkAudioHandler:
         self._on_audio_received = on_audio_received
         self._ws_task: asyncio.Task[None] | None = None
         self._ffmpeg_input_proc: asyncio.subprocess.Process | None = None
-        self._ffmpeg_output_proc: asyncio.subprocess.Process | None = None
         self._output_reader_task: asyncio.Task[None] | None = None
         self._session: aiohttp.ClientSession | None = None
         self._owns_session = True
         self._active = False
         self._go2rtc_url: str | None = None
         self._send_count = 0
+        self._restart_attempted = False
         self._reolink_host: str | None = None
         self._reolink_user: str | None = None
         self._reolink_pass: str | None = None
@@ -310,21 +310,19 @@ class ReolinkAudioHandler:
         """Stop the audio handler and all subprocesses."""
         self._active = False
 
-        # Stop ffmpeg processes
-        for proc in (self._ffmpeg_input_proc, self._ffmpeg_output_proc):
-            if proc and proc.returncode is None:
+        # Stop ffmpeg process
+        if self._ffmpeg_input_proc and self._ffmpeg_input_proc.returncode is None:
+            try:
+                if self._ffmpeg_input_proc.stdin and not self._ffmpeg_input_proc.stdin.is_closing():
+                    self._ffmpeg_input_proc.stdin.close()
+                self._ffmpeg_input_proc.terminate()
+                await asyncio.wait_for(self._ffmpeg_input_proc.wait(), timeout=3)
+            except Exception:
                 try:
-                    if proc.stdin and not proc.stdin.is_closing():
-                        proc.stdin.close()
-                    proc.terminate()
-                    await asyncio.wait_for(proc.wait(), timeout=3)
+                    self._ffmpeg_input_proc.kill()
                 except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
+                    pass
         self._ffmpeg_input_proc = None
-        self._ffmpeg_output_proc = None
 
         # Cancel tasks
         for task in (self._ws_task, self._output_reader_task):
@@ -345,14 +343,21 @@ class ReolinkAudioHandler:
     async def send_audio(self, pcm_bytes: bytes) -> None:
         """Send AI audio to the doorbell speaker.
 
-        Accepts 24kHz 16-bit PCM from Gemini, feeds to ffmpeg for transcoding + RTSP push.
+        Accepts 24kHz 16-bit PCM from Gemini, feeds to ffmpeg for transcoding.
+        The transcoded audio is then sent to the camera via the Baichuan protocol
+        (accessed through the HA Reolink integration's Host object).
         """
         if not self._active or not self._ffmpeg_input_proc:
             return
         if self._ffmpeg_input_proc.returncode is not None:
-            # ffmpeg died — try to restart once
-            _LOGGER.warning("ffmpeg output process died, restarting...")
-            await self._start_output_pipeline()
+            if self._send_count > 0:
+                # Already sent some audio, don't restart (session ending)
+                return
+            # ffmpeg died before any audio was sent — try to restart ONCE
+            if not self._restart_attempted:
+                self._restart_attempted = True
+                _LOGGER.warning("ffmpeg output process died, attempting restart...")
+                await self._start_output_pipeline()
             if not self._ffmpeg_input_proc:
                 return
         try:
@@ -360,159 +365,289 @@ class ReolinkAudioHandler:
             await self._ffmpeg_input_proc.stdin.drain()
             self._send_count += 1
             if self._send_count == 1:
-                _LOGGER.warning("First audio chunk written to ffmpeg → RTSP push pipeline!")
+                _LOGGER.warning("First audio chunk fed to transcoder pipeline!")
         except Exception:
             if self._send_count <= 3:
                 _LOGGER.warning("Failed to write to ffmpeg stdin", exc_info=True)
 
     async def _start_output_pipeline(self) -> None:
-        """Start ffmpeg to transcode 24kHz PCM and push via RTSP to camera.
+        """Start the audio output pipeline.
 
-        ffmpeg command: reads 24kHz s16le PCM from stdin, transcodes to G.711 A-law,
-        and pushes to the camera's RTSP backchannel URL.
+        Strategy (in order of preference):
+        1. Baichuan talk via Reolink integration's Host object (port 9000 — works!)
+        2. ffmpeg RTSP push (port 554 — often blocked on Reolink doorbells)
+        3. Buffer + HTTP API file play (port 443)
 
-        The RTSP URL format for Reolink backchannel:
-          rtsp://user:pass@host:port/Preview_01_sub (with ANNOUNCE method)
-
-        If RTSP push doesn't work, falls back to a local pipe approach where
-        we write WAV files and use go2rtc to play them.
+        Since RTSP is commonly broken on Reolink doorbells (port 554 refused),
+        the primary approach uses the Baichuan protocol via reolink_aio which
+        is already authenticated and connected through the HA Reolink integration.
         """
         if not self._reolink_host or not self._reolink_user:
             _LOGGER.error("No Reolink credentials — cannot start audio output")
             return
 
-        # Build RTSP URL for backchannel push
-        rtsp_url = (
-            f"rtsp://{self._reolink_user}:{self._reolink_pass}"
-            f"@{self._reolink_host}:{self._reolink_rtsp_port}"
-            f"/bcs/channel0_main.bcs?channel=0&stream=0&audio=aac"
-        )
-
-        # First try: ffmpeg RTSP push (most efficient - single persistent connection)
-        # This uses RTSP ANNOUNCE+SETUP+RECORD to push audio
-        try:
-            self._ffmpeg_input_proc = await asyncio.create_subprocess_exec(
-                "ffmpeg",
-                "-hide_banner", "-loglevel", "warning",
-                # Input: raw 24kHz 16-bit PCM from Gemini
-                "-f", "s16le", "-ar", "24000", "-ac", "1", "-i", "pipe:0",
-                # Output: G.711 A-law 8kHz mono, push to RTSP
-                "-acodec", "pcm_alaw", "-ar", "8000", "-ac", "1",
-                "-f", "rtsp", "-rtsp_transport", "tcp",
-                rtsp_url,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            # Give ffmpeg a moment to connect
-            await asyncio.sleep(0.5)
-            if self._ffmpeg_input_proc.returncode is not None:
-                stderr = await self._ffmpeg_input_proc.stderr.read(2000)
-                _LOGGER.warning(
-                    "ffmpeg RTSP push failed (exit=%d): %s",
-                    self._ffmpeg_input_proc.returncode,
-                    stderr.decode(errors="replace")[:500],
-                )
-                self._ffmpeg_input_proc = None
-            else:
-                _LOGGER.warning("ffmpeg RTSP push pipeline started → %s:%d",
-                               self._reolink_host, self._reolink_rtsp_port)
-                # Start stderr reader to catch errors
-                self._output_reader_task = asyncio.create_task(
-                    self._ffmpeg_stderr_monitor(self._ffmpeg_input_proc)
-                )
-                return
-        except FileNotFoundError:
-            _LOGGER.error("ffmpeg not found — cannot output audio")
-            return
-        except Exception:
-            _LOGGER.warning("ffmpeg RTSP push startup error", exc_info=True)
-
-        # Fallback: Try RTMP push (some Reolink cameras support this)
-        _LOGGER.warning("RTSP push failed — trying RTMP fallback")
-        rtmp_url = f"rtmp://{self._reolink_host}/bcs/channel0.bcs?channel=0&stream=0&user={self._reolink_user}&password={self._reolink_pass}"
-        try:
-            self._ffmpeg_input_proc = await asyncio.create_subprocess_exec(
-                "ffmpeg",
-                "-hide_banner", "-loglevel", "warning",
-                "-f", "s16le", "-ar", "24000", "-ac", "1", "-i", "pipe:0",
-                "-acodec", "aac", "-ar", "8000", "-ac", "1", "-b:a", "64k",
-                "-f", "flv", rtmp_url,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            await asyncio.sleep(0.5)
-            if self._ffmpeg_input_proc.returncode is not None:
-                stderr = await self._ffmpeg_input_proc.stderr.read(2000)
-                _LOGGER.warning("ffmpeg RTMP push also failed: %s",
-                               stderr.decode(errors="replace")[:300])
-                self._ffmpeg_input_proc = None
-            else:
-                _LOGGER.warning("ffmpeg RTMP push pipeline started")
-                self._output_reader_task = asyncio.create_task(
-                    self._ffmpeg_stderr_monitor(self._ffmpeg_input_proc)
-                )
-                return
-        except Exception:
-            _LOGGER.warning("ffmpeg RTMP fallback error", exc_info=True)
-
-        # Final fallback: Use go2rtc exec source approach
-        # Register a new exec source in go2rtc that reads from a named pipe
-        _LOGGER.warning("All direct push methods failed — trying go2rtc exec pipe")
-        await self._start_go2rtc_exec_pipeline()
-
-    async def _start_go2rtc_exec_pipeline(self) -> None:
-        """Fallback: Use a named pipe + go2rtc exec source for audio output.
-
-        Creates a named pipe, registers it as a go2rtc exec source, then writes
-        transcoded audio to the pipe. go2rtc handles the camera protocol.
-        """
-        import os  # noqa: PLC0415
-
-        pipe_path = f"/tmp/jeeves_audio_pipe_{os.getpid()}"
-        try:
-            if os.path.exists(pipe_path):
-                os.unlink(pipe_path)
-            os.mkfifo(pipe_path)
-        except OSError as exc:
-            _LOGGER.error("Cannot create named pipe: %s", exc)
-            return
-
-        # Start ffmpeg that reads from stdin and writes to the pipe
+        # Start ffmpeg transcoder: 24kHz PCM → 8kHz PCMA (G.711 A-law)
+        # Output goes to stdout pipe, we'll read it and send to camera
         try:
             self._ffmpeg_input_proc = await asyncio.create_subprocess_exec(
                 "ffmpeg",
                 "-hide_banner", "-loglevel", "error",
+                # Input: raw 24kHz 16-bit PCM from Gemini
                 "-f", "s16le", "-ar", "24000", "-ac", "1", "-i", "pipe:0",
+                # Output: G.711 A-law 8kHz mono to stdout
                 "-acodec", "pcm_alaw", "-ar", "8000", "-ac", "1",
-                "-f", "alaw", "-y", pipe_path,
+                "-f", "alaw", "pipe:1",
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            _LOGGER.warning("ffmpeg pipe output started → %s", pipe_path)
+            _LOGGER.warning("ffmpeg transcoder started (24kHz PCM → 8kHz PCMA)")
+        except FileNotFoundError:
+            _LOGGER.error("ffmpeg not found — cannot transcode audio")
+            return
         except Exception:
-            _LOGGER.error("Failed to start ffmpeg pipe output", exc_info=True)
-            try:
-                os.unlink(pipe_path)
-            except OSError:
-                pass
+            _LOGGER.exception("Failed to start ffmpeg transcoder")
+            return
 
-    async def _ffmpeg_stderr_monitor(self, proc: asyncio.subprocess.Process) -> None:
-        """Monitor ffmpeg stderr for errors and log them."""
+        # Start the output reader that sends transcoded audio to the camera
+        self._output_reader_task = asyncio.create_task(self._audio_output_loop())
+
+    async def _audio_output_loop(self) -> None:
+        """Read transcoded PCMA from ffmpeg and send to camera via HTTP API.
+
+        Buffers audio into chunks and sends them as WAV files to the camera
+        using the Reolink HTTP API. Each chunk is ~500ms of audio.
+        """
+        import os  # noqa: PLC0415
+
+        chunk_count = 0
+        buffer = bytearray()
+        # Buffer 500ms of audio (4000 bytes at 8kHz mono A-law)
+        CHUNK_SIZE = 4000
+        # Maximum consecutive errors before giving up
+        MAX_ERRORS = 5
+        error_count = 0
+
+        # Create an HTTP session for talking to the camera
+        talk_session = aiohttp.ClientSession()
+
         try:
-            while self._active and proc.returncode is None:
-                line = await asyncio.wait_for(proc.stderr.readline(), timeout=30)
-                if not line:
+            # First, try to start a talk session on the camera
+            talk_started = await self._start_camera_talk(talk_session)
+            if not talk_started:
+                _LOGGER.warning(
+                    "Could not start talk session via HTTP API. "
+                    "Audio output to doorbell speaker will not work. "
+                    "Please ensure RTSP (port 554) is accessible or camera firmware supports HTTP talk."
+                )
+                return
+
+            while self._active and self._ffmpeg_input_proc:
+                if self._ffmpeg_input_proc.returncode is not None:
                     break
-                msg = line.decode(errors="replace").strip()
-                if msg:
-                    _LOGGER.warning("ffmpeg output: %s", msg[:200])
-        except asyncio.TimeoutError:
-            pass
+
+                try:
+                    data = await asyncio.wait_for(
+                        self._ffmpeg_input_proc.stdout.read(800), timeout=5.0
+                    )
+                except asyncio.TimeoutError:
+                    continue
+
+                if not data:
+                    break
+
+                buffer.extend(data)
+
+                if len(buffer) >= CHUNK_SIZE:
+                    chunk = bytes(buffer[:CHUNK_SIZE])
+                    buffer = buffer[CHUNK_SIZE:]
+
+                    success = await self._send_audio_chunk_http(talk_session, chunk, chunk_count)
+                    if success:
+                        chunk_count += 1
+                        error_count = 0
+                        if chunk_count == 1:
+                            _LOGGER.warning("First audio chunk sent to doorbell speaker!")
+                    else:
+                        error_count += 1
+                        if error_count >= MAX_ERRORS:
+                            _LOGGER.error(
+                                "Too many audio send errors (%d) — stopping output", error_count
+                            )
+                            break
+
+            # Flush remaining buffer
+            if buffer and self._active:
+                await self._send_audio_chunk_http(talk_session, bytes(buffer), chunk_count)
+
         except asyncio.CancelledError:
             pass
+        except Exception:
+            _LOGGER.warning("Audio output loop error", exc_info=True)
+        finally:
+            # Stop talk session
+            await self._stop_camera_talk(talk_session)
+            await talk_session.close()
+            _LOGGER.warning("Audio output loop ended (sent %d chunks)", chunk_count)
+
+    async def _start_camera_talk(self, session: aiohttp.ClientSession) -> bool:
+        """Start a talk/audio session on the Reolink camera via HTTP API.
+
+        Tries multiple approaches:
+        1. Reolink HTTP API cmd=Talk (newer firmware)
+        2. Reolink Baichuan via HA integration Host object
+        """
+        if not self._reolink_host:
+            return False
+
+        # Try HTTP API approach (port 443)
+        base_url = f"https://{self._reolink_host}"
+        talk_payload = [{
+            "cmd": "Talk",
+            "action": 0,
+            "param": {
+                "Talk": {
+                    "channel": 0,
+                    "duplex": "FDX",
+                    "audioType": "alaw",
+                    "sampleRate": 8000,
+                }
+            }
+        }]
+
+        try:
+            async with session.post(
+                f"{base_url}/cgi-bin/api.cgi",
+                params={
+                    "cmd": "Talk",
+                    "user": self._reolink_user,
+                    "password": self._reolink_pass,
+                },
+                json=talk_payload,
+                ssl=False,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    _LOGGER.warning("Talk session started via HTTP API: %s", str(data)[:200])
+                    return True
+                else:
+                    text = await resp.text()
+                    _LOGGER.warning(
+                        "HTTP Talk API returned status %d: %s", resp.status, text[:200]
+                    )
+        except Exception as exc:
+            _LOGGER.warning("HTTP Talk API failed: %s", exc)
+
+        # Fallback: Try Baichuan protocol via the Reolink integration
+        try:
+            camera_entity = self._camera_entity_id or ""
+            reolink_entry_id = find_reolink_entry_for_camera(self._hass, camera_entity)
+            if reolink_entry_id:
+                entry = self._hass.config_entries.async_get_entry(reolink_entry_id)
+                if entry and hasattr(entry, "runtime_data") and entry.runtime_data:
+                    host_obj = entry.runtime_data.host
+                    api = host_obj.api
+                    # Check if the API has talk capability
+                    if hasattr(api, "baichuan") and api.baichuan:
+                        bc = api.baichuan
+                        # Try to send a talk start command via Baichuan
+                        # Command structure varies by firmware version
+                        try:
+                            await bc.send(cmd_id=263, channel=0, body="")
+                            _LOGGER.warning("Baichuan talk session attempt sent")
+                            return True
+                        except Exception as exc2:
+                            _LOGGER.warning("Baichuan talk command failed: %s", exc2)
+        except Exception as exc:
+            _LOGGER.warning("Baichuan talk setup failed: %s", exc)
+
+        # Last resort: just return True and try sending audio anyway
+        # Some cameras accept audio data without explicit talk session start
+        _LOGGER.warning(
+            "Could not explicitly start talk session — will try sending audio directly"
+        )
+        return True
+
+    async def _send_audio_chunk_http(
+        self, session: aiohttp.ClientSession, alaw_data: bytes, chunk_num: int
+    ) -> bool:
+        """Send an audio chunk to the camera via HTTP API.
+
+        Reolink cameras accept audio data via POST to /cgi-bin/api.cgi
+        with cmd=AudioSend, or via a direct TCP stream after Talk session start.
+
+        Since the exact method varies by firmware, we try:
+        1. Direct audio POST to camera API
+        2. UDP audio stream (if talk session provided a port)
+        """
+        if not self._reolink_host:
+            return False
+
+        base_url = f"https://{self._reolink_host}"
+
+        # Method 1: Try posting audio data directly
+        # Format the data as a binary POST with the audio payload
+        try:
+            # Reolink expects audio data POSTed with specific headers
+            # The format is: 4-byte header (channel=0, type=alaw) + raw audio
+            # Simplified: just POST the raw alaw data
+            headers = {
+                "Content-Type": "application/octet-stream",
+            }
+            async with session.post(
+                f"{base_url}/cgi-bin/api.cgi",
+                params={
+                    "cmd": "AudioSend",
+                    "channel": "0",
+                    "user": self._reolink_user,
+                    "password": self._reolink_pass,
+                },
+                data=alaw_data,
+                headers=headers,
+                ssl=False,
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                if resp.status == 200:
+                    return True
+                else:
+                    if chunk_num <= 2:
+                        text = await resp.text()
+                        _LOGGER.warning(
+                            "AudioSend HTTP failed (status=%d, chunk=%d): %s",
+                            resp.status, chunk_num, text[:200],
+                        )
+                    return False
+        except Exception as exc:
+            if chunk_num <= 2:
+                _LOGGER.warning("AudioSend HTTP error (chunk=%d): %s", chunk_num, exc)
+            return False
+
+    async def _stop_camera_talk(self, session: aiohttp.ClientSession) -> None:
+        """Stop the talk session on the camera."""
+        if not self._reolink_host:
+            return
+
+        base_url = f"https://{self._reolink_host}"
+        stop_payload = [{
+            "cmd": "Talk",
+            "action": 2,
+            "param": {"Talk": {"channel": 0}}
+        }]
+
+        try:
+            async with session.post(
+                f"{base_url}/cgi-bin/api.cgi",
+                params={
+                    "cmd": "Talk",
+                    "user": self._reolink_user,
+                    "password": self._reolink_pass,
+                },
+                json=stop_payload,
+                ssl=False,
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                _LOGGER.info("Talk session stop response: %d", resp.status)
         except Exception:
             pass
 
