@@ -20,12 +20,82 @@ from homeassistant.core import HomeAssistant
 
 _LOGGER = logging.getLogger(__name__)
 
-# go2rtc is embedded in HA Core and runs on localhost:1984
-GO2RTC_BASE = "http://localhost:1984"
+# HA-managed go2rtc runs on port 11984 (since 2024.x)
+# User/addon go2rtc typically runs on port 1984
+GO2RTC_PORTS = [11984, 1984]
+GO2RTC_BASE: str | None = None  # Resolved at runtime
 
 # Reolink RTSP URL patterns
 REOLINK_RTSP_MAIN = "rtsp://{user}:{password}@{host}:554/h264Preview_01_main"
 REOLINK_RTSP_SUB = "rtsp://{user}:{password}@{host}:554/h264Preview_01_sub"
+
+
+async def _discover_go2rtc_url(hass: HomeAssistant) -> str | None:
+    """Discover the active go2rtc API URL.
+
+    Strategy:
+    1. Access HA's internal go2rtc data (url + authenticated session)
+    2. Try port 11984 (HA-managed go2rtc since 2024.x)
+    3. Try port 1984 (user-installed/addon go2rtc)
+    """
+    global GO2RTC_BASE  # noqa: PLW0603
+
+    if GO2RTC_BASE:
+        return GO2RTC_BASE
+
+    # Method 1: Access HA's go2rtc data — it stores the URL and session with auth
+    try:
+        go2rtc_data = hass.data.get("go2rtc")
+        if go2rtc_data and hasattr(go2rtc_data, "url"):
+            url = go2rtc_data.url.rstrip("/")
+            _LOGGER.info("Found go2rtc via HA internal data: %s", url)
+            GO2RTC_BASE = url
+            return GO2RTC_BASE
+    except (AttributeError, KeyError, TypeError):
+        pass
+
+    # Method 2: Try known ports on localhost (with and without common auth)
+    session = aiohttp.ClientSession()
+    try:
+        for port in GO2RTC_PORTS:
+            try:
+                url = f"http://127.0.0.1:{port}"
+                async with session.get(
+                    f"{url}/api/streams",
+                    timeout=aiohttp.ClientTimeout(total=3),
+                ) as resp:
+                    if resp.status in (200, 401):
+                        # 200 = accessible, 401 = exists but needs auth
+                        if resp.status == 200:
+                            _LOGGER.info("Discovered go2rtc at %s (no auth)", url)
+                            GO2RTC_BASE = url
+                            return GO2RTC_BASE
+                        else:
+                            _LOGGER.info("Found go2rtc at %s (requires auth)", url)
+                            GO2RTC_BASE = url
+                            return GO2RTC_BASE
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+                continue
+    finally:
+        await session.close()
+
+    _LOGGER.warning("Could not discover go2rtc — tried ports %s", GO2RTC_PORTS)
+    return None
+
+
+def _get_go2rtc_session(hass: HomeAssistant) -> aiohttp.ClientSession | None:
+    """Get HA's authenticated go2rtc session if available.
+
+    HA-managed go2rtc uses random BasicAuth credentials, and communicates
+    via a Unix socket session. We can reuse this session for our API calls.
+    """
+    try:
+        go2rtc_data = hass.data.get("go2rtc")
+        if go2rtc_data and hasattr(go2rtc_data, "session"):
+            return go2rtc_data.session
+    except (AttributeError, KeyError, TypeError):
+        pass
+    return None
 
 
 def get_reolink_config(hass: HomeAssistant, config_entry_id: str) -> dict[str, Any] | None:
@@ -72,34 +142,47 @@ async def setup_go2rtc_stream(
 
     Reference: https://community.home-assistant.io/t/2-way-audio-intercom-for-reolink-doorbell-made-easy/832189
     """
+    base_url = await _discover_go2rtc_url(hass)
+    if not base_url:
+        _LOGGER.error("Cannot setup go2rtc stream — go2rtc not found")
+        return False
+
+    # Use HA's authenticated session if available (for HA-managed go2rtc)
+    ha_session = _get_go2rtc_session(hass)
+    own_session = None
+    if ha_session:
+        session = ha_session
+    else:
+        own_session = aiohttp.ClientSession()
+        session = own_session
+
     try:
-        session = aiohttp.ClientSession()
-        try:
-            url = f"{GO2RTC_BASE}/api/streams"
+        url = f"{base_url}/api/streams"
 
-            # Source 1: RTSP stream (receives video + audio from doorbell)
-            params1 = {"src": stream_name, "url": rtsp_url}
-            async with session.put(url, params=params1) as resp:
-                if resp.status not in (200, 201):
-                    text = await resp.text()
-                    _LOGGER.error("Failed to register go2rtc RTSP source: %s", text)
-                    return False
+        # Source 1: RTSP stream (receives video + audio from doorbell)
+        params1 = {"src": stream_name, "url": rtsp_url}
+        async with session.put(url, params=params1) as resp:
+            if resp.status not in (200, 201):
+                text = await resp.text()
+                _LOGGER.error("Failed to register go2rtc RTSP source (status=%d): %s", resp.status, text)
+                return False
 
-            # Source 2: ffmpeg backchannel (sends audio TO doorbell speaker)
-            backchannel_url = f"ffmpeg:{stream_name}#audio=opus#audio=copy"
-            params2 = {"src": stream_name, "url": backchannel_url}
-            async with session.put(url, params=params2) as resp:
-                if resp.status not in (200, 201):
-                    text = await resp.text()
-                    _LOGGER.warning("Failed to register go2rtc backchannel: %s (2-way audio may not work)", text)
+        # Source 2: ffmpeg backchannel (sends audio TO doorbell speaker)
+        backchannel_url = f"ffmpeg:{stream_name}#audio=opus#audio=copy"
+        params2 = {"src": stream_name, "url": backchannel_url}
+        async with session.put(url, params=params2) as resp:
+            if resp.status not in (200, 201):
+                text = await resp.text()
+                _LOGGER.warning("Failed to register go2rtc backchannel: %s (2-way audio may not work)", text)
 
-            _LOGGER.info("Registered go2rtc stream '%s' with backchannel", stream_name)
-            return True
-        finally:
-            await session.close()
+        _LOGGER.info("Registered go2rtc stream '%s' with backchannel", stream_name)
+        return True
     except Exception:
         _LOGGER.exception("Error setting up go2rtc stream")
         return False
+    finally:
+        if own_session:
+            await own_session.close()
 
 
 class ReolinkAudioHandler:
@@ -121,7 +204,9 @@ class ReolinkAudioHandler:
         self._on_audio_received = on_audio_received
         self._ws_task: asyncio.Task[None] | None = None
         self._session: aiohttp.ClientSession | None = None
+        self._owns_session = True
         self._active = False
+        self._go2rtc_url: str | None = None
 
     @property
     def is_active(self) -> bool:
@@ -132,10 +217,24 @@ class ReolinkAudioHandler:
         if self._active:
             return
 
-        self._session = aiohttp.ClientSession()
+        # Discover go2rtc URL before starting
+        self._go2rtc_url = await _discover_go2rtc_url(self._hass)
+        if not self._go2rtc_url:
+            _LOGGER.error("Cannot start audio handler — go2rtc not found")
+            return
+
+        # Use HA's authenticated session if available
+        ha_session = _get_go2rtc_session(self._hass)
+        if ha_session:
+            self._session = ha_session
+            self._owns_session = False
+        else:
+            self._session = aiohttp.ClientSession()
+            self._owns_session = True
+
         self._active = True
         self._ws_task = asyncio.create_task(self._audio_receive_loop())
-        _LOGGER.info("Reolink audio handler started (stream=%s)", self._stream_name)
+        _LOGGER.info("Reolink audio handler started (stream=%s, go2rtc=%s)", self._stream_name, self._go2rtc_url)
 
     async def stop(self) -> None:
         """Stop the audio handler."""
@@ -147,9 +246,9 @@ class ReolinkAudioHandler:
             except asyncio.CancelledError:
                 pass
         self._ws_task = None
-        if self._session:
+        if self._session and self._owns_session:
             await self._session.close()
-            self._session = None
+        self._session = None
         _LOGGER.info("Reolink audio handler stopped")
 
     async def send_audio(self, pcm_bytes: bytes) -> None:
@@ -158,11 +257,11 @@ class ReolinkAudioHandler:
         go2rtc accepts audio via its stream talk endpoint.
         Format: raw PCM 16-bit LE, mono, at the camera's expected sample rate.
         """
-        if not self._session or not self._active:
+        if not self._session or not self._active or not self._go2rtc_url:
             return
 
         try:
-            url = f"{GO2RTC_BASE}/api/stream"
+            url = f"{self._go2rtc_url}/api/stream"
             params = {"src": self._stream_name, "backchannel": "1"}
             async with self._session.post(
                 url, params=params,
@@ -177,7 +276,7 @@ class ReolinkAudioHandler:
 
     async def _audio_receive_loop(self) -> None:
         """Connect to go2rtc WebSocket and receive audio frames from the doorbell mic."""
-        ws_url = f"{GO2RTC_BASE}/api/ws?src={self._stream_name}&media=audio"
+        ws_url = f"{self._go2rtc_url}/api/ws?src={self._stream_name}&media=audio"
 
         while self._active:
             try:
