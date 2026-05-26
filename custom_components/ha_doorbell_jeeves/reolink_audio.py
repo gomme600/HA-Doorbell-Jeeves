@@ -990,18 +990,21 @@ class ReolinkAudioHandler:
             _LOGGER.warning("Failed to create Baichuan listen connection: %s", exc)
             return
 
-        # Intercept the protocol's push callback to capture cmd 3 audio data
+        # Patch the TCP protocol to handle binary stream responses (payload_offset != 0)
+        # The standard reolink_aio library rejects these, but cmd 3 stream requires it
         try:
             protocol = listen_bc._protocol
             if protocol:
                 self._original_push_callback = protocol._push_callback
                 protocol._push_callback = self._stream_push_callback
-                _LOGGER.info("Hooked Baichuan protocol push callback for audio input")
+                self._patch_protocol_for_streaming(protocol)
+                _LOGGER.info("Patched Baichuan protocol for binary stream reception")
         except Exception as exc:
-            _LOGGER.warning("Failed to hook push callback: %s", exc)
+            _LOGGER.warning("Failed to patch protocol: %s", exc)
             return
 
         # Request the sub-stream (cmd 3) — camera sends multiplexed video+audio
+        self._listen_active = True  # Enable before send so push callback processes data
         try:
             preview_body = (
                 '<?xml version="1.0" encoding="UTF-8" ?>\n'
@@ -1013,14 +1016,21 @@ class ReolinkAudioHandler:
                 "</Preview>\n"
                 "</body>\n"
             )
-            # send() waits for the first response; subsequent stream data goes to push
+            # send() may fail because the response has payload_offset != 0.
+            # Our patched parse_data will handle the response and start receiving.
             await listen_bc.send(cmd_id=3, channel=0, body=preview_body)
-            self._listen_active = True
             _LOGGER.warning("Baichuan preview stream started — receiving audio from doorbell mic")
         except Exception as exc:
-            _LOGGER.warning("Failed to start Baichuan preview stream: %s", exc)
-            # Some cameras may return an error but still stream — mark active anyway
-            self._listen_active = True
+            # Expected: the first response has payload_offset which triggers an error
+            # in send()'s receive_future. But our patched parse_data already resolved
+            # the future or the stream is flowing via push.
+            err_msg = str(exc).lower()
+            if "payload offset" in err_msg or "parsing not implemented" in err_msg:
+                _LOGGER.warning(
+                    "Preview stream flowing (initial response had payload_offset — normal)"
+                )
+            else:
+                _LOGGER.warning("Preview stream start issue: %s (continuing anyway)", exc)
 
         # Start the input processor task (decodes ADPCM → PCM and sends to Gemini)
         self._input_processor_task = asyncio.create_task(self._audio_input_processor())
@@ -1040,6 +1050,110 @@ class ReolinkAudioHandler:
         elif self._original_push_callback:
             # Pass non-audio pushes to the original handler
             self._original_push_callback(cmd_id, data, len_header)
+
+    def _patch_protocol_for_streaming(self, protocol) -> None:
+        """Monkeypatch the TCP protocol's parse_data to handle binary streams.
+
+        The standard reolink_aio library rejects messages with payload_offset != 0.
+        For cmd 3 (preview/audio stream), the response contains:
+          - 24-byte Baichuan header (includes payload_offset field)
+          - payload_offset bytes: encrypted Extension XML
+          - remaining bytes: raw BcMedia binary data
+
+        We patch parse_data to accept these and route the binary data to our
+        audio extraction method directly.
+        """
+        from reolink_aio.baichuan.util import HEADER_MAGIC  # noqa: PLC0415
+
+        original_parse_data = protocol.parse_data
+        handler = self  # Capture reference for closure
+
+        def patched_parse_data():
+            """Enhanced parse_data that handles payload_offset for binary streams."""
+            if len(protocol._data) < 24:
+                if len(protocol._data) >= 20:
+                    # Check if this is a standard 20-byte header message
+                    mess_class = protocol._data[18:20].hex()
+                    if mess_class == "1466":
+                        original_parse_data()
+                        return
+                # Wait for more data
+                return
+
+            # Read the header fields
+            magic = protocol._data[0:4].hex()
+            if magic != HEADER_MAGIC:
+                original_parse_data()
+                return
+
+            mess_class = protocol._data[18:20].hex()
+
+            # Only intercept 24-byte header messages that have payload_offset
+            if mess_class not in ("1464", "0000"):
+                original_parse_data()
+                return
+
+            rec_payload_offset = int.from_bytes(protocol._data[20:24], byteorder="little")
+            if rec_payload_offset == 0:
+                # Standard message — use original parser
+                original_parse_data()
+                return
+
+            # --- Binary stream message (payload_offset != 0) ---
+            rec_cmd_id = int.from_bytes(protocol._data[4:8], byteorder="little")
+            rec_len_body = int.from_bytes(protocol._data[8:12], byteorder="little")
+            rec_mess_id = int.from_bytes(protocol._data[12:16], byteorder="little")
+            len_header = 24
+
+            len_body = len(protocol._data) - len_header
+            if len_body < rec_len_body:
+                # Wait for the rest of the body
+                return
+
+            # Extract the full chunk
+            len_chunk = rec_len_body + len_header
+            data_chunk = protocol._data[0:len_chunk]
+
+            # Move past this message
+            if len_body > rec_len_body:
+                protocol._data = protocol._data[len_chunk:]
+            else:
+                protocol._data = b""
+
+            # Check status code
+            rec_status_code = int.from_bytes(data_chunk[16:18], byteorder="little")
+            if rec_status_code != 200:
+                # Error response — resolve any waiting future
+                receive_future = protocol.receive_futures.get(rec_cmd_id, {}).get(rec_mess_id)
+                if receive_future is not None and not receive_future.done():
+                    from reolink_aio.exceptions import ApiError  # noqa: PLC0415
+                    receive_future.set_exception(
+                        ApiError(f"cmd {rec_cmd_id} status {rec_status_code}",
+                                 rspCode=rec_status_code)
+                    )
+                return
+
+            # Extract binary payload (after the Extension XML)
+            binary_start = len_header + rec_payload_offset
+            binary_data = data_chunk[binary_start:] if binary_start < len(data_chunk) else b""
+
+            # Resolve any waiting receive_future (first response to send())
+            receive_future = protocol.receive_futures.get(rec_cmd_id, {}).get(rec_mess_id)
+            if receive_future is not None and not receive_future.done():
+                # Return Extension XML part to the caller
+                ext_data = data_chunk[len_header:len_header + rec_payload_offset]
+                receive_future.set_result((ext_data, len_header))
+
+            # Route binary data directly to audio extraction
+            if binary_data and handler._listen_active:
+                handler._extract_audio_from_stream(binary_data)
+
+            # Continue parsing if there's more data in the buffer
+            if protocol._data and len(protocol._data) >= 4:
+                if protocol._data[0:4].hex() == HEADER_MAGIC:
+                    patched_parse_data()
+
+        protocol.parse_data = patched_parse_data
 
     def _extract_audio_from_stream(self, body: bytes) -> None:
         """Parse BcMedia packets from a cmd 3 stream chunk and extract ADPCM audio.
