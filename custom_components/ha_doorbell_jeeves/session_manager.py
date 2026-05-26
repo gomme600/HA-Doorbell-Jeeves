@@ -117,18 +117,39 @@ class JeevesSessionManager:
         """Load persistent data and register start triggers."""
         await self.store.async_load()
 
-        # Always sync start triggers from config entry data into the store
-        # (config_flow saves to entry.data["start_triggers_config"],
-        #  but _register_start_triggers reads from self.store.start_triggers)
+        # Sync start triggers from config entry data into the store.
+        # Config flow stores triggers in two possible keys:
+        #   - "start_triggers_config" (from triggers step)
+        #   - "doorbell_trigger_entity" (from Reolink auto-detection, legacy)
         triggers_config = self._config.get("start_triggers_config", [])
+
+        # Fallback: Reolink auto-detected doorbell entity
+        if not triggers_config:
+            doorbell_entity = self._config.get("doorbell_trigger_entity", "")
+            if doorbell_entity:
+                triggers_config = [{"entity_id": doorbell_entity, "to_state": "on"}]
+                _LOGGER.warning(
+                    "Using auto-detected doorbell trigger: %s", doorbell_entity
+                )
+
         if triggers_config:
             from .models import StartTrigger  # noqa: PLC0415
             triggers = [StartTrigger.from_dict(t) for t in triggers_config]
             if triggers != self.store.start_triggers:
                 await self.store.async_set_start_triggers(triggers)
-                _LOGGER.info("Synced %d start triggers from config", len(triggers))
+                _LOGGER.warning("Synced %d start trigger(s) from config", len(triggers))
+        elif not self.store.start_triggers:
+            _LOGGER.warning(
+                "No start triggers configured. "
+                "Go to integration options → Triggers to set up doorbell auto-start."
+            )
 
         self._register_start_triggers()
+        _LOGGER.warning(
+            "Registered %d start trigger(s): %s",
+            len(self.store.start_triggers),
+            [t.entity_id for t in self.store.start_triggers],
+        )
 
     async def _lazy_setup_reolink(self) -> None:
         """Set up go2rtc stream for Reolink (deferred from boot for timing)."""
