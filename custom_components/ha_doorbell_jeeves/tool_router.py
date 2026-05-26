@@ -185,10 +185,16 @@ class ToolRouter:
 
     async def _check_gemini(self, new_turns: list[dict[str, str]]) -> list[dict[str, Any]]:
         """Use Gemini text model to check if tools should be called."""
+        import asyncio  # noqa: PLC0415
+
         from google import genai  # noqa: PLC0415
         from google.genai import types  # noqa: PLC0415
 
-        client = genai.Client(api_key=self._api_key)
+        # genai.Client() does blocking I/O — run in executor
+        loop = asyncio.get_event_loop()
+        client = await loop.run_in_executor(
+            None, lambda: genai.Client(api_key=self._api_key)
+        )
 
         # Build messages
         messages = self._build_tool_check_messages(new_turns)

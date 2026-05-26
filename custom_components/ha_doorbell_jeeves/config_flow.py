@@ -324,25 +324,29 @@ class DoorbellJeevesConfigFlow(ConfigFlow, domain=DOMAIN):
         return self.async_create_entry(title=title, data=self._data)
 
     async def _validate_api_key(self, provider: str, api_key: str, base_url: str | None = None) -> bool:
-        """Validate the API key by making a simple request."""
+        """Validate the API key by making a simple request.
+        
+        Note: genai.Client() and the import itself do blocking I/O (SSL cert loading,
+        file system reads). We must run everything in an executor to avoid event loop warnings.
+        """
         if not api_key:
             return False
         try:
             if provider == PROVIDER_GEMINI:
-                from google import genai  # noqa: PLC0415
-                client = genai.Client(api_key=api_key)
-                # Simple validation — list models
-                models = await self.hass.async_add_executor_job(
-                    lambda: list(client.models.list())
-                )
-                return len(models) > 0
+                def _validate_gemini() -> bool:
+                    from google import genai  # noqa: PLC0415
+                    client = genai.Client(api_key=api_key)
+                    models = list(client.models.list())
+                    return len(models) > 0
+
+                return await self.hass.async_add_executor_job(_validate_gemini)
             else:
                 import openai  # noqa: PLC0415
                 kwargs: dict[str, Any] = {"api_key": api_key}
                 if base_url:
                     kwargs["base_url"] = base_url
                 client = openai.AsyncOpenAI(**kwargs)
-                models = await client.models.list()
+                await client.models.list()
                 return True
         except Exception as err:
             _LOGGER.debug("API key validation failed: %s", err)

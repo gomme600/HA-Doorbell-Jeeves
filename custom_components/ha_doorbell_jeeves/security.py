@@ -235,7 +235,8 @@ class SecurityManager:
         from google import genai  # noqa: PLC0415
         from google.genai import types  # noqa: PLC0415
 
-        client = genai.Client(api_key=api_key)
+        # genai.Client() does blocking I/O — run construction in thread
+        client = await asyncio.to_thread(genai.Client, api_key=api_key)
         system_prompt = _VALIDATOR_BASE_PROMPT
         if custom_prompt:
             system_prompt += f"\n\nADMIN INSTRUCTIONS FOR '{action_name}':\n{custom_prompt}"

@@ -63,7 +63,11 @@ class GeminiLiveClient(BaseRealtimeClient):
         return " | ".join(f"[{t['role']}]: {t['text'][:100]}" for t in recent)
 
     async def connect(self) -> None:
-        self._client = genai.Client(api_key=self._api_key)
+        # genai.Client() does blocking I/O (SSL cert loading) — run in executor
+        loop = asyncio.get_event_loop()
+        self._client = await loop.run_in_executor(
+            None, lambda: genai.Client(api_key=self._api_key)
+        )
 
         live_config = types.LiveConnectConfig(
             response_modalities=["AUDIO"],
