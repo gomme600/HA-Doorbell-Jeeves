@@ -47,6 +47,7 @@ class GeminiLiveClient(BaseRealtimeClient):
 
         self._client: genai.Client | None = None
         self._session: Any = None
+        self._session_cm: Any = None
         self._receive_task: asyncio.Task[None] | None = None
         self._connected = False
         self._conversation_turns: list[dict[str, str]] = []
@@ -82,9 +83,10 @@ class GeminiLiveClient(BaseRealtimeClient):
             output_audio_transcription=types.AudioTranscriptionConfig(),
         )
 
-        self._session = await self._client.aio.live.connect(
+        self._session_cm = self._client.aio.live.connect(
             model=self._model, config=live_config,
         )
+        self._session = await self._session_cm.__aenter__()
         self._connected = True
 
         await self._inject_reference_images()
@@ -99,12 +101,13 @@ class GeminiLiveClient(BaseRealtimeClient):
                 await self._receive_task
             except asyncio.CancelledError:
                 pass
-        if self._session:
+        if self._session_cm:
             try:
-                await self._session.close()
+                await self._session_cm.__aexit__(None, None, None)
             except Exception:
                 pass
             self._session = None
+            self._session_cm = None
         self._client = None
         self._conversation_turns.clear()
         _LOGGER.info("Gemini Live disconnected")
