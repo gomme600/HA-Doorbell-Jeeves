@@ -986,25 +986,47 @@ class ReolinkAudioHandler:
         """Read audio from RTSP stream via ffmpeg and send PCM to Gemini.
 
         Runs ffmpeg with:
-          - Input: RTSP URL (sub-stream for lower bandwidth)
+          - Input: RTSP URL (tries sub-stream first, falls back to main)
           - Only audio track (-vn: no video)
           - Output: raw 16kHz 16-bit mono PCM on stdout
 
         Sends 20ms PCM chunks to Gemini via the audio callback.
         """
-        rtsp_url = self._reolink_rtsp_url
-        _LOGGER.warning(
-            "Audio input: starting RTSP ffmpeg reader from %s",
-            rtsp_url.split("@")[-1] if "@" in rtsp_url else rtsp_url,
-        )
+        # Build list of URLs to try (sub first, then main stream)
+        urls_to_try = [self._reolink_rtsp_url]
+        if self._reolink_host and self._reolink_user and self._reolink_pass:
+            from urllib.parse import quote  # noqa: PLC0415
+            encoded_pass = quote(self._reolink_pass, safe="")
+            port = self._reolink_rtsp_port or 554
+            base = f"rtsp://{self._reolink_user}:{encoded_pass}@{self._reolink_host}:{port}"
+            # Add alternative URL patterns if not already in list
+            alternatives = [
+                f"{base}/h264Preview_01_sub",
+                f"{base}/Preview_01_sub",
+                f"{base}/h264Preview_01_main",
+            ]
+            for alt in alternatives:
+                if alt not in urls_to_try:
+                    urls_to_try.append(alt)
 
         proc: asyncio.subprocess.Process | None = None
-        try:
+        rtsp_url = ""
+
+        for url in urls_to_try:
+            if not self._active or not self._listen_active:
+                return
+            rtsp_url = url
+            _LOGGER.warning(
+                "Audio input: trying RTSP URL %s",
+                url.split("@")[-1] if "@" in url else url,
+            )
+
             proc = await asyncio.create_subprocess_exec(
                 "ffmpeg",
-                "-hide_banner", "-loglevel", "error",
+                "-hide_banner", "-loglevel", "warning",
                 "-rtsp_transport", "tcp",
-                "-i", rtsp_url,
+                "-stimeout", "5000000",  # 5s RTSP socket timeout
+                "-i", url,
                 "-vn",  # No video — audio only
                 "-acodec", "pcm_s16le",
                 "-ar", str(AUDIO_INPUT_SAMPLE_RATE),
@@ -1015,13 +1037,39 @@ class ReolinkAudioHandler:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            _LOGGER.warning("Audio input: ffmpeg RTSP reader started (PID=%d)", proc.pid)
 
-            # Read PCM in 20ms chunks: 16000 Hz * 2 bytes * 0.02s = 640 bytes
-            CHUNK_SIZE = 640
-            chunks_sent = 0
-            first_logged = False
+            # Wait briefly to see if ffmpeg connects or dies immediately
+            await asyncio.sleep(1.5)
+            if proc.returncode is not None:
+                # ffmpeg exited — read error and try next URL
+                stderr_data = b""
+                try:
+                    stderr_data = await asyncio.wait_for(proc.stderr.read(2000), timeout=1.0)
+                except Exception:
+                    pass
+                _LOGGER.warning(
+                    "Audio input: ffmpeg failed for %s (rc=%d): %s",
+                    url.split("@")[-1] if "@" in url else url,
+                    proc.returncode,
+                    stderr_data.decode(errors="replace").strip()[:300] if stderr_data else "no error",
+                )
+                proc = None
+                continue
 
+            # ffmpeg is still running — this URL works
+            _LOGGER.warning("Audio input: ffmpeg RTSP reader connected (PID=%d)", proc.pid)
+            break
+        else:
+            _LOGGER.warning("Audio input: all RTSP URLs failed — mic input disabled")
+            self._listen_active = False
+            return
+
+        # Read PCM in 20ms chunks: 16000 Hz * 2 bytes * 0.02s = 640 bytes
+        CHUNK_SIZE = 640
+        chunks_sent = 0
+        first_logged = False
+
+        try:
             while self._active and self._listen_active and proc.returncode is None:
                 pcm_data = await proc.stdout.read(CHUNK_SIZE)
                 if not pcm_data:
@@ -1046,21 +1094,23 @@ class ReolinkAudioHandler:
         except Exception as exc:
             _LOGGER.warning("RTSP audio input error: %s", exc)
         finally:
-            if proc and proc.returncode is None:
-                proc.terminate()
+            if proc:
+                # Always read stderr for error info
                 try:
                     stderr_data = await asyncio.wait_for(proc.stderr.read(2000), timeout=2.0)
                     if stderr_data:
                         _LOGGER.warning(
                             "ffmpeg RTSP audio stderr: %s",
-                            stderr_data.decode(errors="replace").strip()[:200],
+                            stderr_data.decode(errors="replace").strip()[:500],
                         )
                 except (asyncio.TimeoutError, Exception):
                     pass
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+                if proc.returncode is None:
+                    proc.terminate()
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
             self._listen_active = False
             _LOGGER.warning("Audio input: RTSP reader stopped (sent %d chunks)", chunks_sent)
 
