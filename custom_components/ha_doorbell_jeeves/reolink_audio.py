@@ -270,12 +270,14 @@ class ReolinkTalkMonitor:
         username: str,
         password: str,
         on_human_takeover: Any,  # Callable[[], Awaitable[None]]
+        poll_interval: float = 2.0,
     ) -> None:
         self._hass = hass
         self._host = host
         self._username = username
         self._password = password
         self._on_human_takeover = on_human_takeover
+        self._poll_interval = poll_interval
         self._poll_task: asyncio.Task[None] | None = None
         self._session: aiohttp.ClientSession | None = None
         self._token: str | None = None
@@ -330,7 +332,7 @@ class ReolinkTalkMonitor:
                 break
             except Exception:
                 _LOGGER.debug("Talk state poll error", exc_info=True)
-            await asyncio.sleep(self.POLL_INTERVAL)
+            await asyncio.sleep(self._poll_interval)
 
     async def _login(self) -> bool:
         """Authenticate with the Reolink camera to get a session token."""

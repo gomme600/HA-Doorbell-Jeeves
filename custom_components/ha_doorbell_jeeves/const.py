@@ -53,6 +53,14 @@ CONF_STOP_ENTITIES = "stop_entities"
 CONF_STOP_ENTITY_STATES = "stop_entity_states"
 CONF_STOP_EVENTS = "stop_events"
 
+# Human Takeover Detection
+CONF_TAKEOVER_REOLINK_API = "takeover_reolink_api"
+CONF_TAKEOVER_AUDIO_ENERGY = "takeover_audio_energy"
+CONF_TAKEOVER_ENERGY_THRESHOLD = "takeover_energy_threshold"
+CONF_TAKEOVER_POLL_INTERVAL = "takeover_poll_interval"
+DEFAULT_TAKEOVER_ENERGY_THRESHOLD = 2000
+DEFAULT_TAKEOVER_POLL_INTERVAL = 2.0
+
 # Security
 CONF_DEFAULT_SECURITY_MODE = "default_security_mode"
 CONF_VALIDATOR_MODEL = "validator_model"

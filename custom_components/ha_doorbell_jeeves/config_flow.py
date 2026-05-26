@@ -838,7 +838,7 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
     # ─── Triggers ─────────────────────────────────────────────────────────────
 
     async def async_step_triggers(self, user_input: dict[str, Any] | None = None) -> FlowResult:
-        """Start/stop trigger configuration."""
+        """Start/stop trigger and human takeover configuration."""
         if user_input is not None:
             # Parse start triggers
             start_entities = user_input.get("start_entities", [])
@@ -851,22 +851,79 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
             stop_entities = user_input.get(CONF_STOP_ENTITIES, [])
             self._data[CONF_STOP_ENTITIES] = stop_entities
 
+            # Human takeover detection methods
+            from .const import (  # noqa: PLC0415
+                CONF_TAKEOVER_REOLINK_API,
+                CONF_TAKEOVER_AUDIO_ENERGY,
+                CONF_TAKEOVER_ENERGY_THRESHOLD,
+                CONF_TAKEOVER_POLL_INTERVAL,
+                DEFAULT_TAKEOVER_ENERGY_THRESHOLD,
+                DEFAULT_TAKEOVER_POLL_INTERVAL,
+            )
+            self._data[CONF_TAKEOVER_REOLINK_API] = user_input.get(CONF_TAKEOVER_REOLINK_API, True)
+            self._data[CONF_TAKEOVER_AUDIO_ENERGY] = user_input.get(CONF_TAKEOVER_AUDIO_ENERGY, False)
+            self._data[CONF_TAKEOVER_ENERGY_THRESHOLD] = user_input.get(
+                CONF_TAKEOVER_ENERGY_THRESHOLD, DEFAULT_TAKEOVER_ENERGY_THRESHOLD
+            )
+            self._data[CONF_TAKEOVER_POLL_INTERVAL] = user_input.get(
+                CONF_TAKEOVER_POLL_INTERVAL, DEFAULT_TAKEOVER_POLL_INTERVAL
+            )
+
             return self._save_options()
 
-        # Get current triggers
+        # Get current values
+        from .const import (  # noqa: PLC0415
+            CONF_TAKEOVER_REOLINK_API,
+            CONF_TAKEOVER_AUDIO_ENERGY,
+            CONF_TAKEOVER_ENERGY_THRESHOLD,
+            CONF_TAKEOVER_POLL_INTERVAL,
+            DEFAULT_TAKEOVER_ENERGY_THRESHOLD,
+            DEFAULT_TAKEOVER_POLL_INTERVAL,
+        )
+
         current_start = self._data.get("start_triggers_config", [])
         start_entity_ids = [t["entity_id"] for t in current_start] if current_start else []
+        is_reolink = self._data.get(CONF_AUDIO_MODE) == AUDIO_MODE_REOLINK
+
+        schema_fields: dict[Any, Any] = {
+            vol.Optional("start_entities", default=start_entity_ids): EntitySelector(
+                EntitySelectorConfig(domain=["binary_sensor", "input_boolean"], multiple=True)
+            ),
+            vol.Optional(CONF_STOP_ENTITIES, default=self._data.get(CONF_STOP_ENTITIES, [])): EntitySelector(
+                EntitySelectorConfig(multiple=True)
+            ),
+        }
+
+        # Human takeover detection section
+        if is_reolink:
+            schema_fields[vol.Optional(
+                CONF_TAKEOVER_REOLINK_API,
+                default=self._data.get(CONF_TAKEOVER_REOLINK_API, True),
+            )] = BooleanSelector()
+
+        schema_fields[vol.Optional(
+            CONF_TAKEOVER_AUDIO_ENERGY,
+            default=self._data.get(CONF_TAKEOVER_AUDIO_ENERGY, False),
+        )] = BooleanSelector()
+
+        schema_fields[vol.Optional(
+            CONF_TAKEOVER_ENERGY_THRESHOLD,
+            default=self._data.get(CONF_TAKEOVER_ENERGY_THRESHOLD, DEFAULT_TAKEOVER_ENERGY_THRESHOLD),
+        )] = NumberSelector(
+            NumberSelectorConfig(min=500, max=10000, step=100, mode=NumberSelectorMode.SLIDER)
+        )
+
+        if is_reolink:
+            schema_fields[vol.Optional(
+                CONF_TAKEOVER_POLL_INTERVAL,
+                default=self._data.get(CONF_TAKEOVER_POLL_INTERVAL, DEFAULT_TAKEOVER_POLL_INTERVAL),
+            )] = NumberSelector(
+                NumberSelectorConfig(min=0.5, max=10.0, step=0.5, unit_of_measurement="s", mode=NumberSelectorMode.SLIDER)
+            )
 
         return self.async_show_form(
             step_id="triggers",
-            data_schema=vol.Schema({
-                vol.Optional("start_entities", default=start_entity_ids): EntitySelector(
-                    EntitySelectorConfig(domain=["binary_sensor", "input_boolean"], multiple=True)
-                ),
-                vol.Optional(CONF_STOP_ENTITIES, default=self._data.get(CONF_STOP_ENTITIES, [])): EntitySelector(
-                    EntitySelectorConfig(multiple=True)
-                ),
-            }),
+            data_schema=vol.Schema(schema_fields),
         )
 
     # ─── Identity Management ──────────────────────────────────────────────────

@@ -200,11 +200,15 @@
         }
       },
       "triggers": {
-        "title": "Start & Stop Triggers",
-        "description": "Configure which entities trigger the AI session. **Start triggers** automatically activate Jeeves (e.g., doorbell press). **Stop triggers** end the session (e.g., front door opens).",
+        "title": "Triggers & Human Takeover",
+        "description": "Configure which entities trigger the AI session and how to detect when a human takes over.\n\n**Start triggers** automatically activate Jeeves (e.g., doorbell press).\n**Stop triggers** end the session (e.g., front door opens).\n**Human takeover** stops the AI when you start talking via the Reolink app or another method.",
         "data": {
           "start_entities": "Start Trigger Entities (e.g., doorbell button)",
-          "stop_entities": "Stop Trigger Entities (e.g., front door sensor)"
+          "stop_entities": "Stop Trigger Entities (e.g., front door sensor)",
+          "takeover_reolink_api": "Reolink API Takeover Detection (polls camera talk state)",
+          "takeover_audio_energy": "Audio Energy Takeover Detection (monitors mic loudness)",
+          "takeover_energy_threshold": "Audio Energy Threshold (higher = less sensitive)",
+          "takeover_poll_interval": "Reolink Poll Interval"
         }
       },
       "identities": {

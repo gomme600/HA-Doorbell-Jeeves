@@ -34,6 +34,10 @@ from .const import (
     CONF_STOP_ENTITY_STATES,
     CONF_STOP_EVENTS,
     CONF_SYSTEM_PROMPT,
+    CONF_TAKEOVER_AUDIO_ENERGY,
+    CONF_TAKEOVER_ENERGY_THRESHOLD,
+    CONF_TAKEOVER_POLL_INTERVAL,
+    CONF_TAKEOVER_REOLINK_API,
     CONF_TOOL_API_KEY,
     CONF_TOOL_BASE_URL,
     CONF_TOOL_MODEL,
@@ -90,6 +94,9 @@ class JeevesSessionManager:
 
         # Talk state monitor (detects human taking over via Reolink app)
         self._talk_monitor: Any = None  # ReolinkTalkMonitor or None
+
+        # Audio interrupt detector (energy-based takeover detection)
+        self._interrupt_detector: Any = None  # AudioInterruptDetector or None
 
         # Tool router (dual-model mode)
         self._tool_router: Any = None  # ToolRouter or None
@@ -228,6 +235,10 @@ class JeevesSessionManager:
             await self._talk_monitor.stop()
             self._talk_monitor = None
 
+        # Stop interrupt detector
+        if self._interrupt_detector:
+            self._interrupt_detector = None
+
         # Stop audio handler
         if self._audio_handler:
             await self._audio_handler.stop()
@@ -260,9 +271,14 @@ class JeevesSessionManager:
     async def _start_reolink_audio(self, config: dict) -> None:
         """Start the Reolink 2-way audio handler via go2rtc."""
         from .reolink_audio import (  # noqa: PLC0415
+            AudioInterruptDetector,
             ReolinkAudioHandler,
             ReolinkTalkMonitor,
             get_reolink_config,
+        )
+        from .const import (  # noqa: PLC0415
+            DEFAULT_TAKEOVER_ENERGY_THRESHOLD,
+            DEFAULT_TAKEOVER_POLL_INTERVAL,
         )
 
         stream_name = config.get(CONF_GO2RTC_STREAM_NAME, "")
@@ -270,6 +286,13 @@ class JeevesSessionManager:
             _LOGGER.warning("No go2rtc stream configured — Reolink audio disabled")
             return
 
+        # Shared takeover callback
+        async def _on_human_takeover() -> None:
+            """Human started talking — stop AI session."""
+            _LOGGER.info("Human takeover detected — stopping AI session")
+            await self.async_stop_session()
+
+        # Audio handler (always needed for Reolink mode)
         async def _on_doorbell_audio(audio_bytes: bytes) -> None:
             """Forward audio from doorbell mic to AI client."""
             if self._client and self._active:
@@ -281,24 +304,40 @@ class JeevesSessionManager:
         await self._audio_handler.start()
         _LOGGER.info("Reolink audio handler active (stream=%s)", stream_name)
 
-        # Start talk state monitor (detects when human talks via Reolink app)
-        reolink_entry_id = config.get(CONF_REOLINK_ENTRY_ID, "")
-        if reolink_entry_id:
-            reolink_config = get_reolink_config(self.hass, reolink_entry_id)
-            if reolink_config and reolink_config.get("host"):
-                async def _on_human_takeover() -> None:
-                    """Human started talking via Reolink app — stop AI session."""
-                    _LOGGER.info("Human takeover via Reolink app — stopping AI session")
-                    await self.async_stop_session()
+        # --- Human Takeover Detection (both methods can run simultaneously) ---
 
-                self._talk_monitor = ReolinkTalkMonitor(
-                    hass=self.hass,
-                    host=reolink_config["host"],
-                    username=reolink_config["username"],
-                    password=reolink_config["password"],
-                    on_human_takeover=_on_human_takeover,
-                )
-                await self._talk_monitor.start()
+        # Method 1: Reolink API polling (GetTalkState)
+        use_reolink_api = config.get(CONF_TAKEOVER_REOLINK_API, True)
+        if use_reolink_api:
+            reolink_entry_id = config.get(CONF_REOLINK_ENTRY_ID, "")
+            if reolink_entry_id:
+                reolink_config = get_reolink_config(self.hass, reolink_entry_id)
+                if reolink_config and reolink_config.get("host"):
+                    poll_interval = config.get(
+                        CONF_TAKEOVER_POLL_INTERVAL, DEFAULT_TAKEOVER_POLL_INTERVAL
+                    )
+                    self._talk_monitor = ReolinkTalkMonitor(
+                        hass=self.hass,
+                        host=reolink_config["host"],
+                        username=reolink_config["username"],
+                        password=reolink_config["password"],
+                        on_human_takeover=_on_human_takeover,
+                        poll_interval=poll_interval,
+                    )
+                    await self._talk_monitor.start()
+                    _LOGGER.info("Reolink talk monitor active (poll=%.1fs)", poll_interval)
+
+        # Method 2: Audio energy detection
+        use_audio_energy = config.get(CONF_TAKEOVER_AUDIO_ENERGY, False)
+        if use_audio_energy:
+            threshold = config.get(
+                CONF_TAKEOVER_ENERGY_THRESHOLD, DEFAULT_TAKEOVER_ENERGY_THRESHOLD
+            )
+            self._interrupt_detector = AudioInterruptDetector(
+                on_interrupt=_on_human_takeover,
+                energy_threshold=threshold,
+            )
+            _LOGGER.info("Audio energy interrupt detector active (threshold=%d)", threshold)
 
     # ─── Dual-Model Tool Router Setup ─────────────────────────────────────────
 
