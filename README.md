@@ -139,14 +139,14 @@ get_sensor_state → auto
 
 1. Make sure [HACS](https://hacs.xyz/) is installed.
 2. In HACS, click the 3-dot menu → **Custom repositories**.
-3. Add `https://github.com/slucas/ha-doorbell-jeeves` as type **Integration**.
+3. Add `https://github.com/gomme600/HA-Doorbell-Jeeves` as type **Integration**.
 4. Search for "Doorbell Jeeves" in HACS and click **Install**.
 5. Restart Home Assistant.
 6. Go to **Settings → Devices & Services → Add Integration → Doorbell Jeeves**.
 
 ### Option 2: Manual
 
-1. Download the [latest release](https://github.com/slucas/ha-doorbell-jeeves/releases) or clone this repo.
+1. Download the [latest release](https://github.com/gomme600/HA-Doorbell-Jeeves/releases) or clone this repo.
 2. Copy the `custom_components/ha_doorbell_jeeves/` folder into your Home Assistant `config/custom_components/` directory:
    ```bash
    # From the repo root
