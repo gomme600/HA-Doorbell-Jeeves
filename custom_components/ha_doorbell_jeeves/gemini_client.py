@@ -116,12 +116,8 @@ class GeminiLiveClient(BaseRealtimeClient):
         if not self._session or not self._connected:
             return
         try:
-            await self._session.send(
-                input=types.LiveClientRealtimeInput(
-                    media_chunks=[
-                        types.Blob(data=pcm_bytes, mime_type=f"audio/pcm;rate={AUDIO_SAMPLE_RATE}")
-                    ]
-                )
+            await self._session.send_realtime_input(
+                audio=types.Blob(data=pcm_bytes, mime_type=f"audio/pcm;rate={AUDIO_SAMPLE_RATE}")
             )
         except Exception:
             _LOGGER.exception("Failed to send audio")
@@ -131,10 +127,8 @@ class GeminiLiveClient(BaseRealtimeClient):
             return
         try:
             image_bytes = base64.b64decode(image_base64)
-            await self._session.send(
-                input=types.LiveClientRealtimeInput(
-                    media_chunks=[types.Blob(data=image_bytes, mime_type=mime_type)]
-                )
+            await self._session.send_realtime_input(
+                video=types.Blob(data=image_bytes, mime_type=mime_type)
             )
         except Exception:
             _LOGGER.exception("Failed to send image")

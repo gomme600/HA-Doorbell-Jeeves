@@ -143,8 +143,8 @@ class JeevesSessionManager:
         # Reference images
         reference_images = self._get_reference_images()
 
-        # Build tools
-        gemini_tools = build_gemini_tools(self.store)
+        # Build tools (runs in executor due to google.genai import blocking I/O)
+        gemini_tools = await self.hass.async_add_executor_job(build_gemini_tools, self.store)
         openai_tools = build_openai_tools(self.store)
 
         # ─── Dual-model setup ─────────────────────────────────────────────

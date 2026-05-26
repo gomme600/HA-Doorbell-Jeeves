@@ -88,7 +88,7 @@ CONF_REOLINK_ENTRY_ID = "reolink_entry_id"
 # ─── Defaults ─────────────────────────────────────────────────────────────────
 
 DEFAULT_PROVIDER = PROVIDER_GEMINI
-DEFAULT_MODEL_GEMINI = "gemini-2.5-flash-native-audio-dialog"
+DEFAULT_MODEL_GEMINI = "gemini-2.5-flash-native-audio-latest"
 DEFAULT_MODEL_OPENAI = "gpt-4o-realtime-preview"
 DEFAULT_TOOL_MODEL_GEMINI = "gemini-2.5-flash"
 DEFAULT_TOOL_MODEL_OPENAI = "gpt-4.1"
