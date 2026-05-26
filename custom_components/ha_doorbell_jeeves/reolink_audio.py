@@ -1129,36 +1129,45 @@ class ReolinkAudioHandler:
 
         The camera encrypts binary stream data with AES-CFB-128 (same key as
         Extension XML). We decrypt before parsing BcMedia packets.
+
+        IMPORTANT: Must not raise exceptions — would kill the protocol parser.
         """
-        if cmd_id == 3 and self._listen_active:
-            # Extract body from the full packet (skip Baichuan header)
-            body = data[len_header:] if len(data) > len_header else b""
+        try:
+            if cmd_id == 3 and self._listen_active:
+                # Extract body from the full packet (skip Baichuan header)
+                body = data[len_header:] if len(data) > len_header else b""
 
-            # Check if this message has a payload_offset (first response vs continuation)
-            if len_header == 24 and len(data) >= 24:
-                payload_offset = int.from_bytes(data[20:24], byteorder="little")
-                if payload_offset > 0 and len(body) > payload_offset:
-                    # First response: Extension XML is encrypted (skip it),
-                    # binary payload AFTER it also needs decryption
-                    body = body[payload_offset:]
+                # Check if this message has a payload_offset (first response vs continuation)
+                if len_header == 24 and len(data) >= 24:
+                    payload_offset = int.from_bytes(data[20:24], byteorder="little")
+                    if payload_offset > 0 and len(body) > payload_offset:
+                        # First response: Extension XML is encrypted (skip it),
+                        # binary payload AFTER it also needs decryption
+                        body = body[payload_offset:]
 
-            if body:
-                # Decrypt the binary body (AES-CFB-128)
-                body = self._decrypt_binary_body(body)
+                if body:
+                    # Decrypt the binary body (AES-CFB-128)
+                    body = self._decrypt_binary_body(body)
 
-                if not hasattr(self, "_push_count"):
-                    self._push_count = 0
-                self._push_count += 1
-                if self._push_count <= 5:
-                    _LOGGER.warning(
-                        "Push callback cmd=3 #%d: %d body bytes, first8=%s",
-                        self._push_count, len(body),
-                        body[:8].hex() if len(body) >= 8 else body.hex(),
-                    )
-                self._extract_audio_from_stream(body)
-        elif self._original_push_callback:
-            # Pass non-audio pushes to the original handler
-            self._original_push_callback(cmd_id, data, len_header)
+                    if not hasattr(self, "_push_count"):
+                        self._push_count = 0
+                    self._push_count += 1
+                    if self._push_count <= 5 or self._push_count % 100 == 0:
+                        _LOGGER.warning(
+                            "Push callback cmd=3 #%d: %d body bytes, first8=%s",
+                            self._push_count, len(body),
+                            body[:8].hex() if len(body) >= 8 else body.hex(),
+                        )
+                    self._extract_audio_from_stream(body)
+            elif self._original_push_callback:
+                # Pass non-audio pushes to the original handler
+                self._original_push_callback(cmd_id, data, len_header)
+        except Exception as exc:
+            if not hasattr(self, "_push_error_count"):
+                self._push_error_count = 0
+            self._push_error_count += 1
+            if self._push_error_count <= 3:
+                _LOGGER.warning("Push callback error #%d: %s", self._push_error_count, exc)
 
     def _patch_protocol_for_streaming(self, protocol) -> None:
         """Monkeypatch the TCP protocol's parse_data to handle binary streams.
@@ -1243,18 +1252,17 @@ class ReolinkAudioHandler:
                 return
 
             # Extract binary payload (after the Extension XML)
-            binary_start = len_header + rec_payload_offset
-            binary_data = data_chunk[binary_start:] if binary_start < len(data_chunk) else b""
-
-            # Decrypt binary payload (AES-CFB-128)
-            if binary_data:
-                binary_data = handler._decrypt_binary_body(binary_data)
+            # The ENTIRE body (Extension + binary) is encrypted as one AES-CFB stream
+            # Must decrypt the whole thing, then split
+            full_body = data_chunk[len_header:]
+            full_body_decrypted = handler._decrypt_binary_body(full_body)
+            binary_data = full_body_decrypted[rec_payload_offset:] if rec_payload_offset < len(full_body_decrypted) else b""
 
             # Resolve any waiting receive_future (first response to send())
             receive_future = protocol.receive_futures.get(rec_cmd_id, {}).get(rec_mess_id)
             if receive_future is not None and not receive_future.done():
-                # Return Extension XML part to the caller
-                ext_data = data_chunk[len_header:len_header + rec_payload_offset]
+                # Return Extension XML part to the caller (decrypted)
+                ext_data = full_body_decrypted[:rec_payload_offset]
                 receive_future.set_result((ext_data, len_header))
 
             # Route binary data directly to audio extraction
@@ -1362,9 +1370,21 @@ class ReolinkAudioHandler:
                 total_with_pad = total_data + pad
                 if pos + total_with_pad > len(buf):
                     break
-                # For now log AAC and skip (TODO: could add AAC decode via ffmpeg)
+                # Extract AAC frame data (starts at offset 8, after magic + 2x size)
+                aac_data = bytes(buf[pos + 8:pos + 8 + payload_size])
+                if aac_data and self._audio_input_buffer:
+                    try:
+                        self._audio_input_buffer.put_nowait(aac_data)
+                        audio_found += 1
+                    except asyncio.QueueFull:
+                        pass  # Drop if queue is full
                 if self._stream_extract_count <= 5:
-                    _LOGGER.warning("BcMedia AAC packet: %d bytes", payload_size)
+                    _LOGGER.warning(
+                        "BcMedia AAC packet: %d bytes (first2=%s), queued=%d",
+                        payload_size,
+                        aac_data[:2].hex() if len(aac_data) >= 2 else "?",
+                        audio_found,
+                    )
                 pos += total_with_pad
                 continue
 
@@ -1422,99 +1442,117 @@ class ReolinkAudioHandler:
             )
 
     async def _audio_input_processor(self) -> None:
-        """Process ADPCM audio blocks from the Baichuan stream into PCM for Gemini.
+        """Process AAC audio frames from the Baichuan stream into PCM for Gemini.
 
-        Continuously dequeues ADPCM blocks, decodes them to 16-bit PCM.
-        The camera may send ADPCM at 8000Hz (per neolink) while Gemini expects
-        16kHz PCM. If needed, we use ffmpeg for upsampling.
+        The camera sends AAC audio (ADTS-framed) via the cmd 3 preview stream.
+        We use ffmpeg to decode AAC → 16kHz 16-bit mono PCM for Gemini input.
         """
-        # According to neolink, ADPCM from camera is always 8000Hz
-        # Our TalkAbility says 16000Hz but that's for SENDING to the camera
-        # Gemini expects 16000Hz input — so we may need to upsample
-        CAMERA_MIC_RATE = 8000  # neolink: "Always 8000Hz for ADPCM"
-
         _LOGGER.warning(
-            "Audio input processor started (Baichuan ADPCM %dHz → PCM %dHz for Gemini)",
-            CAMERA_MIC_RATE, AUDIO_INPUT_SAMPLE_RATE,
+            "Audio input processor started (Baichuan AAC → PCM %dHz for Gemini)",
+            AUDIO_INPUT_SAMPLE_RATE,
         )
         blocks_decoded = 0
-
-        # Start ffmpeg upsampler if rates don't match
-        upsample_proc: asyncio.subprocess.Process | None = None
-        if CAMERA_MIC_RATE != AUDIO_INPUT_SAMPLE_RATE:
-            try:
-                upsample_proc = await asyncio.create_subprocess_exec(
-                    "ffmpeg",
-                    "-hide_banner", "-loglevel", "error",
-                    "-f", "s16le", "-ar", str(CAMERA_MIC_RATE), "-ac", "1", "-i", "pipe:0",
-                    "-f", "s16le", "-ar", str(AUDIO_INPUT_SAMPLE_RATE), "-ac", "1", "pipe:1",
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                _LOGGER.warning("Audio input upsampler: %dHz → %dHz", CAMERA_MIC_RATE, AUDIO_INPUT_SAMPLE_RATE)
-            except Exception as exc:
-                _LOGGER.warning("Failed to start input upsampler: %s (sending raw)", exc)
-                upsample_proc = None
+        decoder_proc: asyncio.subprocess.Process | None = None
 
         try:
+            # Start ffmpeg AAC decoder → 16kHz s16le PCM
+            decoder_proc = await asyncio.create_subprocess_exec(
+                "ffmpeg",
+                "-hide_banner", "-loglevel", "error",
+                "-f", "aac", "-i", "pipe:0",
+                "-f", "s16le", "-ar", str(AUDIO_INPUT_SAMPLE_RATE), "-ac", "1", "pipe:1",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _LOGGER.warning("Audio input decoder: AAC → PCM %dHz", AUDIO_INPUT_SAMPLE_RATE)
+
+            # Start background reader for decoded PCM output
+            read_task = asyncio.create_task(
+                self._read_decoded_pcm(decoder_proc.stdout)
+            )
+
             while self._active and self._listen_active:
                 try:
-                    adpcm_block = await asyncio.wait_for(
+                    aac_frame = await asyncio.wait_for(
                         self._audio_input_buffer.get(), timeout=2.0
                     )
                 except asyncio.TimeoutError:
                     continue
 
-                # Decode ADPCM block to 16-bit PCM
-                pcm_data = self._decode_ima_adpcm(adpcm_block)
-                if not pcm_data:
+                if not aac_frame:
                     continue
 
                 blocks_decoded += 1
                 if blocks_decoded == 1:
+                    # Log the first frame for diagnostics
                     _LOGGER.warning(
-                        "✓ First audio block decoded from doorbell mic (%d bytes PCM @ %dHz)",
-                        len(pcm_data), CAMERA_MIC_RATE,
+                        "✓ First AAC frame from doorbell mic (%d bytes, sync=%s)",
+                        len(aac_frame),
+                        "ADTS" if aac_frame[0:1] == b"\xff" else f"0x{aac_frame[0:2].hex()}",
                     )
-                elif blocks_decoded % 100 == 0:
-                    _LOGGER.info("Audio input: %d blocks decoded from doorbell mic", blocks_decoded)
+                elif blocks_decoded % 200 == 0:
+                    _LOGGER.info("Audio input: %d AAC frames decoded", blocks_decoded)
 
-                # Upsample if necessary
-                if upsample_proc and upsample_proc.returncode is None:
+                # Feed AAC frame to ffmpeg decoder
+                if decoder_proc and decoder_proc.returncode is None:
                     try:
-                        upsample_proc.stdin.write(pcm_data)
-                        await upsample_proc.stdin.drain()
-                        # Read upsampled output (ratio * input size)
-                        ratio = AUDIO_INPUT_SAMPLE_RATE / CAMERA_MIC_RATE
-                        expected_size = int(len(pcm_data) * ratio)
-                        upsampled = await asyncio.wait_for(
-                            upsample_proc.stdout.read(expected_size),
-                            timeout=0.1,
-                        )
-                        if upsampled:
-                            pcm_data = upsampled
-                    except asyncio.TimeoutError:
-                        pass  # Use un-upsampled data
-                    except Exception:
-                        pass
+                        decoder_proc.stdin.write(aac_frame)
+                        await decoder_proc.stdin.drain()
+                    except (BrokenPipeError, ConnectionResetError):
+                        _LOGGER.warning("AAC decoder pipe broken after %d frames", blocks_decoded)
+                        break
+                    except Exception as exc:
+                        _LOGGER.warning("AAC decoder write error: %s", exc)
+                        break
 
-                # Send PCM to Gemini via callback
-                await self._on_audio_received(pcm_data)
+            # Cancel the read task
+            read_task.cancel()
+            try:
+                await read_task
+            except asyncio.CancelledError:
+                pass
 
         except asyncio.CancelledError:
             pass
         except Exception:
             _LOGGER.warning("Audio input processor error", exc_info=True)
         finally:
-            # Clean up upsampler
-            if upsample_proc and upsample_proc.returncode is None:
+            if decoder_proc and decoder_proc.returncode is None:
                 try:
-                    upsample_proc.stdin.close()
-                    upsample_proc.terminate()
+                    decoder_proc.stdin.close()
+                    decoder_proc.terminate()
                 except Exception:
                     pass
-            _LOGGER.warning("Audio input processor ended (%d blocks decoded)", blocks_decoded)
+            _LOGGER.warning("Audio input processor ended (%d AAC frames decoded)", blocks_decoded)
+
+    async def _read_decoded_pcm(self, stdout: asyncio.StreamReader) -> None:
+        """Read decoded PCM from ffmpeg stdout and send to Gemini.
+
+        Reads in chunks matching ~20ms at 16kHz (640 bytes = 320 samples * 2 bytes).
+        """
+        CHUNK_SIZE = 640  # 20ms at 16kHz mono s16le
+        first_sent = False
+
+        try:
+            while True:
+                pcm_data = await stdout.read(CHUNK_SIZE)
+                if not pcm_data:
+                    break  # EOF — decoder closed
+
+                if not first_sent:
+                    first_sent = True
+                    _LOGGER.warning(
+                        "✓ First decoded PCM from doorbell mic (%d bytes @ %dHz) → Gemini",
+                        len(pcm_data), AUDIO_INPUT_SAMPLE_RATE,
+                    )
+
+                # Send to Gemini
+                await self._on_audio_received(pcm_data)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            _LOGGER.warning("PCM reader error: %s", exc)
 
     def _decode_ima_adpcm(self, adpcm_block: bytes) -> bytes:
         """Decode a single IMA/DVI-4 ADPCM block to 16-bit PCM (little-endian).
