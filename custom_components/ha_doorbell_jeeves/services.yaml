@@ -1,0 +1,44 @@
+start_session:
+  name: Start Jeeves Session
+  description: >-
+    Start the AI concierge session. Connects to the configured provider
+    (Gemini or OpenAI), begins the vision loop, and registers auto-stop triggers.
+  fields:
+    entry_id:
+      name: Config Entry ID
+      description: The config entry ID of the Doorbell Jeeves instance.
+      required: true
+      selector:
+        text:
+
+stop_session:
+  name: Stop Jeeves Session
+  description: >-
+    Stop the active session. Use from automations for human takeover
+    or programmatic interruption.
+  fields:
+    entry_id:
+      name: Config Entry ID
+      description: The config entry ID to stop.
+      required: true
+      selector:
+        text:
+
+send_audio:
+  name: Send Audio Chunk
+  description: >-
+    Send raw PCM audio (base64-encoded) into the active session.
+    Format: 24000 Hz, mono, 16-bit little-endian PCM.
+  fields:
+    entry_id:
+      name: Config Entry ID
+      description: The active instance entry ID.
+      required: true
+      selector:
+        text:
+    audio_base64:
+      name: Audio Data (Base64)
+      description: Base64-encoded PCM audio (24kHz, mono, 16-bit LE).
+      required: true
+      selector:
+        text:

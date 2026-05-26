@@ -1,0 +1,151 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Provider & Credentials",
+        "description": "Choose your AI provider and enter credentials. For local models, select OpenAI and set the base URL to your server (e.g., http://localhost:8080/v1).",
+        "data": {
+          "provider": "Provider",
+          "api_key": "API Key",
+          "api_base_url": "Custom API Base URL (for local/self-hosted models)",
+          "model": "Model name (e.g., gemini-2.5-flash-native-audio-dialog or gpt-4o-realtime-preview)",
+          "voice": "Voice name"
+        }
+      },
+      "devices": {
+        "title": "Camera & Audio",
+        "description": "Configure the doorbell camera and audio output. Higher FPS gives the AI better temporal awareness but uses more bandwidth. Frame downscaling reduces latency.",
+        "data": {
+          "camera_entity": "Camera Entity",
+          "media_player_entity": "Media Player (Speaker)",
+          "vision_fps": "Vision FPS (0.1 = one frame every 10s, 60 = real-time video)",
+          "frame_max_width": "Max Frame Width (px)",
+          "frame_max_height": "Max Frame Height (px)",
+          "frame_quality": "JPEG Quality (lower = faster, smaller)",
+          "session_timeout": "Session Timeout (0 = no limit)"
+        }
+      },
+      "entities": {
+        "title": "Allowed Entities",
+        "description": "The AI can ONLY interact with entities listed here. Leave a category empty to disable those tools entirely.",
+        "data": {
+          "allowed_lights": "Lights",
+          "allowed_locks": "Locks / Gates",
+          "allowed_switches": "Switches",
+          "allowed_covers": "Covers (garage, gates)",
+          "allowed_sensors": "Sensors (read-only)",
+          "notify_service": "Notification service (e.g., notify.mobile_app_phone)"
+        }
+      },
+      "security": {
+        "title": "Security Policies",
+        "description": "Configure per-action security. 'Validated' actions are independently verified by a second AI agent before execution. 'PIN' actions require the visitor to speak a code.",
+        "data": {
+          "default_security_mode": "Default mode for unlisted actions",
+          "validated_actions": "Actions requiring validator approval",
+          "pin_actions": "Actions requiring PIN",
+          "validator_uses_camera": "Validator receives camera frame",
+          "validator_requires_visual": "Validator must confirm visual identity match",
+          "max_per_session": "Max executions per session (0 = unlimited)",
+          "cooldown_seconds": "Cooldown between same action (seconds)",
+          "validator_model": "Validator model (any Gemini/OpenAI model)",
+          "pin_code": "PIN Code"
+        }
+      },
+      "stop_triggers": {
+        "title": "Auto-Stop Triggers",
+        "description": "Configure what automatically stops the AI session. Use this for human takeover (e.g., Reolink app becomes active) or physical events (e.g., front door opens).",
+        "data": {
+          "stop_entities": "Stop when these entities change state",
+          "stop_entity_state_map": "State conditions (one per line: entity_id: state)",
+          "stop_events": "Stop on these HA events (comma-separated)"
+        }
+      },
+      "identity": {
+        "title": "Identity & Prompt",
+        "description": "Configure face recognition and the AI's personality/rules.",
+        "data": {
+          "identity_mode": "Identity Mode",
+          "face_sensor_entity": "Face Sensor Entity",
+          "system_prompt": "System Prompt"
+        }
+      }
+    },
+    "error": {
+      "invalid_credentials": "Could not validate credentials. Check your API key, model, and base URL."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Configure Doorbell Jeeves",
+        "description": "Select which settings to modify.",
+        "data": { "section": "Section" }
+      },
+      "general": {
+        "title": "General Settings",
+        "data": {
+          "provider": "Provider",
+          "api_key": "API Key",
+          "api_base_url": "Custom Base URL",
+          "model": "Model",
+          "voice": "Voice",
+          "session_timeout": "Timeout (s)"
+        }
+      },
+      "vision": {
+        "title": "Vision & Camera",
+        "data": {
+          "camera_entity": "Camera",
+          "media_player_entity": "Speaker",
+          "vision_fps": "FPS",
+          "frame_max_width": "Max Width",
+          "frame_max_height": "Max Height",
+          "frame_quality": "JPEG Quality"
+        }
+      },
+      "entities": {
+        "title": "Allowed Entities",
+        "data": {
+          "allowed_lights": "Lights",
+          "allowed_locks": "Locks",
+          "allowed_switches": "Switches",
+          "allowed_covers": "Covers",
+          "allowed_sensors": "Sensors",
+          "notify_service": "Notify Service"
+        }
+      },
+      "security": {
+        "title": "Security Policies",
+        "data": {
+          "default_security_mode": "Default Mode",
+          "validated_actions": "Validated Actions",
+          "pin_actions": "PIN Actions",
+          "validator_uses_camera": "Camera to validator",
+          "validator_requires_visual": "Visual match required",
+          "max_per_session": "Max/session",
+          "cooldown_seconds": "Cooldown (s)",
+          "custom_validator_prompt": "Custom validator instructions",
+          "validator_model": "Validator Model",
+          "pin_code": "PIN"
+        }
+      },
+      "stop_triggers": {
+        "title": "Auto-Stop Triggers",
+        "data": {
+          "stop_entities": "Stop entities",
+          "stop_entity_state_map": "State map (entity: state)",
+          "stop_events": "Stop events"
+        }
+      },
+      "prompt": {
+        "title": "Identity & Prompt",
+        "data": {
+          "identity_mode": "Identity Mode",
+          "face_sensor_entity": "Face Sensor",
+          "system_prompt": "System Prompt"
+        }
+      }
+    }
+  }
+}

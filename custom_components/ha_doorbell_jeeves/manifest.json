@@ -1,0 +1,12 @@
+{
+  "domain": "ha_doorbell_jeeves",
+  "name": "Doorbell Jeeves",
+  "codeowners": ["@slucas"],
+  "config_flow": true,
+  "dependencies": ["camera", "media_player", "persistent_notification"],
+  "documentation": "https://github.com/slucas/ha-doorbell-jeeves",
+  "iot_class": "cloud_push",
+  "issue_tracker": "https://github.com/slucas/ha-doorbell-jeeves/issues",
+  "requirements": ["google-genai>=1.14.0", "openai>=1.40.0", "Pillow>=10.0.0"],
+  "version": "1.0.0"
+}
