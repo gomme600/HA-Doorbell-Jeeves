@@ -1,16 +1,15 @@
-"""Reolink audio handler – Baichuan protocol 2-way audio with Reolink doorbells.
+"""Reolink audio handler – 2-way audio with Reolink doorbells.
 
 This module handles:
-  - Audio input: receives ADPCM from doorbell mic via Baichuan cmd 3 (preview stream)
+  - Audio input: receives audio from doorbell mic via RTSP + ffmpeg (reliable)
   - Audio output: sends ADPCM to doorbell speaker via Baichuan cmd 202 (talk)
-  - Both directions use the native Baichuan protocol (port 9000), bypassing RTSP entirely
+  - Output uses the native Baichuan protocol (port 9000), input uses RTSP
   - go2rtc utilities are retained for non-Reolink device fallback
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
 import logging
 from typing import Any
 
@@ -218,6 +217,7 @@ class ReolinkAudioHandler:
         self._reolink_user: str | None = None
         self._reolink_pass: str | None = None
         self._reolink_rtsp_port: int = 554
+        self._reolink_rtsp_url: str = ""
         self._camera_entity_id: str | None = None
         # Baichuan talk state (output — speaker)
         self._baichuan: Any = None
@@ -227,12 +227,8 @@ class ReolinkAudioHandler:
         self._pcm_buffer: bytearray = bytearray()
         self._ffmpeg_proc: asyncio.subprocess.Process | None = None
         self._chime_delay: float = DEFAULT_CHIME_DELAY
-        # Baichuan audio input state (mic receive via cmd 3 stream)
-        self._listen_host: Any = None  # Separate Host for preview/listen stream
-        self._listen_bc: Any = None
+        # Audio input state (RTSP mic via ffmpeg)
         self._listen_active = False
-        self._original_push_callback: Any = None
-        self._audio_input_buffer: asyncio.Queue[bytes] = asyncio.Queue(maxsize=200)
         self._input_processor_task: asyncio.Task[None] | None = None
 
     @property
@@ -293,10 +289,26 @@ class ReolinkAudioHandler:
                     # Try to get verified RTSP URL
                     rtsp_url = await api.get_rtsp_stream_source(0, "sub", check=False)
                     if rtsp_url:
+                        self._reolink_rtsp_url = rtsp_url
                         _LOGGER.warning("Reolink RTSP URL: %s",
                                        rtsp_url.replace(self._reolink_pass or "", "***"))
                 except Exception as exc:
                     _LOGGER.warning("Could not get RTSP details from Reolink Host: %s", exc)
+
+        # Build RTSP URL from credentials if not discovered from API
+        if not hasattr(self, "_reolink_rtsp_url") or not self._reolink_rtsp_url:
+            if self._reolink_host and self._reolink_user and self._reolink_pass:
+                from urllib.parse import quote  # noqa: PLC0415
+                encoded_pass = quote(self._reolink_pass, safe="")
+                port = self._reolink_rtsp_port or 554
+                self._reolink_rtsp_url = (
+                    f"rtsp://{self._reolink_user}:{encoded_pass}"
+                    f"@{self._reolink_host}:{port}/h264Preview_01_sub"
+                )
+                _LOGGER.warning("Built RTSP URL from credentials: rtsp://%s:***@%s:%d/...",
+                               self._reolink_user, self._reolink_host, port)
+            else:
+                self._reolink_rtsp_url = ""
 
         if not self._reolink_host:
             _LOGGER.warning("Could not discover Reolink host — audio output may not work")
@@ -323,8 +335,14 @@ class ReolinkAudioHandler:
         # Stop Baichuan talk session
         await self._stop_baichuan_talk(0)
 
-        # Stop Baichuan listen stream (cmd 4 = stop preview)
-        await self._stop_baichuan_listen()
+        # Cancel RTSP audio input task
+        if self._input_processor_task and not self._input_processor_task.done():
+            self._input_processor_task.cancel()
+            try:
+                await self._input_processor_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._input_processor_task = None
 
         # Logout dedicated talk connection
         if hasattr(self, "_talk_host") and self._talk_host:
@@ -334,28 +352,16 @@ class ReolinkAudioHandler:
                 pass
             self._talk_host = None
 
-        # Logout dedicated listen connection
-        if hasattr(self, "_listen_host") and self._listen_host:
+        # Cancel output reader task
+        if self._output_reader_task and not self._output_reader_task.done():
+            self._output_reader_task.cancel()
             try:
-                await self._listen_host.logout()
-            except Exception:
+                await self._output_reader_task
+            except asyncio.CancelledError:
                 pass
-            self._listen_host = None
-
-        # Cancel tasks
-        for task in (self._output_reader_task, self._input_processor_task):
-            if task and not task.done():
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
         self._output_reader_task = None
-        self._input_processor_task = None
 
         self._baichuan = None
-        self._listen_bc = None
-        self._talk_ability = None
         self._talk_ability = None
         _LOGGER.warning("Reolink audio handler stopped (sent %d audio chunks)", self._send_count)
 
@@ -586,8 +592,8 @@ class ReolinkAudioHandler:
         import time as time_mod  # noqa: PLC0415
         expected_stream_end = time_mod.monotonic()
 
-        # Use 1 block per payload for lower latency (neolink streaming mode)
-        BLOCKS_PER_PAYLOAD = 1
+        # Use 2 blocks per payload for smoother playback with less timing sensitivity
+        BLOCKS_PER_PAYLOAD = 2
 
         try:
             while self._active:
@@ -957,784 +963,106 @@ class ReolinkAudioHandler:
             else:
                 raise RuntimeError("Cannot find Baichuan transport to write talk data")
 
-    # ─── Baichuan Audio Input (Mic Receive via cmd 3 Stream) ──────────────────
+    # ─── Audio Input (Mic Receive via RTSP/ffmpeg) ──────────────────────────────
 
     async def _start_baichuan_audio_input(self) -> None:
-        """Start receiving audio from the doorbell mic via Baichuan preview stream.
+        """Start receiving audio from the doorbell mic via RTSP + ffmpeg.
 
-        Creates a SEPARATE Baichuan connection dedicated to receiving the
-        video/audio stream (cmd 3). We intercept the TCP protocol's push
-        callback to capture BcMedia ADPCM audio packets from the camera's mic.
+        Uses ffmpeg to connect to the camera's RTSP stream and extract ONLY
+        the audio track, decoding it to 16kHz 16-bit PCM for Gemini input.
 
-        This replaces go2rtc-based audio input — works even when RTSP is broken.
+        This is far more reliable than the Baichuan binary stream approach
+        because ffmpeg handles all protocol details (RTSP setup, RTP, codec
+        detection, buffering, reconnection) natively.
         """
-        camera_entity = self._camera_entity_id or ""
-        reolink_entry_id = find_reolink_entry_for_camera(self._hass, camera_entity)
-        if not reolink_entry_id:
-            _LOGGER.warning("No Reolink entry found — Baichuan audio input disabled")
+        if not self._reolink_rtsp_url:
+            _LOGGER.warning("No RTSP URL available — audio input disabled")
             return
 
-        entry = self._hass.config_entries.async_get_entry(reolink_entry_id)
-        if not entry:
-            return
+        self._listen_active = True
+        self._input_processor_task = asyncio.create_task(self._rtsp_audio_input_loop())
 
-        data = entry.data
-        host = data.get("host", "")
-        username = data.get("username", "admin")
-        password = data.get("password", "")
-        http_port = data.get("port")
-        use_https = data.get("use_https")
-        bc_port = data.get("baichuan_port", 9000)
+    async def _rtsp_audio_input_loop(self) -> None:
+        """Read audio from RTSP stream via ffmpeg and send PCM to Gemini.
 
-        if not host:
-            _LOGGER.warning("Reolink entry has no host — audio input disabled")
-            return
+        Runs ffmpeg with:
+          - Input: RTSP URL (sub-stream for lower bandwidth)
+          - Only audio track (-vn: no video)
+          - Output: raw 16kHz 16-bit mono PCM on stdout
 
-        try:
-            from homeassistant.helpers.aiohttp_client import async_get_clientsession  # noqa: PLC0415
-            from reolink_aio.api import Host  # noqa: PLC0415
-
-            listen_host = Host(
-                host=host,
-                username=username,
-                password=password,
-                port=http_port,
-                use_https=use_https,
-                bc_port=bc_port,
-                aiohttp_get_session_callback=lambda: async_get_clientsession(self._hass),
-            )
-            listen_bc = listen_host.baichuan
-            await listen_bc.login()
-            self._listen_host = listen_host
-            self._listen_bc = listen_bc
-            _LOGGER.warning("Created dedicated Baichuan listen connection to %s:%d", host, bc_port)
-        except Exception as exc:
-            _LOGGER.warning("Failed to create Baichuan listen connection: %s", exc)
-            return
-
-        # Patch the TCP protocol to handle binary stream responses (payload_offset != 0)
-        # The standard reolink_aio library rejects these, but cmd 3 stream requires it
-        try:
-            protocol = listen_bc._protocol
-            if protocol:
-                self._original_push_callback = protocol._push_callback
-                protocol._push_callback = self._stream_push_callback
-                self._patch_protocol_for_streaming(protocol)
-                _LOGGER.info("Patched Baichuan protocol for binary stream reception")
-        except Exception as exc:
-            _LOGGER.warning("Failed to patch protocol: %s", exc)
-            return
-
-        # Request the sub-stream (cmd 3) — camera sends multiplexed video+audio
-        # IMPORTANT: We write the request directly to the transport instead of using
-        # send(), because send() waits for a response and tries to decrypt it as XML.
-        # The stream response contains binary BcMedia data (payload_offset != 0),
-        # which our patched parse_data handles and routes to audio extraction.
-        self._listen_active = True  # Enable before writing so push callback processes data
-        self._stream_buffer = bytearray()  # Buffer for accumulating partial BcMedia data
-        try:
-            from reolink_aio.baichuan import util as bc_util  # noqa: PLC0415
-
-            # Build the Preview XML request body
-            # NOTE: handle=256 for subStream (per neolink's protocol analysis)
-            preview_body = (
-                '<?xml version="1.0" encoding="UTF-8" ?>\n'
-                "<body>\n"
-                '<Preview version="1.1">\n'
-                "<channelId>0</channelId>\n"
-                "<handle>256</handle>\n"
-                "<streamType>subStream</streamType>\n"
-                "</Preview>\n"
-                "</body>\n"
-            )
-
-            # Encrypt the body
-            enc_type = bc_util.EncType.AES
-            ch_id = 1  # channel 0 + 1
-            enc_body = listen_bc._aes_encrypt(preview_body)
-
-            # Increment message ID
-            if not hasattr(listen_bc, "_mess_id"):
-                listen_bc._mess_id = 0
-            listen_bc._mess_id = (listen_bc._mess_id + 1) % 16777216
-            mess_id = listen_bc._mess_id
-
-            # Build 24-byte Baichuan header for cmd 3
-            cmd_id = 3
-            mess_len = len(enc_body)
-            header = (
-                bytes.fromhex(bc_util.HEADER_MAGIC)
-                + int(cmd_id).to_bytes(4, "little")
-                + int(mess_len).to_bytes(4, "little")
-                + int(ch_id).to_bytes(1, "little")
-                + int(mess_id).to_bytes(3, "little")
-                + bytes.fromhex("00001464")  # status=0, class=0x6414
-                + int(0).to_bytes(4, "little")  # payload_offset=0 (request has no binary)
-            )
-
-            packet = header + enc_body
-
-            # Write directly to transport
-            if hasattr(listen_bc, "_mutex") and hasattr(listen_bc, "_transport"):
-                async with listen_bc._mutex:
-                    listen_bc._transport.write(packet)
-            elif hasattr(listen_bc, "_protocol") and hasattr(listen_bc._protocol, "transport"):
-                listen_bc._protocol.transport.write(packet)
-            else:
-                raise RuntimeError("Cannot find Baichuan transport for listen connection")
-
-            _LOGGER.warning(
-                "Sent preview stream request directly to transport (handle=256, subStream)"
-            )
-        except Exception as exc:
-            _LOGGER.warning("Failed to send preview stream request: %s", exc)
-            self._listen_active = False
-            return
-
-        # Start the input processor task (decodes ADPCM → PCM and sends to Gemini)
-        self._input_processor_task = asyncio.create_task(self._audio_input_processor())
-
-    def _decrypt_binary_body(self, body: bytes) -> bytes:
-        """Decrypt AES-CFB-128 encrypted binary stream body.
-
-        Reolink cameras encrypt ALL body data (including binary stream payloads)
-        with AES-CFB when in AES mode. Unlike neolink's assumption, Reolink's
-        implementation DOES encrypt the binary stream.
-
-        Uses the same key/IV as the Extension XML decryption.
+        Sends 20ms PCM chunks to Gemini via the audio callback.
         """
-        if not self._listen_bc or not hasattr(self._listen_bc, "_aes_key"):
-            return body
-        aes_key = self._listen_bc._aes_key
-        if aes_key is None:
-            return body
-
-        try:
-            from Cryptodome.Cipher import AES as AES_Cipher  # noqa: PLC0415
-
-            AES_IV = b"0123456789abcdef"
-            cipher = AES_Cipher.new(key=aes_key, mode=AES_Cipher.MODE_CFB, iv=AES_IV, segment_size=128)
-            return cipher.decrypt(body)
-        except Exception as exc:
-            if not hasattr(self, "_decrypt_err_logged"):
-                self._decrypt_err_logged = True
-                _LOGGER.warning("Binary stream decrypt failed: %s", exc)
-            return body
-
-    def _stream_push_callback(self, cmd_id: int, data: bytes, len_header: int) -> None:
-        """Intercept Baichuan push messages to extract audio from cmd 3 stream.
-
-        Called by the TCP protocol whenever an unsolicited message arrives.
-        For cmd 3 (preview stream), we parse BcMedia packets and queue audio.
-
-        The camera encrypts binary stream data with AES-CFB-128 (same key as
-        Extension XML). We decrypt before parsing BcMedia packets.
-
-        IMPORTANT: Must not raise exceptions — would kill the protocol parser.
-        """
-        try:
-            if cmd_id == 3 and self._listen_active:
-                # Extract body from the full packet (skip Baichuan header)
-                body = data[len_header:] if len(data) > len_header else b""
-
-                if body:
-                    # Check if body is valid BcMedia (unencrypted) or needs decryption
-                    KNOWN_MAGICS = (
-                        b"\x31\x30\x30\x32", b"\x31\x30\x30\x31",
-                        b"\x30\x31\x77\x62", b"\x30\x35\x77\x62",
-                    )
-                    if len(body) >= 4:
-                        first4 = body[:4]
-                        is_plaintext = (
-                            first4 in KNOWN_MAGICS
-                            or (len(body) > 3 and body[2:4] == b"\x64\x63")
-                        )
-                        if not is_plaintext:
-                            body = self._decrypt_binary_body(body)
-
-                    if not hasattr(self, "_push_count"):
-                        self._push_count = 0
-                    self._push_count += 1
-                    if self._push_count <= 5 or self._push_count % 100 == 0:
-                        _LOGGER.warning(
-                            "Push callback cmd=3 #%d: %d body bytes, first8=%s",
-                            self._push_count, len(body),
-                            body[:8].hex() if len(body) >= 8 else body.hex(),
-                        )
-                    self._extract_audio_from_stream(body)
-            elif self._original_push_callback:
-                # Pass non-audio pushes to the original handler
-                self._original_push_callback(cmd_id, data, len_header)
-        except Exception as exc:
-            if not hasattr(self, "_push_error_count"):
-                self._push_error_count = 0
-            self._push_error_count += 1
-            if self._push_error_count <= 3:
-                _LOGGER.warning("Push callback error #%d: %s", self._push_error_count, exc)
-
-    def _patch_protocol_for_streaming(self, protocol) -> None:
-        """Monkeypatch the TCP protocol's parse_data to handle binary streams.
-
-        The standard reolink_aio library rejects messages with payload_offset != 0.
-        For cmd 3 (preview/audio stream), the response contains:
-          - 24-byte Baichuan header (includes payload_offset field)
-          - payload_offset bytes: encrypted Extension XML
-          - remaining bytes: raw BcMedia binary data
-
-        We patch parse_data to accept these and route the binary data to our
-        audio extraction method directly.
-        """
-        from reolink_aio.baichuan.util import HEADER_MAGIC  # noqa: PLC0415
-
-        original_parse_data = protocol.parse_data
-        handler = self  # Capture reference for closure
-
-        def patched_parse_data():
-            """Enhanced parse_data that handles payload_offset for binary streams."""
-            # Track entry count for diagnostics
-            if not hasattr(handler, "_patch_entry"):
-                handler._patch_entry = 0
-            handler._patch_entry += 1
-            if handler._patch_entry <= 10:
-                data_len = len(protocol._data) if protocol._data else 0
-                first8 = protocol._data[:8].hex() if data_len >= 8 else (protocol._data.hex() if protocol._data else "empty")
-                _LOGGER.warning(
-                    "patched_parse_data entry #%d: data_len=%d, first8=%s",
-                    handler._patch_entry, data_len, first8,
-                )
-
-            if len(protocol._data) < 24:
-                if len(protocol._data) >= 20:
-                    # Check if this is a standard 20-byte header message
-                    mess_class = protocol._data[18:20].hex()
-                    if mess_class == "1466":
-                        original_parse_data()
-                        return
-                # Wait for more data
-                return
-
-            # Read the header fields
-            magic = protocol._data[0:4].hex()
-            if magic != HEADER_MAGIC:
-                original_parse_data()
-                return
-
-            mess_class = protocol._data[18:20].hex()
-
-            # Only intercept 24-byte header messages that have payload_offset
-            if mess_class not in ("1464", "0000"):
-                original_parse_data()
-                return
-
-            rec_payload_offset = int.from_bytes(protocol._data[20:24], byteorder="little")
-
-            # Diagnostic: log the first 10 messages' routing
-            if not hasattr(handler, "_route_count"):
-                handler._route_count = 0
-            handler._route_count += 1
-            if handler._route_count <= 10:
-                rec_cmd_id_peek = int.from_bytes(protocol._data[4:8], byteorder="little")
-                rec_len_body_peek = int.from_bytes(protocol._data[8:12], byteorder="little")
-                _LOGGER.warning(
-                    "Patched parse route #%d: cmd=%d, payload_offset=%d, body_len=%d, class=%s",
-                    handler._route_count, rec_cmd_id_peek, rec_payload_offset,
-                    rec_len_body_peek, mess_class,
-                )
-
-            if rec_payload_offset == 0:
-                # Standard message — use original parser
-                original_parse_data()
-                return
-
-            # --- Binary stream message (payload_offset != 0) ---
-            rec_cmd_id = int.from_bytes(protocol._data[4:8], byteorder="little")
-            rec_len_body = int.from_bytes(protocol._data[8:12], byteorder="little")
-            rec_mess_id = int.from_bytes(protocol._data[12:16], byteorder="little")
-            len_header = 24
-
-            # Track how many messages we process
-            if not hasattr(handler, "_parse_count"):
-                handler._parse_count = 0
-            handler._parse_count += 1
-
-            len_body = len(protocol._data) - len_header
-            if len_body < rec_len_body:
-                # Wait for the rest of the body
-                if handler._parse_count <= 10:
-                    _LOGGER.warning(
-                        "Patched parse: msg#%d cmd=%d waiting for body (%d/%d bytes)",
-                        handler._parse_count, rec_cmd_id, len_body, rec_len_body,
-                    )
-                return
-
-            # Extract the full chunk
-            len_chunk = rec_len_body + len_header
-            data_chunk = protocol._data[0:len_chunk]
-
-            # Move past this message
-            if len_body > rec_len_body:
-                protocol._data = protocol._data[len_chunk:]
-            else:
-                protocol._data = b""
-
-            # Check status code
-            rec_status_code = int.from_bytes(data_chunk[16:18], byteorder="little")
-            if rec_status_code != 200:
-                # Error response — resolve any waiting future
-                receive_future = protocol.receive_futures.get(rec_cmd_id, {}).get(rec_mess_id)
-                if receive_future is not None and not receive_future.done():
-                    from reolink_aio.exceptions import ApiError  # noqa: PLC0415
-                    receive_future.set_exception(
-                        ApiError(f"cmd {rec_cmd_id} status {rec_status_code}",
-                                 rspCode=rec_status_code)
-                    )
-                return
-
-            # Extract binary payload (after the Extension XML)
-            # The first response's binary is NOT encrypted; continuation messages ARE.
-            # Strategy: try raw first, if first 4 bytes match a known BcMedia magic use it.
-            # Otherwise, decrypt and use the decrypted version.
-            full_body = data_chunk[len_header:]
-            binary_data = full_body[rec_payload_offset:] if rec_payload_offset < len(full_body) else b""
-
-            # Check if binary_data is already valid BcMedia (unencrypted)
-            KNOWN_MAGICS = (
-                b"\x31\x30\x30\x32", b"\x31\x30\x30\x31",  # InfoV2, InfoV1
-                b"\x30\x31\x77\x62", b"\x30\x35\x77\x62",  # ADPCM, AAC
-            )
-            if binary_data and len(binary_data) >= 4:
-                first4 = binary_data[:4]
-                is_plaintext = (
-                    first4 in KNOWN_MAGICS
-                    or (len(binary_data) > 3 and binary_data[2:4] == b"\x64\x63")  # IFrame/PFrame
-                )
-                if not is_plaintext:
-                    # Try decryption
-                    binary_data = handler._decrypt_binary_body(binary_data)
-
-            # Resolve any waiting receive_future (first response to send())
-            receive_future = protocol.receive_futures.get(rec_cmd_id, {}).get(rec_mess_id)
-            if receive_future is not None and not receive_future.done():
-                # Return Extension XML part to the caller (decrypt it)
-                ext_encrypted = full_body[:rec_payload_offset]
-                ext_data = handler._decrypt_binary_body(ext_encrypted)
-                receive_future.set_result((ext_data, len_header))
-
-            # Route binary data directly to audio extraction
-            if binary_data and handler._listen_active:
-                handler._extract_audio_from_stream(binary_data)
-            elif not binary_data and handler._listen_active:
-                _LOGGER.warning("Patched parse_data: binary_data empty (offset=%d, chunk_len=%d)", rec_payload_offset, len(data_chunk))
-
-            # Continue parsing if there's more data in the buffer
-            if protocol._data and len(protocol._data) >= 4:
-                if protocol._data[0:4].hex() == HEADER_MAGIC:
-                    patched_parse_data()
-
-        protocol.parse_data = patched_parse_data
-
-    def _extract_audio_from_stream(self, body: bytes) -> None:
-        """Parse BcMedia packets from a cmd 3 stream chunk and extract audio.
-
-        BcMedia multiplexes video and audio in a binary stream.
-        Audio can be ADPCM (magic 0x62773130) or AAC (magic 0x62773530).
-        Video frames use magics like 0x63643030 (IFrame) and 0x63643130 (PFrame).
-
-        The stream arrives in chunks that may not align to BcMedia packet boundaries,
-        so we accumulate data in self._stream_buffer and parse complete packets.
-
-        This runs in the protocol callback (event loop) so must be FAST.
-        """
-        import struct as struct_mod  # noqa: PLC0415
-
-        # BcMedia magic values (as u32 little-endian, stored as 4-byte sequences)
-        MAGIC_ADPCM = b"\x30\x31\x77\x62"   # 0x62773130
-        MAGIC_AAC = b"\x30\x35\x77\x62"     # 0x62773530
-        MAGIC_INFO_V1 = b"\x31\x30\x30\x31"  # 0x31303031
-        MAGIC_INFO_V2 = b"\x31\x30\x30\x32"  # 0x32303031 - what we actually received!
-        # IFrame: 0x63643030-0x63643039, PFrame: 0x63643130-0x63643139
-        MAGIC_IFRAME_BASE = b"\x30\x30\x64\x63"  # 0x63643030
-        MAGIC_PFRAME_BASE = b"\x30\x31\x64\x63"  # 0x63643130
-
-        # Diagnostic logging (first few calls only)
-        if not hasattr(self, "_stream_extract_count"):
-            self._stream_extract_count = 0
-        self._stream_extract_count += 1
-        if self._stream_extract_count <= 5:
-            _LOGGER.warning(
-                "Stream data #%d: %d bytes, first16hex=%s",
-                self._stream_extract_count, len(body),
-                body[:16].hex() if len(body) >= 16 else body.hex(),
-            )
-
-        # Accumulate into buffer for cross-chunk packet parsing
-        self._stream_buffer.extend(body)
-        buf = self._stream_buffer
-        audio_found = 0
-        pos = 0
-
-        while pos + 8 <= len(buf):
-            magic = bytes(buf[pos:pos + 4])
-
-            # --- INFO V2 header (32 bytes total: 4 magic + 28 payload) ---
-            if magic == MAGIC_INFO_V2 or magic == MAGIC_INFO_V1:
-                if pos + 32 > len(buf):
-                    break  # Need more data
-                # Parse video dimensions for logging
-                if self._stream_extract_count <= 3:
-                    header_size = struct_mod.unpack_from("<I", buf, pos + 4)[0]
-                    width = struct_mod.unpack_from("<I", buf, pos + 8)[0]
-                    height = struct_mod.unpack_from("<I", buf, pos + 12)[0]
-                    _LOGGER.warning(
-                        "BcMedia InfoV2: %dx%d (header_size=%d)", width, height, header_size
-                    )
-                pos += 32  # Fixed size
-                continue
-
-            # --- ADPCM audio packet ---
-            if magic == MAGIC_ADPCM:
-                if pos + 12 > len(buf):
-                    break  # Need more data
-                payload_size = struct_mod.unpack_from("<H", buf, pos + 4)[0]
-                # Total packet: 4 magic + 2 size + 2 size + payload_size + padding
-                total_data = 8 + payload_size
-                pad = (-total_data) % 8
-                total_with_pad = total_data + pad
-                if pos + total_with_pad > len(buf):
-                    break  # Need more data
-
-                # Extract ADPCM data (skip 4-byte sub-header: 2b data_magic + 2b half_block)
-                adpcm_size = payload_size - 4
-                if adpcm_size > 4:
-                    adpcm_block = bytes(buf[pos + 12:pos + 12 + adpcm_size])
-                    try:
-                        self._audio_input_buffer.put_nowait(adpcm_block)
-                        audio_found += 1
-                    except asyncio.QueueFull:
-                        pass
-                pos += total_with_pad
-                continue
-
-            # --- AAC audio packet ---
-            if magic == MAGIC_AAC:
-                if pos + 8 > len(buf):
-                    break
-                payload_size = struct_mod.unpack_from("<H", buf, pos + 4)[0]
-                total_data = 8 + payload_size
-                pad = (-total_data) % 8
-                total_with_pad = total_data + pad
-                if pos + total_with_pad > len(buf):
-                    break
-                # Extract AAC frame data (starts at offset 8, after magic + 2x size)
-                aac_data = bytes(buf[pos + 8:pos + 8 + payload_size])
-                if aac_data and self._audio_input_buffer:
-                    try:
-                        self._audio_input_buffer.put_nowait(aac_data)
-                        audio_found += 1
-                    except asyncio.QueueFull:
-                        pass  # Drop if queue is full
-                if self._stream_extract_count <= 5:
-                    _LOGGER.warning(
-                        "BcMedia AAC packet: %d bytes (first2=%s), queued=%d",
-                        payload_size,
-                        aac_data[:2].hex() if len(aac_data) >= 2 else "?",
-                        audio_found,
-                    )
-                pos += total_with_pad
-                continue
-
-            # --- IFrame / PFrame (video) — skip efficiently ---
-            # Check if first byte matches IFrame/PFrame pattern
-            # IFrame magic: 0x63643030-0x63643039 (bytes: 30 30/31/../39 64 63)
-            # PFrame magic: 0x63643130-0x63643139 (bytes: 30 31/31/../39 64 63)
-            if len(buf) > pos + 3 and buf[pos + 2:pos + 4] == b"\x64\x63":
-                # This is a video frame (IFrame or PFrame)
-                # Layout: 4 magic + 4 video_type_str + 4 payload_size + 4 additional_header
-                #          + 4 microseconds + 4 unknown + additional_header bytes + payload + pad
-                if pos + 24 > len(buf):
-                    break
-                payload_size = struct_mod.unpack_from("<I", buf, pos + 12)[0]
-                additional = struct_mod.unpack_from("<I", buf, pos + 16)[0]
-                # Total: 24 header + additional + payload + padding
-                total_data = 24 + additional + payload_size
-                pad = (-payload_size) % 8
-                total_with_pad = total_data + pad
-                if pos + total_with_pad > len(buf):
-                    # Incomplete video frame — if very large, skip to save memory
-                    if payload_size > 200000:
-                        # Drop the incomplete frame data — too large to buffer
-                        pos = len(buf)
-                    break
-                pos += total_with_pad
-                continue
-
-            # Unknown magic — try to skip forward to find the next known magic
-            # Use bytes.find() to jump to the next potential packet start
-            next_adpcm = buf.find(MAGIC_ADPCM, pos + 1)
-            next_aac = buf.find(MAGIC_AAC, pos + 1)
-            next_info = buf.find(MAGIC_INFO_V2, pos + 1)
-            candidates = [x for x in (next_adpcm, next_aac, next_info) if x >= 0]
-            if candidates:
-                pos = min(candidates)
-            else:
-                # No known magic found — discard everything up to last 4 bytes
-                pos = max(0, len(buf) - 4)
-                break
-
-        # Remove consumed data from buffer (keep unprocessed tail)
-        if pos > 0:
-            del self._stream_buffer[:pos]
-
-        # Keep buffer from growing unbounded (cap at 512KB)
-        if len(self._stream_buffer) > 524288:
-            _LOGGER.debug("Stream buffer overflow (%d bytes) — flushing", len(self._stream_buffer))
-            self._stream_buffer.clear()
-
-        if audio_found and self._stream_extract_count <= 20:
-            _LOGGER.warning(
-                "Stream #%d: extracted %d audio blocks (buffer=%d bytes remaining)",
-                self._stream_extract_count, audio_found, len(self._stream_buffer),
-            )
-
-    async def _audio_input_processor(self) -> None:
-        """Process AAC audio frames from the Baichuan stream into PCM for Gemini.
-
-        The camera sends AAC audio (ADTS-framed) via the cmd 3 preview stream.
-        We use ffmpeg to decode AAC → 16kHz 16-bit mono PCM for Gemini input.
-        """
+        rtsp_url = self._reolink_rtsp_url
         _LOGGER.warning(
-            "Audio input processor started (Baichuan AAC → PCM %dHz for Gemini)",
-            AUDIO_INPUT_SAMPLE_RATE,
+            "Audio input: starting RTSP ffmpeg reader from %s",
+            rtsp_url.split("@")[-1] if "@" in rtsp_url else rtsp_url,
         )
-        blocks_decoded = 0
-        decoder_proc: asyncio.subprocess.Process | None = None
 
+        proc: asyncio.subprocess.Process | None = None
         try:
-            # Start ffmpeg AAC decoder → 16kHz s16le PCM
-            decoder_proc = await asyncio.create_subprocess_exec(
+            proc = await asyncio.create_subprocess_exec(
                 "ffmpeg",
                 "-hide_banner", "-loglevel", "error",
-                "-f", "aac", "-i", "pipe:0",
-                "-f", "s16le", "-ar", str(AUDIO_INPUT_SAMPLE_RATE), "-ac", "1", "pipe:1",
-                stdin=asyncio.subprocess.PIPE,
+                "-rtsp_transport", "tcp",
+                "-i", rtsp_url,
+                "-vn",  # No video — audio only
+                "-acodec", "pcm_s16le",
+                "-ar", str(AUDIO_INPUT_SAMPLE_RATE),
+                "-ac", "1",
+                "-f", "s16le",
+                "pipe:1",
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            _LOGGER.warning("Audio input decoder: AAC → PCM %dHz", AUDIO_INPUT_SAMPLE_RATE)
+            _LOGGER.warning("Audio input: ffmpeg RTSP reader started (PID=%d)", proc.pid)
 
-            # Start background reader for decoded PCM output
-            read_task = asyncio.create_task(
-                self._read_decoded_pcm(decoder_proc.stdout)
-            )
+            # Read PCM in 20ms chunks: 16000 Hz * 2 bytes * 0.02s = 640 bytes
+            CHUNK_SIZE = 640
+            chunks_sent = 0
+            first_logged = False
 
-            while self._active and self._listen_active:
-                try:
-                    aac_frame = await asyncio.wait_for(
-                        self._audio_input_buffer.get(), timeout=2.0
-                    )
-                except asyncio.TimeoutError:
-                    continue
-
-                if not aac_frame:
-                    continue
-
-                blocks_decoded += 1
-                if blocks_decoded == 1:
-                    # Log the first frame for diagnostics
-                    _LOGGER.warning(
-                        "✓ First AAC frame from doorbell mic (%d bytes, sync=%s)",
-                        len(aac_frame),
-                        "ADTS" if aac_frame[0:1] == b"\xff" else f"0x{aac_frame[0:2].hex()}",
-                    )
-                elif blocks_decoded % 200 == 0:
-                    _LOGGER.info("Audio input: %d AAC frames decoded", blocks_decoded)
-
-                # Feed AAC frame to ffmpeg decoder
-                if decoder_proc and decoder_proc.returncode is None:
-                    try:
-                        decoder_proc.stdin.write(aac_frame)
-                        await decoder_proc.stdin.drain()
-                    except (BrokenPipeError, ConnectionResetError):
-                        _LOGGER.warning("AAC decoder pipe broken after %d frames", blocks_decoded)
-                        break
-                    except Exception as exc:
-                        _LOGGER.warning("AAC decoder write error: %s", exc)
-                        break
-
-            # Cancel the read task
-            read_task.cancel()
-            try:
-                await read_task
-            except asyncio.CancelledError:
-                pass
-
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            _LOGGER.warning("Audio input processor error", exc_info=True)
-        finally:
-            if decoder_proc and decoder_proc.returncode is None:
-                try:
-                    decoder_proc.stdin.close()
-                    decoder_proc.terminate()
-                except Exception:
-                    pass
-            _LOGGER.warning("Audio input processor ended (%d AAC frames decoded)", blocks_decoded)
-
-    async def _read_decoded_pcm(self, stdout: asyncio.StreamReader) -> None:
-        """Read decoded PCM from ffmpeg stdout and send to Gemini.
-
-        Reads in chunks matching ~20ms at 16kHz (640 bytes = 320 samples * 2 bytes).
-        """
-        CHUNK_SIZE = 640  # 20ms at 16kHz mono s16le
-        first_sent = False
-
-        try:
-            while True:
-                pcm_data = await stdout.read(CHUNK_SIZE)
+            while self._active and self._listen_active and proc.returncode is None:
+                pcm_data = await proc.stdout.read(CHUNK_SIZE)
                 if not pcm_data:
-                    break  # EOF — decoder closed
+                    break  # EOF or process died
 
-                if not first_sent:
-                    first_sent = True
+                if not first_logged:
+                    first_logged = True
                     _LOGGER.warning(
-                        "✓ First decoded PCM from doorbell mic (%d bytes @ %dHz) → Gemini",
+                        "✓ First audio from doorbell mic via RTSP (%d bytes PCM @ %dHz)",
                         len(pcm_data), AUDIO_INPUT_SAMPLE_RATE,
                     )
 
-                # Send to Gemini
+                chunks_sent += 1
+                if chunks_sent % 500 == 0:
+                    _LOGGER.info("Audio input: %d chunks sent to Gemini", chunks_sent)
+
+                # Send PCM directly to Gemini
                 await self._on_audio_received(pcm_data)
+
         except asyncio.CancelledError:
             pass
         except Exception as exc:
-            _LOGGER.warning("PCM reader error: %s", exc)
-
-    def _decode_ima_adpcm(self, adpcm_block: bytes) -> bytes:
-        """Decode a single IMA/DVI-4 ADPCM block to 16-bit PCM (little-endian).
-
-        Block layout (standard DVI-4):
-          - 2 bytes: initial predictor value (i16 LE)
-          - 1 byte: step table index (0–88)
-          - 1 byte: reserved (0)
-          - remaining bytes: packed 4-bit nibbles (2 samples per byte, low nibble first)
-
-        Returns raw 16-bit LE PCM bytes at the camera's native sample rate.
-        """
-        import struct as struct_mod  # noqa: PLC0415
-
-        if len(adpcm_block) < 8:  # Need at least header + some data
-            return b""
-
-        IMA_INDEX_TABLE = [-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8]
-        IMA_STEP_TABLE = [
-            7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31,
-            34, 37, 41, 45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143,
-            157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544,
-            598, 658, 724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878,
-            2066, 2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358, 5894,
-            6484, 7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899, 15289, 16818,
-            18500, 20350, 22385, 24623, 27086, 29794, 32767,
-        ]
-
-        # Parse block header
-        predictor = struct_mod.unpack_from("<h", adpcm_block, 0)[0]
-        step_index = adpcm_block[2]
-        step_index = max(0, min(88, step_index))
-
-        # Decode nibbles
-        nibble_data = adpcm_block[4:]
-        samples = []
-
-        for byte_val in nibble_data:
-            # Low nibble first, then high nibble
-            for nibble in (byte_val & 0x0F, (byte_val >> 4) & 0x0F):
-                step = IMA_STEP_TABLE[step_index]
-
-                # Decode nibble to difference
-                diff = step >> 3
-                if nibble & 4:
-                    diff += step
-                if nibble & 2:
-                    diff += step >> 1
-                if nibble & 1:
-                    diff += step >> 2
-
-                if nibble & 8:
-                    predictor -= diff
-                else:
-                    predictor += diff
-
-                # Clamp to 16-bit range
-                predictor = max(-32768, min(32767, predictor))
-
-                # Update step index
-                step_index += IMA_INDEX_TABLE[nibble]
-                step_index = max(0, min(88, step_index))
-
-                samples.append(predictor)
-
-        if not samples:
-            return b""
-
-        return struct_mod.pack(f"<{len(samples)}h", *samples)
-
-    async def _stop_baichuan_listen(self) -> None:
-        """Stop the Baichuan preview stream (cmd 4 = stop video)."""
-        if not self._listen_bc:
-            return
-        try:
-            from reolink_aio.baichuan import util as bc_util  # noqa: PLC0415
-
-            # Build stop command (cmd 4) with handle=256 (subStream)
-            stop_body = (
-                '<?xml version="1.0" encoding="UTF-8" ?>\n'
-                "<body>\n"
-                '<Preview version="1.1">\n'
-                "<channelId>0</channelId>\n"
-                "<handle>256</handle>\n"
-                "</Preview>\n"
-                "</body>\n"
-            )
-
-            # Write directly to transport (same as start)
-            enc_body = self._listen_bc._aes_encrypt(stop_body)
-            if not hasattr(self._listen_bc, "_mess_id"):
-                self._listen_bc._mess_id = 0
-            self._listen_bc._mess_id = (self._listen_bc._mess_id + 1) % 16777216
-            mess_id = self._listen_bc._mess_id
-
-            cmd_id = 4  # MSG_ID_VIDEO_STOP
-            header = (
-                bytes.fromhex(bc_util.HEADER_MAGIC)
-                + int(cmd_id).to_bytes(4, "little")
-                + int(len(enc_body)).to_bytes(4, "little")
-                + int(1).to_bytes(1, "little")  # ch_id = channel 0 + 1
-                + int(mess_id).to_bytes(3, "little")
-                + bytes.fromhex("00001464")
-                + int(0).to_bytes(4, "little")
-            )
-
-            packet = header + enc_body
-            if hasattr(self._listen_bc, "_mutex") and hasattr(self._listen_bc, "_transport"):
-                async with self._listen_bc._mutex:
-                    self._listen_bc._transport.write(packet)
-            elif hasattr(self._listen_bc, "_protocol") and hasattr(self._listen_bc._protocol, "transport"):
-                self._listen_bc._protocol.transport.write(packet)
-
-            _LOGGER.info("Baichuan preview stream stop sent (cmd 4)")
-        except Exception as exc:
-            _LOGGER.debug("Preview stop error (non-critical): %s", exc)
-
-        # Restore original push callback
-        if self._original_push_callback and self._listen_bc:
-            try:
-                protocol = self._listen_bc._protocol
-                if protocol:
-                    protocol._push_callback = self._original_push_callback
-            except Exception:
-                pass
-        self._original_push_callback = None
-
+            _LOGGER.warning("RTSP audio input error: %s", exc)
+        finally:
+            if proc and proc.returncode is None:
+                proc.terminate()
+                try:
+                    stderr_data = await asyncio.wait_for(proc.stderr.read(2000), timeout=2.0)
+                    if stderr_data:
+                        _LOGGER.warning(
+                            "ffmpeg RTSP audio stderr: %s",
+                            stderr_data.decode(errors="replace").strip()[:200],
+                        )
+                except (asyncio.TimeoutError, Exception):
+                    pass
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            self._listen_active = False
+            _LOGGER.warning("Audio input: RTSP reader stopped (sent %d chunks)", chunks_sent)
 
 async def auto_configure_reolink(
     hass: HomeAssistant,
