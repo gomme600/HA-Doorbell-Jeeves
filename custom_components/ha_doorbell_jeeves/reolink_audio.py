@@ -1025,7 +1025,6 @@ class ReolinkAudioHandler:
                 "ffmpeg",
                 "-hide_banner", "-loglevel", "warning",
                 "-rtsp_transport", "tcp",
-                "-stimeout", "5000000",  # 5s RTSP socket timeout
                 "-i", url,
                 "-vn",  # No video — audio only
                 "-acodec", "pcm_s16le",
@@ -1039,7 +1038,7 @@ class ReolinkAudioHandler:
             )
 
             # Wait briefly to see if ffmpeg connects or dies immediately
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(3.0)
             if proc.returncode is not None:
                 # ffmpeg exited — read error and try next URL
                 stderr_data = b""
