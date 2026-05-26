@@ -101,6 +101,29 @@ For other doorbells, choose "Manual Setup" and configure:
 
 ---
 
+## 🖐️ Human Takeover Detection
+
+The AI agent automatically stops when a human takes over the conversation:
+
+### Detection Methods
+
+| Method | How it works | When to use |
+|--------|-------------|-------------|
+| **Reolink API** | Polls the camera's `GetTalkState` endpoint every 2s | Reolink users — zero config needed |
+| **Audio Energy** | Monitors doorbell mic for loud audio while AI speaks | Backup for any camera type |
+| **HA Entity Trigger** | Watches for entity state changes (e.g., door opens) | Any setup — configure in Triggers |
+
+### Reolink Talk State Monitor
+When you use Reolink Quick Setup, the integration automatically monitors whether someone activated 2-way audio via the Reolink mobile app. When detected:
+1. AI playback stops immediately
+2. Session ends gracefully
+3. The human can speak uninterrupted
+
+### Stop Triggers (HA Entities)
+You can configure any HA entity as a stop trigger (e.g., `binary_sensor.front_door`). When it changes to the specified state, the AI session ends. Configure via **Options → Triggers**.
+
+---
+
 ## ⚙️ Setup Wizard
 
 ### Initial Setup (5 steps)
