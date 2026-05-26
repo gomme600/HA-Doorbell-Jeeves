@@ -584,18 +584,18 @@ class ReolinkAudioHandler:
                     except Exception:
                         _LOGGER.warning("ffmpeg stdin write failed")
                         break
-                else:
-                    await asyncio.sleep(0.02)
-                    continue
 
-                # Read resampled PCM — get enough for 4 ADPCM blocks at a time
+                # Always try to read resampled PCM from ffmpeg
+                # (even if no new input was written — ffmpeg may still have buffered data)
                 read_size = pcm_bytes_per_block * 4
                 try:
                     resampled = await asyncio.wait_for(
                         self._ffmpeg_proc.stdout.read(read_size),
-                        timeout=2.0,
+                        timeout=0.1,
                     )
                 except asyncio.TimeoutError:
+                    # No data ready yet — small delay and retry
+                    await asyncio.sleep(0.02)
                     continue
                 except Exception:
                     break
@@ -619,8 +619,8 @@ class ReolinkAudioHandler:
                         chunks_sent += 1
                         if chunks_sent == 1:
                             _LOGGER.warning("✓ First ADPCM chunk sent to doorbell speaker!")
-                        elif chunks_sent % 50 == 0:
-                            _LOGGER.info("Audio output progress: %d chunks sent", chunks_sent)
+                        elif chunks_sent % 10 == 0:
+                            _LOGGER.warning("Audio output progress: %d chunks sent", chunks_sent)
                     except Exception as exc:
                         if chunks_sent <= 3:
                             _LOGGER.warning("Baichuan talk send error: %s", exc)
