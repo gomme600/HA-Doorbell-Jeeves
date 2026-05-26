@@ -1191,6 +1191,18 @@ class ReolinkAudioHandler:
 
         def patched_parse_data():
             """Enhanced parse_data that handles payload_offset for binary streams."""
+            # Track entry count for diagnostics
+            if not hasattr(handler, "_patch_entry"):
+                handler._patch_entry = 0
+            handler._patch_entry += 1
+            if handler._patch_entry <= 10:
+                data_len = len(protocol._data) if protocol._data else 0
+                first8 = protocol._data[:8].hex() if data_len >= 8 else (protocol._data.hex() if protocol._data else "empty")
+                _LOGGER.warning(
+                    "patched_parse_data entry #%d: data_len=%d, first8=%s",
+                    handler._patch_entry, data_len, first8,
+                )
+
             if len(protocol._data) < 24:
                 if len(protocol._data) >= 20:
                     # Check if this is a standard 20-byte header message
