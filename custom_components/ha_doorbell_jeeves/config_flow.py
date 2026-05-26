@@ -503,11 +503,16 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
     async def async_step_add_camera(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         if user_input is not None:
             store = await self._async_get_store()
+            existing = store.get_entity(user_input["entity_id"])
             await store.async_add_entity(
                 ManagedEntity(
                     entity_id=user_input["entity_id"],
                     name=user_input["name"],
                     description=user_input["description"],
+                    actions=list(existing.actions) if existing else [],
+                    security_mode=existing.security_mode if existing else SECURITY_MODE_AUTO,
+                    require_visual_match=existing.require_visual_match if existing else False,
+                    require_camera_feed=existing.require_camera_feed if existing else False,
                 )
             )
             return await self.async_step_entities()
@@ -528,11 +533,16 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
     async def async_step_add_calendar(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         if user_input is not None:
             store = await self._async_get_store()
+            existing = store.get_entity(user_input["entity_id"])
             await store.async_add_entity(
                 ManagedEntity(
                     entity_id=user_input["entity_id"],
                     name=user_input["name"],
                     description=user_input["description"],
+                    actions=list(existing.actions) if existing else [],
+                    security_mode=existing.security_mode if existing else SECURITY_MODE_AUTO,
+                    require_visual_match=existing.require_visual_match if existing else False,
+                    require_camera_feed=existing.require_camera_feed if existing else False,
                 )
             )
             return await self.async_step_entities()
@@ -553,7 +563,13 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
     async def async_step_add_entity(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         if user_input is not None:
             store = await self._async_get_store()
-            await store.async_add_entity(self._build_managed_entity_from_input(user_input))
+            existing = store.get_entity(user_input["entity_id"])
+            await store.async_add_entity(
+                self._build_managed_entity_from_input(
+                    user_input,
+                    existing.actions if existing else None,
+                )
+            )
             return await self.async_step_entities()
         return self.async_show_form(step_id="add_entity", data_schema=vol.Schema(self._entity_form_schema()))
 
@@ -625,8 +641,8 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
 
     async def async_step_add_standalone_action(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         store = await self._async_get_store()
-        global_entity = await self._ensure_global_actions_entity(store)
         if user_input is not None:
+            global_entity = await self._ensure_global_actions_entity(store)
             global_entity.actions.append(self._build_action_from_input(user_input))
             await store.async_add_entity(global_entity)
             return await self.async_step_entities()

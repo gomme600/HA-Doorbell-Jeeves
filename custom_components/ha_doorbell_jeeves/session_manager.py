@@ -653,7 +653,11 @@ class JeevesSessionManager:
 
     def _handle_audio_output(self, audio_bytes: bytes) -> None:
         """Handle audio output from the AI model."""
-        _LOGGER.warning("Audio output received from AI: %d bytes", len(audio_bytes))
+        if not hasattr(self, "_audio_out_count"):
+            self._audio_out_count = 0
+        self._audio_out_count += 1
+        if self._audio_out_count <= 3:
+            _LOGGER.warning("Audio output from AI: %d bytes (chunk #%d)", len(audio_bytes), self._audio_out_count)
         # If Reolink audio handler is active, send directly to doorbell speaker
         if self._audio_handler and self._audio_handler.is_active:
             self.hass.async_create_task(self._audio_handler.send_audio(audio_bytes))

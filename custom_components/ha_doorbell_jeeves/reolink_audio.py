@@ -234,7 +234,10 @@ class ReolinkAudioHandler:
 
         self._active = True
         self._ws_task = asyncio.create_task(self._audio_receive_loop())
-        _LOGGER.info("Reolink audio handler started (stream=%s, go2rtc=%s)", self._stream_name, self._go2rtc_url)
+        _LOGGER.warning(
+            "Reolink audio handler started (stream=%s, go2rtc=%s, owns_session=%s)",
+            self._stream_name, self._go2rtc_url, self._owns_session,
+        )
 
     async def stop(self) -> None:
         """Stop the audio handler."""
@@ -258,6 +261,8 @@ class ReolinkAudioHandler:
         Format: raw PCM 16-bit LE, mono, at the camera's expected sample rate.
         """
         if not self._session or not self._active or not self._go2rtc_url:
+            _LOGGER.warning("send_audio: not ready (session=%s, active=%s, url=%s)",
+                           bool(self._session), self._active, self._go2rtc_url)
             return
 
         try:
@@ -270,13 +275,14 @@ class ReolinkAudioHandler:
             ) as resp:
                 if resp.status not in (200, 201, 204):
                     text = await resp.text()
-                    _LOGGER.debug("Backchannel send status %d: %s", resp.status, text[:100])
+                    _LOGGER.warning("Backchannel send status %d: %s", resp.status, text[:200])
         except Exception:
-            _LOGGER.debug("Failed to send audio to doorbell", exc_info=True)
+            _LOGGER.warning("Failed to send audio to doorbell", exc_info=True)
 
     async def _audio_receive_loop(self) -> None:
         """Connect to go2rtc WebSocket and receive audio frames from the doorbell mic."""
         ws_url = f"{self._go2rtc_url}/api/ws?src={self._stream_name}&media=audio"
+        _LOGGER.warning("Audio receive loop connecting to: %s", ws_url)
 
         while self._active:
             try:
@@ -284,7 +290,7 @@ class ReolinkAudioHandler:
                     break
 
                 async with self._session.ws_connect(ws_url) as ws:
-                    _LOGGER.debug("Connected to go2rtc audio WebSocket")
+                    _LOGGER.warning("Connected to go2rtc audio WebSocket")
                     async for msg in ws:
                         if not self._active:
                             break
@@ -292,12 +298,13 @@ class ReolinkAudioHandler:
                             # Raw audio data from the doorbell microphone
                             await self._on_audio_received(msg.data)
                         elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
+                            _LOGGER.warning("go2rtc WS closed/error: %s", msg.type)
                             break
 
             except asyncio.CancelledError:
                 break
             except Exception:
-                _LOGGER.debug("go2rtc audio WebSocket error, retrying in 2s", exc_info=True)
+                _LOGGER.warning("go2rtc audio WebSocket error, retrying in 2s", exc_info=True)
                 await asyncio.sleep(2)
 
 
