@@ -128,6 +128,11 @@ class JeevesSessionManager:
         provider = config.get(CONF_PROVIDER, PROVIDER_GEMINI)
         api_key: str = config[CONF_API_KEY]
         model: str = config.get(CONF_MODEL, DEFAULT_MODEL_GEMINI)
+        # Runtime fix: replace known-invalid model names
+        _INVALID_MODELS = {"gemini-2.5-flash-native-audio-dialog"}
+        if model in _INVALID_MODELS:
+            model = DEFAULT_MODEL_GEMINI
+            _LOGGER.warning("Replaced invalid model %s → %s", config.get(CONF_MODEL), model)
         dual_model = config.get(CONF_DUAL_MODEL_ENABLED, False)
 
         # Build full system prompt with entity context
