@@ -110,7 +110,7 @@
       },
       "dual_model": {
         "title": "Dual Model Architecture",
-        "description": "Native audio models (like gemini-2.5-flash-native-audio-dialog) do NOT support function calling. Enable dual-model mode to use a separate text model for tool execution while the audio model handles the conversation.\n\nLeave disabled if your voice model supports tools natively (e.g., gpt-4o-realtime, gemini-2.0-flash-live).",
+        "description": "By default, the voice model handles tool calls natively (recommended). Enable dual-model mode only if you want a separate text model to handle tool execution instead of the voice model.\n\nThis is an advanced option — most users should leave it disabled.",
         "data": {
           "dual_model_enabled": "Enable Dual Model Mode",
           "tool_provider": "Tool Model Provider",

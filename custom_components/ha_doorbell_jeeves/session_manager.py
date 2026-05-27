@@ -276,16 +276,6 @@ class JeevesSessionManager:
             api_key: str = config[CONF_API_KEY]
             model: str = config.get(CONF_MODEL, DEFAULT_MODEL_GEMINI)
             dual_model = config.get(CONF_DUAL_MODEL_ENABLED, False)
-            model_lacks_native_tools = (
-                provider == PROVIDER_GEMINI
-                and model.startswith("gemini-") and "native-audio" in model
-            )
-            if model_lacks_native_tools and not dual_model:
-                _LOGGER.warning(
-                    "Model %s does not support native tool calling; enabling dual-model routing",
-                    model,
-                )
-                dual_model = True
 
             _LOGGER.warning(
                 "Session config: provider=%s, model=%s, audio_mode=%s, camera=%s",
