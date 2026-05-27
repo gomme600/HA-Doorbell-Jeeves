@@ -80,9 +80,16 @@ class GeminiLiveClient(BaseRealtimeClient):
             ),
             system_instruction=types.Content(parts=[types.Part(text=self._system_prompt)]),
             tools=self._tools if self._tools else None,
-            # NOTE: input/output_audio_transcription omitted — causes 1008 policy
-            # violation on some model versions ("Operation is not implemented").
-            # Transcriptions will be captured when model supports them natively.
+            output_audio_transcription=types.AudioTranscriptionConfig(),
+            realtime_input_config=types.RealtimeInputConfig(
+                automatic_activity_detection=types.AutomaticActivityDetection(
+                    start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
+                    end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
+                    silence_duration_ms=700,
+                    prefix_padding_ms=300,
+                ),
+                activity_handling=types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
+            ),
         )
 
         self._session_cm = self._client.aio.live.connect(
@@ -128,28 +135,13 @@ class GeminiLiveClient(BaseRealtimeClient):
             _LOGGER.exception("Failed to send audio")
 
     async def send_image(self, image_base64: str, mime_type: str = "image/jpeg") -> None:
-        """Send an image frame to the live session.
-
-        Uses LiveClientContent (content turn) instead of send_realtime_input(video=)
-        because the native audio dialog model does not support realtime video input
-        but can accept images as inline_data in user content turns.
-        turn_complete=True marks the visual update as a complete turn so it doesn't
-        block the model's VAD-triggered audio responses.
-        """
+        """Send an image frame to the live session via realtime video input."""
         if not self._session or not self._connected:
             return
         try:
             image_bytes = base64.b64decode(image_base64)
-            await self._session.send(
-                input=types.LiveClientContent(
-                    turns=[types.Content(
-                        role="user",
-                        parts=[types.Part(inline_data=types.Blob(
-                            data=image_bytes, mime_type=mime_type
-                        ))],
-                    )],
-                    turn_complete=True,
-                )
+            await self._session.send_realtime_input(
+                video=types.Blob(data=image_bytes, mime_type=mime_type)
             )
         except Exception:
             _LOGGER.exception("Failed to send image")
@@ -159,26 +151,20 @@ class GeminiLiveClient(BaseRealtimeClient):
         if not self._session or not self._connected:
             return
         try:
-            await self._session.send(
-                input=types.LiveClientContent(
-                    turns=[types.Content(role="user", parts=[types.Part(text=text)])],
-                    turn_complete=True,
-                )
+            await self._session.send_client_content(
+                turns=[types.Content(role="user", parts=[types.Part(text=text)])],
+                turn_complete=True,
             )
         except Exception:
             _LOGGER.exception("Failed to inject context")
 
     async def request_recap(self, outcome: str, timeout: float = 8.0) -> dict[str, str] | None:
-        """Ask the live model to generate a session recap as text before disconnecting.
+        """Ask the live model to generate a session recap.
 
-        Returns parsed recap dict or None if the model doesn't support text output.
-        Currently, native audio dialog models only support AUDIO modality, so this
-        will return None immediately. Kept for future models that support mixed output.
+        With output_audio_transcription enabled, even native audio models produce
+        text output via the transcription stream. The recap prompt requests JSON
+        which will appear in the output_transcription messages.
         """
-        # Native audio models can only output audio — skip to avoid timeout delay
-        if "native-audio" in self._model:
-            return None
-
         if not self._session or not self._connected:
             return None
 
@@ -196,11 +182,9 @@ class GeminiLiveClient(BaseRealtimeClient):
         )
 
         try:
-            await self._session.send(
-                input=types.LiveClientContent(
-                    turns=[types.Content(role="user", parts=[types.Part(text=prompt)])],
-                    turn_complete=True,
-                )
+            await self._session.send_client_content(
+                turns=[types.Content(role="user", parts=[types.Part(text=prompt)])],
+                turn_complete=True,
             )
             # Wait for text response (captured by _process via _recap_future)
             text_response = await asyncio.wait_for(self._recap_future, timeout=timeout)
@@ -239,11 +223,9 @@ class GeminiLiveClient(BaseRealtimeClient):
             parts.append(types.Part(inline_data=types.Blob(data=image_bytes, mime_type="image/jpeg")))
             parts.append(types.Part(text=f"[Reference: {ref['caption']}]"))
         try:
-            await self._session.send(
-                input=types.LiveClientContent(
-                    turns=[types.Content(role="user", parts=parts)],
-                    turn_complete=True,
-                )
+            await self._session.send_client_content(
+                turns=[types.Content(role="user", parts=parts)],
+                turn_complete=True,
             )
         except Exception:
             _LOGGER.exception("Failed to inject reference images")
@@ -336,8 +318,8 @@ class GeminiLiveClient(BaseRealtimeClient):
             )
         if self._session and self._connected:
             try:
-                await self._session.send(
-                    input=types.LiveClientToolResponse(function_responses=function_responses)
+                await self._session.send_tool_response(
+                    function_responses=function_responses
                 )
             except Exception:
                 _LOGGER.exception("Failed to send tool response")
