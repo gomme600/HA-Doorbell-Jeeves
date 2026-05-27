@@ -155,22 +155,27 @@ async def _register_frontend_resources(hass: HomeAssistant) -> None:
         _LOGGER.warning("Memory timeline card file missing: %s", card_path)
         return
 
-    # Serve the card JS via a custom view with the correct MIME type
+    # Serve the card JS via a custom view with the correct MIME type.
+    # HA's static path serving returns text/plain for .js files and the strict
+    # nosniff header prevents browsers from executing import()'d modules.
     from aiohttp import web  # noqa: PLC0415
 
     from homeassistant.components.http import HomeAssistantView  # noqa: PLC0415
 
+    card_bytes = card_path.read_bytes()
+
     class _CardJSView(HomeAssistantView):
         """Serve the memory timeline card JavaScript with correct MIME."""
 
-        url = _MEMORY_TIMELINE_CARD_URL
+        url = "/api/ha_doorbell_jeeves/card.js"
         name = f"api:{DOMAIN}:card_js"
         requires_auth = False  # Frontend resources must load without auth
 
-        async def get(self, request: web.Request) -> web.FileResponse:
-            return web.FileResponse(
-                card_path,
-                headers={"Content-Type": "application/javascript; charset=utf-8"},
+        async def get(self, request: web.Request) -> web.Response:
+            return web.Response(
+                body=card_bytes,
+                content_type="application/javascript",
+                headers={"Cache-Control": "no-cache"},
             )
 
     hass.http.register_view(_CardJSView())
@@ -178,8 +183,8 @@ async def _register_frontend_resources(hass: HomeAssistant) -> None:
     # Tell the HA frontend to load the card JS on every page
     from homeassistant.components.frontend import add_extra_js_url  # noqa: PLC0415
 
-    add_extra_js_url(hass, _MEMORY_TIMELINE_CARD_URL)
-    _LOGGER.debug("Registered memory timeline card resource: %s", _MEMORY_TIMELINE_CARD_URL)
+    add_extra_js_url(hass, "/api/ha_doorbell_jeeves/card.js")
+    _LOGGER.debug("Registered memory timeline card resource at /api/ha_doorbell_jeeves/card.js")
 
 
 async def _setup_reolink(hass: HomeAssistant, entry: ConfigEntry, config: dict[str, Any]) -> None:
