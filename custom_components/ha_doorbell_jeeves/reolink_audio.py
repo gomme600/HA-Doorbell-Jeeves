@@ -1319,28 +1319,54 @@ class ReolinkAudioHandler:
         return bytes(pcm_out) if pcm_out else None
 
     def _try_raw_adpcm_decode(self, payload: bytes) -> bytes | None:
-        """Fallback: try decoding payload directly as IMA ADPCM blocks.
+        """Fallback: try decoding payload directly as IMA ADPCM.
 
-        Some cameras send raw ADPCM without BcMedia framing during FDX input.
-        The block starts with a 4-byte header (predictor + step_index + reserved)
-        followed by packed nibbles.
+        Strategy: Try decoding the ENTIRE payload as one continuous ADPCM stream
+        (single 4-byte header at offset 0, rest is packed nibbles). This is what
+        Reolink cameras send in FDX mode — a single block per packet, NOT
+        multiple Microsoft-WAV-style blocks.
+
+        If single-block decode produces unreasonable output (extreme clipping),
+        falls back to multi-block decode.
         """
         if not payload or len(payload) < 8:
             return None
 
-        # Determine block size from talk ability if available
+        # Strategy 1: Entire payload as ONE ADPCM block (most likely for Reolink FDX)
+        pcm_single = self._decode_ima_adpcm_block(payload)
+        if pcm_single:
+            # Sanity check: compute RMS to verify it's reasonable audio
+            import struct as struct_mod  # noqa: PLC0415
+            n_samples = len(pcm_single) // 2
+            if n_samples > 100:
+                samples = struct_mod.unpack(f"<{n_samples}h", pcm_single)
+                rms = (sum(s * s for s in samples[:500]) / min(500, n_samples)) ** 0.5
+                if rms < 28000:  # Reasonable audio (not just clipping noise)
+                    if not hasattr(self, "_raw_fallback_logged"):
+                        self._raw_fallback_logged = True
+                        _LOGGER.warning(
+                            "Audio input: single-block ADPCM decode (%d bytes PCM from %d bytes, RMS=%.0f)",
+                            len(pcm_single), len(payload), rms,
+                        )
+                    return pcm_single
+                else:
+                    _LOGGER.debug(
+                        "Single-block ADPCM decode: RMS=%.0f too high (clipping), trying multi-block",
+                        rms,
+                    )
+
+        # Strategy 2: Multi-block decode (Microsoft WAV style, each block has its own header)
         ability = self._talk_ability
         if ability:
             length_per_encoder = ability.get("length_per_encoder", 1024)
             expected_block_size = (length_per_encoder // 2) + 4
         else:
-            expected_block_size = 516  # Default: (1024/2)+4
+            expected_block_size = 516
 
         pcm_out = bytearray()
         offset = 0
 
         while offset + 4 < len(payload):
-            # Try to decode from current offset as a single ADPCM block
             remaining = len(payload) - offset
             block_size = min(expected_block_size, remaining)
             if block_size < 8:
@@ -1351,7 +1377,6 @@ class ReolinkAudioHandler:
             if pcm_block:
                 pcm_out.extend(pcm_block)
 
-            # Advance with 8-byte alignment padding
             padded_size = block_size + ((-block_size) % 8)
             offset += padded_size
 
@@ -1359,7 +1384,7 @@ class ReolinkAudioHandler:
             if not hasattr(self, "_raw_fallback_logged"):
                 self._raw_fallback_logged = True
                 _LOGGER.warning(
-                    "Audio input: using raw ADPCM decode fallback (%d bytes PCM from %d bytes payload)",
+                    "Audio input: multi-block ADPCM decode (%d bytes PCM from %d bytes payload)",
                     len(pcm_out), len(payload),
                 )
             return bytes(pcm_out)
