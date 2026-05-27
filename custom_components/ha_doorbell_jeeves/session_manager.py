@@ -141,10 +141,11 @@ class JeevesSessionManager:
         self._transcript_history: list[dict[str, str]] = []
 
         # Echo gate: suppress mic forwarding while AI is speaking to prevent
-        # the doorbell mic from picking up the AI's own voice output
-        self._ai_output_active = False
-        self._ai_output_end_time: float = 0.0
-        self._echo_gate_tail_ms: float = 300.0  # extra silence after AI stops
+        # the doorbell mic from picking up the AI's own voice output.
+        # Gate stays closed for ECHO_GATE_HOLD seconds after the last AI output
+        # chunk is received (accounts for speaker buffer + physical echo).
+        self._ai_last_output_time: float = 0.0
+        self._echo_gate_hold_sec: float = 2.0  # hold mic mute this long after last AI chunk
 
     def _normalize_manual_audio_config(self) -> None:
         """Backfill split go2rtc stream keys from the legacy single stream key."""
@@ -955,11 +956,8 @@ class JeevesSessionManager:
                 self._audio_out_count,
             )
 
-        # Echo gate: mark that AI is speaking (mic will be suppressed)
-        self._ai_output_active = True
-        # Estimate when this chunk finishes playing (24kHz, 16-bit mono)
-        chunk_duration = len(audio_bytes) / (24000 * 2)
-        self._ai_output_end_time = time.time() + chunk_duration + (self._echo_gate_tail_ms / 1000.0)
+        # Echo gate: record when AI output arrives (mic muted until hold expires)
+        self._ai_last_output_time = time.time()
 
         if self._interrupt_detector:
             self._interrupt_detector.set_ai_speaking(True)
@@ -1151,11 +1149,12 @@ class JeevesSessionManager:
         """Forward queued microphone PCM chunks to the active realtime client.
 
         Implements an echo gate: mic audio is NOT forwarded while the AI is
-        actively outputting audio (to prevent the doorbell mic from feeding
-        the AI's own voice back into the session).
+        actively outputting audio (+ hold time) to prevent the doorbell mic
+        from feeding the AI's own voice back into the session.
         """
         forwarded = 0
         echo_suppressed = 0
+        gate_was_closed = False
         try:
             while self._active:
                 if self._mic_queue is None:
@@ -1166,22 +1165,23 @@ class JeevesSessionManager:
                 if not audio_bytes:
                     continue
 
-                # Echo gate: suppress mic audio while AI is speaking
-                if self._ai_output_active:
-                    if time.time() < self._ai_output_end_time:
-                        echo_suppressed += 1
-                        if echo_suppressed == 1:
-                            _LOGGER.debug("Echo gate: suppressing mic (AI speaking)")
-                        continue
-                    else:
-                        # AI finished speaking — re-open gate
-                        self._ai_output_active = False
-                        if echo_suppressed > 0:
-                            _LOGGER.warning(
-                                "Echo gate opened (suppressed %d mic chunks during AI output)",
-                                echo_suppressed,
-                            )
-                            echo_suppressed = 0
+                # Echo gate: suppress mic while AI output is recent
+                now = time.time()
+                if self._ai_last_output_time > 0 and (now - self._ai_last_output_time) < self._echo_gate_hold_sec:
+                    echo_suppressed += 1
+                    gate_was_closed = True
+                    if echo_suppressed == 1:
+                        _LOGGER.debug("Echo gate: suppressing mic (AI speaking)")
+                    continue
+
+                # Gate just opened — log it
+                if gate_was_closed:
+                    _LOGGER.warning(
+                        "Echo gate opened (suppressed %d mic chunks, %.1fs of AI output buffering)",
+                        echo_suppressed, self._echo_gate_hold_sec,
+                    )
+                    echo_suppressed = 0
+                    gate_was_closed = False
 
                 if self._client and self._active:
                     try:

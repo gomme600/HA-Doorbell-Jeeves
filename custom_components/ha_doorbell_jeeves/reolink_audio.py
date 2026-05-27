@@ -1208,10 +1208,12 @@ class ReolinkAudioHandler:
             if payload:
                 input_count[0] += 1
                 if input_count[0] == 1:
+                    import base64 as _b64
                     _LOGGER.warning(
                         "✓ First audio from doorbell mic via Baichuan FDX (%d bytes payload). "
-                        "First 32 bytes: %s",
-                        len(payload), payload[:32].hex(),
+                        "First 64 bytes hex: %s | base64(first 256 bytes): %s",
+                        len(payload), payload[:64].hex(),
+                        _b64.b64encode(payload[:256]).decode(),
                     )
                 elif input_count[0] % 500 == 0:
                     _LOGGER.warning("Baichuan audio input: %d packets received", input_count[0])
@@ -1319,43 +1321,40 @@ class ReolinkAudioHandler:
         return bytes(pcm_out) if pcm_out else None
 
     def _try_raw_adpcm_decode(self, payload: bytes) -> bytes | None:
-        """Fallback: try decoding payload directly as IMA ADPCM.
+        """Fallback: try decoding payload as ADPCM or G.711.
 
-        Strategy: Try decoding the ENTIRE payload as one continuous ADPCM stream
-        (single 4-byte header at offset 0, rest is packed nibbles). This is what
-        Reolink cameras send in FDX mode — a single block per packet, NOT
-        multiple Microsoft-WAV-style blocks.
-
-        If single-block decode produces unreasonable output (extreme clipping),
-        falls back to multi-block decode.
+        Tries multiple decode strategies and picks the one that produces the
+        most reasonable audio signal (based on RMS — speech/ambient typically
+        has RMS 1000-15000, not 25000+):
+        1. Entire payload as single IMA ADPCM block
+        2. Payload as multiple ADPCM blocks (WAV-style)
+        3. Payload as G.711 µ-law (8kHz, upsample to 16kHz)
+        4. Payload as G.711 a-law (8kHz, upsample to 16kHz)
         """
         if not payload or len(payload) < 8:
             return None
 
-        # Strategy 1: Entire payload as ONE ADPCM block (most likely for Reolink FDX)
-        pcm_single = self._decode_ima_adpcm_block(payload)
-        if pcm_single:
-            # Sanity check: compute RMS to verify it's reasonable audio
-            import struct as struct_mod  # noqa: PLC0415
-            n_samples = len(pcm_single) // 2
-            if n_samples > 100:
-                samples = struct_mod.unpack(f"<{n_samples}h", pcm_single)
-                rms = (sum(s * s for s in samples[:500]) / min(500, n_samples)) ** 0.5
-                if rms < 28000:  # Reasonable audio (not just clipping noise)
-                    if not hasattr(self, "_raw_fallback_logged"):
-                        self._raw_fallback_logged = True
-                        _LOGGER.warning(
-                            "Audio input: single-block ADPCM decode (%d bytes PCM from %d bytes, RMS=%.0f)",
-                            len(pcm_single), len(payload), rms,
-                        )
-                    return pcm_single
-                else:
-                    _LOGGER.debug(
-                        "Single-block ADPCM decode: RMS=%.0f too high (clipping), trying multi-block",
-                        rms,
-                    )
+        import struct as struct_mod  # noqa: PLC0415
 
-        # Strategy 2: Multi-block decode (Microsoft WAV style, each block has its own header)
+        def _compute_rms(pcm: bytes, max_samples: int = 1000) -> float:
+            n = min(len(pcm) // 2, max_samples)
+            if n == 0:
+                return 99999.0
+            samples = struct_mod.unpack(f"<{n}h", pcm[:n*2])
+            return (sum(s * s for s in samples) / n) ** 0.5
+
+        best_pcm: bytes | None = None
+        best_rms = 99999.0
+        best_method = ""
+
+        # Strategy 1: Single ADPCM block (entire payload = 1 header + nibbles)
+        pcm = self._decode_ima_adpcm_block(payload)
+        if pcm:
+            rms = _compute_rms(pcm)
+            if rms < best_rms:
+                best_pcm, best_rms, best_method = pcm, rms, "single-block ADPCM"
+
+        # Strategy 2: Multi-block ADPCM
         ability = self._talk_ability
         if ability:
             length_per_encoder = ability.get("length_per_encoder", 1024)
@@ -1365,30 +1364,96 @@ class ReolinkAudioHandler:
 
         pcm_out = bytearray()
         offset = 0
-
         while offset + 4 < len(payload):
             remaining = len(payload) - offset
             block_size = min(expected_block_size, remaining)
             if block_size < 8:
                 break
-
-            adpcm_block = payload[offset: offset + block_size]
-            pcm_block = self._decode_ima_adpcm_block(adpcm_block)
+            block = payload[offset: offset + block_size]
+            pcm_block = self._decode_ima_adpcm_block(block)
             if pcm_block:
                 pcm_out.extend(pcm_block)
-
             padded_size = block_size + ((-block_size) % 8)
             offset += padded_size
-
         if pcm_out:
+            rms = _compute_rms(bytes(pcm_out))
+            if rms < best_rms:
+                best_pcm, best_rms, best_method = bytes(pcm_out), rms, "multi-block ADPCM"
+
+        # Strategy 3: G.711 µ-law → PCM 16-bit (8kHz, upsample to 16kHz)
+        pcm_ulaw = self._decode_g711_ulaw(payload)
+        if pcm_ulaw:
+            rms = _compute_rms(pcm_ulaw)
+            if rms < best_rms:
+                best_pcm, best_rms, best_method = pcm_ulaw, rms, "G.711 µ-law"
+
+        # Strategy 4: G.711 a-law → PCM 16-bit (8kHz, upsample to 16kHz)
+        pcm_alaw = self._decode_g711_alaw(payload)
+        if pcm_alaw:
+            rms = _compute_rms(pcm_alaw)
+            if rms < best_rms:
+                best_pcm, best_rms, best_method = pcm_alaw, rms, "G.711 a-law"
+
+        if best_pcm:
             if not hasattr(self, "_raw_fallback_logged"):
                 self._raw_fallback_logged = True
                 _LOGGER.warning(
-                    "Audio input: multi-block ADPCM decode (%d bytes PCM from %d bytes payload)",
-                    len(pcm_out), len(payload),
+                    "Audio input codec detected: %s (RMS=%.0f, %d bytes PCM from %d bytes payload)",
+                    best_method, best_rms, len(best_pcm), len(payload),
                 )
-            return bytes(pcm_out)
+            return best_pcm
         return None
+
+    def _decode_g711_ulaw(self, payload: bytes) -> bytes | None:
+        """Decode G.711 µ-law to 16-bit PCM and upsample 8kHz→16kHz."""
+        import struct as struct_mod  # noqa: PLC0415
+
+        # µ-law decode table (ITU-T G.711)
+        BIAS = 0x84
+        CLIP = 32635
+
+        samples: list[int] = []
+        for byte in payload:
+            byte = ~byte & 0xFF
+            sign = byte & 0x80
+            exponent = (byte >> 4) & 0x07
+            mantissa = byte & 0x0F
+            sample = (mantissa << (exponent + 3)) + BIAS + (BIAS << exponent) - BIAS
+            if sample > CLIP:
+                sample = CLIP
+            if sign:
+                sample = -sample
+            # Upsample 8kHz → 16kHz: duplicate each sample
+            samples.append(sample)
+            samples.append(sample)
+
+        if not samples:
+            return None
+        return struct_mod.pack(f"<{len(samples)}h", *samples)
+
+    def _decode_g711_alaw(self, payload: bytes) -> bytes | None:
+        """Decode G.711 a-law to 16-bit PCM and upsample 8kHz→16kHz."""
+        import struct as struct_mod  # noqa: PLC0415
+
+        samples: list[int] = []
+        for byte in payload:
+            byte ^= 0x55
+            sign = byte & 0x80
+            exponent = (byte >> 4) & 0x07
+            mantissa = byte & 0x0F
+            if exponent == 0:
+                sample = (mantissa << 4) + 8
+            else:
+                sample = ((mantissa << 4) + 0x108) << (exponent - 1)
+            if sign == 0:
+                sample = -sample
+            # Upsample 8kHz → 16kHz: duplicate each sample
+            samples.append(sample)
+            samples.append(sample)
+
+        if not samples:
+            return None
+        return struct_mod.pack(f"<{len(samples)}h", *samples)
 
     def _decode_ima_adpcm_block(self, block: bytes) -> bytes | None:
         """Decode a single IMA/DVI ADPCM block to 16-bit PCM samples.
