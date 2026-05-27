@@ -374,7 +374,10 @@ class JeevesSessionManager:
             fps = config.get(CONF_VISION_FPS, DEFAULT_VISION_FPS)
             camera_entity = config.get(CONF_CAMERA_ENTITY, "")
             if camera_entity:
-                self._vision_task = asyncio.create_task(self._vision_loop(camera_entity, fps))
+                # TEMP DEBUG: disable vision loop to test if concurrent frame sends
+                # are causing the Gemini 1008 disconnect
+                _LOGGER.warning("TEMP DEBUG: Vision loop DISABLED (testing 1008 cause)")
+                # self._vision_task = asyncio.create_task(self._vision_loop(camera_entity, fps))
 
             timeout = config.get(CONF_SESSION_TIMEOUT, DEFAULT_SESSION_TIMEOUT)
             if timeout > 0:
