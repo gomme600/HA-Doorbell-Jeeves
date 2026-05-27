@@ -15,6 +15,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from homeassistant import config_entries
 from homeassistant.core import HomeAssistant
 
 from .const import (
@@ -50,6 +51,25 @@ _LOGGER = logging.getLogger(__name__)
 def _readable_entities(store: DataStore) -> list[ManagedEntity]:
     """Return managed entities that should be exposed for read/history tools."""
     return [entity for entity in store.managed_entities if entity.entity_id != GLOBAL_ACTIONS_ENTITY_ID]
+
+
+def _llmvision_entries(hass: HomeAssistant) -> list[Any]:
+    """Return loaded LLM Vision config entries."""
+    return [
+        entry
+        for entry in hass.config_entries.async_entries("llmvision")
+        if entry.state == config_entries.ConfigEntryState.LOADED
+    ]
+
+
+def _llmvision_get_events_available(hass: HomeAssistant) -> bool:
+    """Return True if llmvision.get_events service is available."""
+    return hass.services.has_service("llmvision", "get_events")
+
+
+def _llmvision_detected(hass: HomeAssistant) -> bool:
+    """Return True if LLM Vision appears to be installed and loaded."""
+    return _llmvision_get_events_available(hass) or bool(_llmvision_entries(hass))
 
 
 def build_system_context(
@@ -111,8 +131,7 @@ def build_system_context(
         lines.append("These are useful for answering questions about what happened recently.")
 
     llmvision_enabled = bool((config or {}).get(CONF_LLMVISION_TIMELINE_ENABLED, False))
-    llmvision_service = hass.services.has_service("llmvision", "get_events")
-    if llmvision_enabled and llmvision_service:
+    if llmvision_enabled and _llmvision_detected(hass):
         lines.append("\n--- LLM VISION TIMELINE ---")
         lines.append(
             "• get_llmvision_events: Query recent LLM Vision detections "
@@ -1019,6 +1038,45 @@ async def _execute_search_events(
         }
 
 
+async def _query_llmvision_events_with_timeline(
+    hass: HomeAssistant,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Query LLM Vision timeline directly for installs without get_events service."""
+    try:
+        from custom_components.llmvision.const import CONF_PROVIDER as LLMVISION_CONF_PROVIDER  # noqa: PLC0415
+        from custom_components.llmvision.timeline import Timeline  # noqa: PLC0415
+    except Exception as err:
+        raise RuntimeError("LLM Vision timeline backend is unavailable for compatibility mode.") from err
+
+    settings_entry = None
+    loaded_entries = _llmvision_entries(hass)
+    for entry in loaded_entries:
+        if str(entry.data.get(LLMVISION_CONF_PROVIDER, "")).strip().lower() == "settings":
+            settings_entry = entry
+            break
+    if settings_entry is None and loaded_entries:
+        settings_entry = loaded_entries[0]
+    if settings_entry is None:
+        raise RuntimeError("No loaded LLM Vision config entry found.")
+
+    timeline = Timeline(hass, settings_entry)
+    events = await timeline.get_events_json(
+        start=payload.get("start"),
+        end=payload.get("end"),
+        cameras=[str(camera).lower() for camera in payload.get("cameras", []) if str(camera).strip()],
+        categories=[
+            str(category).lower()
+            for category in payload.get("categories", [])
+            if str(category).strip()
+        ],
+        labels=[str(label).lower() for label in payload.get("labels", []) if str(label).strip()],
+        limit=payload.get("limit"),
+        include_no_activity=payload.get("include_no_activity", True),
+    )
+    return {"events": events or []}
+
+
 async def _execute_get_llmvision_events(
     hass: HomeAssistant,
     arguments: dict[str, Any],
@@ -1028,8 +1086,8 @@ async def _execute_get_llmvision_events(
     cfg = config or {}
     if not cfg.get(CONF_LLMVISION_TIMELINE_ENABLED, False):
         return {"error": "LLM Vision timeline integration is disabled in Jeeves options."}
-    if not hass.services.has_service("llmvision", "get_events"):
-        return {"error": "LLM Vision service 'llmvision.get_events' is not available."}
+    if not _llmvision_detected(hass):
+        return {"error": "LLM Vision is not detected in Home Assistant."}
 
     def _normalize_list(value: Any) -> list[str]:
         if isinstance(value, list):
@@ -1073,9 +1131,11 @@ async def _execute_get_llmvision_events(
     cameras = _normalize_list(arguments.get("cameras"))
     if not cameras:
         cameras = _normalize_list(cfg.get(CONF_LLMVISION_CAMERAS, []))
+    cameras = [camera.lower() for camera in cameras]
     categories = _normalize_list(arguments.get("categories"))
     if not categories:
         categories = _normalize_list(cfg.get(CONF_LLMVISION_CATEGORIES, []))
+    categories = [category.lower() for category in categories]
 
     query = str(arguments.get("query", "") or "").strip().lower()
 
@@ -1092,16 +1152,22 @@ async def _execute_get_llmvision_events(
     if categories:
         payload["categories"] = categories
 
+    used_source = "service" if _llmvision_get_events_available(hass) else "compatibility"
     try:
-        response = await hass.services.async_call(
-            "llmvision",
-            "get_events",
-            payload,
-            blocking=True,
-            return_response=True,
-        )
+        if used_source == "service":
+            response = await hass.services.async_call(
+                "llmvision",
+                "get_events",
+                payload,
+                blocking=True,
+                return_response=True,
+            )
+        else:
+            response = await _query_llmvision_events_with_timeline(hass, payload)
     except Exception as err:
-        return {"error": f"Failed to query llmvision.get_events: {err}"}
+        if used_source == "service":
+            return {"error": f"Failed to query llmvision.get_events: {err}"}
+        return {"error": f"Failed to query LLM Vision timeline compatibility backend: {err}"}
 
     events_raw = response.get("events", []) if isinstance(response, dict) else []
     if not isinstance(events_raw, list):
@@ -1167,6 +1233,7 @@ async def _execute_get_llmvision_events(
             "categories": categories,
             "include_no_activity": include_no_activity,
         },
+        "source": used_source,
         "event_count": len(filtered),
         "events": filtered,
         "message": (

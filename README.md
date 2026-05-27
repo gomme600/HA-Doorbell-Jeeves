@@ -360,6 +360,10 @@ If you use the [LLM Vision integration](https://github.com/valentinfrlch/ha-llmv
    - max events per query,
    - optional camera/category filters.
 
+Jeeves supports both LLM Vision modes:
+- Native mode (`llmvision.get_events` service available)
+- Compatibility mode (service missing but LLM Vision timeline backend is installed)
+
 When enabled, Jeeves can answer questions like: "Did you recently see a football in the garden?"
 
 ---

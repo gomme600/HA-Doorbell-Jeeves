@@ -354,7 +354,7 @@
       }
     },
     "error": {
-      "llmvision_not_found": "LLM Vision is not installed or not fully configured (missing llmvision.get_events service)."
+      "llmvision_not_found": "LLM Vision is not installed or not loaded. Install/configure it first."
     }
   }
 }

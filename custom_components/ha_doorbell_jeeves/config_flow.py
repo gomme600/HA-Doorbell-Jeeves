@@ -500,11 +500,17 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
 
     async def async_step_timeline(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         """Configure optional LLM Vision timeline integration."""
-        llmvision_available = self.hass.services.has_service("llmvision", "get_events")
+        llmvision_entries = [
+            entry
+            for entry in self.hass.config_entries.async_entries("llmvision")
+            if entry.state == config_entries.ConfigEntryState.LOADED
+        ]
+        llmvision_get_events = self.hass.services.has_service("llmvision", "get_events")
+        llmvision_detected = bool(llmvision_entries) or llmvision_get_events
         errors: dict[str, str] = {}
         if user_input is not None:
             enabled = bool(user_input.get(CONF_LLMVISION_TIMELINE_ENABLED, False))
-            if enabled and not llmvision_available:
+            if enabled and not llmvision_detected:
                 errors["base"] = "llmvision_not_found"
             else:
                 updated = dict(user_input)
@@ -579,8 +585,10 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
             errors=errors,
             description_placeholders={
                 "status": (
-                    "Detected ✅"
-                    if llmvision_available
+                    "Detected ✅ (native get_events service available)"
+                    if llmvision_get_events
+                    else "Detected ✅ (compatibility mode: get_events service not exposed)"
+                    if llmvision_detected
                     else "Not detected ❌ (install and configure LLM Vision first)"
                 )
             },
