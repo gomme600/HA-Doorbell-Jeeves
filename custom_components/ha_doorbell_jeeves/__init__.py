@@ -9,6 +9,7 @@ configurable security policies.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 import voluptuous as vol
@@ -47,6 +48,18 @@ _LOGGER = logging.getLogger(__name__)
 
 # Type alias for runtime data stored on the config entry
 JeevesData = JeevesSessionManager
+
+
+def _normalize_action_id(action_id: str) -> str:
+    """Normalize action IDs to a safe tool/function name."""
+    slug = action_id.lower().replace(" ", "_").replace("-", "_")
+    slug = re.sub(r"[^a-z0-9_]+", "_", slug)
+    slug = re.sub(r"_+", "_", slug).strip("_")
+    if not slug:
+        slug = "action"
+    if slug[0].isdigit():
+        slug = f"action_{slug}"
+    return slug
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -250,18 +263,24 @@ def _register_services(hass: HomeAssistant) -> None:
             return
         steps = list(call.data.get("steps", []))
         service_data = dict(call.data.get("service_data", {}))
-        if not steps and service_data:
-            if any(key in service_data for key in ("action", "service", "target", "data")):
-                steps = []
-            else:
-                steps = []
         service = call.data.get("service") or ""
         if not service and steps:
             service = steps[0].get("action") or steps[0].get("service") or ""
         if not service and service_data:
             service = service_data.get("action") or service_data.get("service") or ""
+        if not service:
+            _LOGGER.error("Action '%s' has no service/step definition", call.data.get("action_id"))
+            return
+        normalized_action_id = _normalize_action_id(call.data["action_id"])
+        if normalized_action_id != call.data["action_id"]:
+            _LOGGER.info(
+                "Normalized action id '%s' -> '%s'",
+                call.data["action_id"],
+                normalized_action_id,
+            )
+        entity.actions = [action for action in entity.actions if action.id != normalized_action_id]
         action = EntityAction(
-            id=call.data["action_id"],
+            id=normalized_action_id,
             name=call.data["action_name"],
             description=call.data.get("description", ""),
             service=service,
@@ -283,8 +302,13 @@ def _register_services(hass: HomeAssistant) -> None:
         if not manager:
             return
         action_id = call.data["action_id"]
+        normalized_action_id = _normalize_action_id(action_id)
         for entity in manager.store.managed_entities:
-            entity.actions = [a for a in entity.actions if a.id != action_id]
+            entity.actions = [
+                action
+                for action in entity.actions
+                if action.id not in {action_id, normalized_action_id}
+            ]
         await manager.store.async_save_entities()
 
     hass.services.async_register(

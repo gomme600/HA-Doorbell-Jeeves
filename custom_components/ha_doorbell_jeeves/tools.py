@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -1013,4 +1014,11 @@ def _prepare_service_call(
 
 def _slugify(text: str) -> str:
     """Convert text to a safe slug for tool names."""
-    return text.lower().replace(" ", "_").replace("-", "_")
+    slug = text.lower().replace(" ", "_").replace("-", "_")
+    slug = re.sub(r"[^a-z0-9_]+", "_", slug)
+    slug = re.sub(r"_+", "_", slug).strip("_")
+    if not slug:
+        slug = "tool"
+    if slug[0].isdigit():
+        slug = f"tool_{slug}"
+    return slug

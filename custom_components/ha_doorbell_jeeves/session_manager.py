@@ -862,6 +862,10 @@ class JeevesSessionManager:
     async def _cleanup_after_end(self) -> None:
         """Clean up resources after an unexpected session end."""
         try:
+            for unsub in self._stop_unsubs:
+                unsub()
+            self._stop_unsubs.clear()
+
             if self._tool_router:
                 self._tool_router.stop()
             if self._talk_monitor:

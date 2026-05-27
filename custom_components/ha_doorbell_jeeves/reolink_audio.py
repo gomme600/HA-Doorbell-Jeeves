@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Any
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 import aiohttp
 
@@ -29,6 +30,37 @@ GO2RTC_BASE: str | None = None  # Resolved at runtime
 # Reolink RTSP URL patterns
 REOLINK_RTSP_MAIN = "rtsp://{user}:{password}@{host}:554/h264Preview_01_main"
 REOLINK_RTSP_SUB = "rtsp://{user}:{password}@{host}:554/h264Preview_01_sub"
+
+
+def _mask_stream_url(url: str) -> str:
+    """Redact credentials from RTSP/RTMP URLs before logging."""
+    try:
+        parsed = urlsplit(url)
+        netloc = parsed.netloc
+
+        if "@" in netloc:
+            userinfo, host = netloc.rsplit("@", 1)
+            if ":" in userinfo:
+                username, _password = userinfo.split(":", 1)
+                netloc = f"{username}:***@{host}"
+            else:
+                netloc = f"***@{host}"
+
+        query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+        if query_pairs:
+            redacted_pairs = []
+            for key, value in query_pairs:
+                if "pass" in key.lower() or "token" in key.lower():
+                    redacted_pairs.append((key, "***"))
+                else:
+                    redacted_pairs.append((key, value))
+            query = urlencode(redacted_pairs, doseq=True)
+        else:
+            query = parsed.query
+
+        return urlunsplit((parsed.scheme, netloc, parsed.path, query, parsed.fragment))
+    except Exception:
+        return "<redacted>"
 
 
 async def _discover_go2rtc_url(hass: HomeAssistant) -> str | None:
@@ -189,16 +221,11 @@ class ReolinkAudioHandler:
     """Handles 2-way audio for Reolink doorbells.
 
     Audio flow:
-      INPUT:  Visitor speaks → go2rtc WS (if available) OR camera snapshot-based
-      OUTPUT: AI responds → PCM 24kHz → ffmpeg → PCMA 8kHz → ffmpeg RTSP push to camera
+      INPUT:  Visitor speaks → RTSP/RTMP stream → ffmpeg decode → PCM 16kHz → AI
+      OUTPUT: AI responds → PCM 24kHz → ffmpeg resample → ADPCM → Baichuan talk
 
-    The output pipeline uses ffmpeg to push audio directly to the camera's
-    RTSP backchannel. This bypasses go2rtc's limitations with backchannel
-    (go2rtc WS is receive-only) by having ffmpeg maintain a persistent
-    RTSP ANNOUNCE session to the camera.
-
-    If RTSP is not available, falls back to the Reolink Baichuan protocol
-    by accessing the Host object from the HA Reolink integration.
+    Output uses native Baichuan protocol (port 9000). Input prefers RTSP and
+    automatically falls back to RTMP when RTSP is unavailable.
     """
 
     def __init__(
@@ -248,11 +275,11 @@ class ReolinkAudioHandler:
         # Start Baichuan talk output pipeline (ADPCM via port 9000)
         await self._start_output_pipeline()
 
-        # Start Baichuan audio input (doorbell mic → AI via cmd 3 stream)
-        await self._start_baichuan_audio_input()
+        # Start doorbell mic input (RTSP/RTMP → ffmpeg → PCM → AI)
+        await self._start_audio_input()
 
         _LOGGER.warning(
-            "Reolink audio handler started (stream=%s, host=%s, baichuan input=%s)",
+            "Reolink audio handler started (stream=%s, host=%s, mic input active=%s)",
             self._stream_name, self._reolink_host, self._listen_active,
         )
 
@@ -290,15 +317,13 @@ class ReolinkAudioHandler:
                     rtsp_url = await api.get_rtsp_stream_source(0, "sub", check=False)
                     if rtsp_url:
                         self._reolink_rtsp_url = rtsp_url
-                        _LOGGER.warning("Reolink RTSP URL: %s",
-                                       rtsp_url.replace(self._reolink_pass or "", "***"))
+                        _LOGGER.warning("Reolink RTSP URL: %s", _mask_stream_url(rtsp_url))
                 except Exception as exc:
                     _LOGGER.warning("Could not get RTSP details from Reolink Host: %s", exc)
 
         # Build RTSP URL from credentials if not discovered from API
         if not hasattr(self, "_reolink_rtsp_url") or not self._reolink_rtsp_url:
             if self._reolink_host and self._reolink_user and self._reolink_pass:
-                from urllib.parse import quote  # noqa: PLC0415
                 encoded_pass = quote(self._reolink_pass, safe="")
                 port = self._reolink_rtsp_port or 554
                 self._reolink_rtsp_url = (
@@ -965,7 +990,7 @@ class ReolinkAudioHandler:
 
     # ─── Audio Input (Mic Receive via RTSP/ffmpeg) ──────────────────────────────
 
-    async def _start_baichuan_audio_input(self) -> None:
+    async def _start_audio_input(self) -> None:
         """Start receiving audio from the doorbell mic via RTSP + ffmpeg.
 
         Uses ffmpeg to connect to the camera's RTSP stream and extract ONLY
@@ -975,8 +1000,9 @@ class ReolinkAudioHandler:
         because ffmpeg handles all protocol details (RTSP setup, RTP, codec
         detection, buffering, reconnection) natively.
         """
-        if not self._reolink_rtsp_url:
-            _LOGGER.warning("No RTSP URL available — audio input disabled")
+        has_fallback_creds = bool(self._reolink_host and self._reolink_user and self._reolink_pass is not None)
+        if not self._reolink_rtsp_url and not has_fallback_creds:
+            _LOGGER.warning("No stream URL or credentials available — audio input disabled")
             return
 
         self._listen_active = True
@@ -993,10 +1019,10 @@ class ReolinkAudioHandler:
         Sends 20ms PCM chunks to Gemini via the audio callback.
         """
         # Build list of URLs to try (sub first, then main stream, then RTMP)
-        urls_to_try = [self._reolink_rtsp_url]
+        urls_to_try = [self._reolink_rtsp_url] if self._reolink_rtsp_url else []
         if self._reolink_host and self._reolink_user and self._reolink_pass:
-            from urllib.parse import quote  # noqa: PLC0415
             encoded_pass = quote(self._reolink_pass, safe="")
+            encoded_query_pass = quote(self._reolink_pass, safe="")
             port = self._reolink_rtsp_port or 554
             base = f"rtsp://{self._reolink_user}:{encoded_pass}@{self._reolink_host}:{port}"
             # Add alternative URL patterns if not already in list
@@ -1007,22 +1033,20 @@ class ReolinkAudioHandler:
                 # RTMP fallback (Reolink cameras support this even when RTSP is disabled)
                 f"rtmp://{self._reolink_host}/bcs/channel0_sub.bcs"
                 f"?channel=0&stream=0&user={self._reolink_user}"
-                f"&password={self._reolink_pass}",
+                f"&password={encoded_query_pass}",
             ]
             for alt in alternatives:
                 if alt not in urls_to_try:
                     urls_to_try.append(alt)
 
         proc: asyncio.subprocess.Process | None = None
-        rtsp_url = ""
 
         for url in urls_to_try:
             if not self._active or not self._listen_active:
                 return
-            rtsp_url = url
             _LOGGER.warning(
                 "Audio input: trying %s",
-                url.split("@")[-1] if "@" in url else url.split("password=")[0] + "password=***",
+                _mask_stream_url(url),
             )
 
             # Build ffmpeg args — add RTSP-specific options only for rtsp:// URLs
@@ -1058,7 +1082,7 @@ class ReolinkAudioHandler:
                     pass
                 _LOGGER.warning(
                     "Audio input: ffmpeg failed for %s (rc=%d): %s",
-                    url.split("@")[-1] if "@" in url else url.split("password=")[0] + "...",
+                    _mask_stream_url(url),
                     proc.returncode,
                     stderr_data.decode(errors="replace").strip()[:300] if stderr_data else "no error",
                 )
@@ -1076,7 +1100,7 @@ class ReolinkAudioHandler:
                     pass
                 _LOGGER.warning(
                     "Audio input: ffmpeg failed for %s (rc=%d): %s",
-                    url.split("@")[-1] if "@" in url else url.split("password=")[0] + "...",
+                    _mask_stream_url(url),
                     proc.returncode,
                     stderr_data.decode(errors="replace").strip()[:300] if stderr_data else "no error",
                 )
@@ -1084,10 +1108,10 @@ class ReolinkAudioHandler:
                 continue
 
             # ffmpeg is still running — this URL works
-            _LOGGER.warning("Audio input: ffmpeg RTSP reader connected (PID=%d)", proc.pid)
+            _LOGGER.warning("Audio input: ffmpeg stream reader connected (PID=%d)", proc.pid)
             break
         else:
-            _LOGGER.warning("Audio input: all RTSP URLs failed — mic input disabled")
+            _LOGGER.warning("Audio input: all stream URLs failed — mic input disabled")
             self._listen_active = False
             return
 
@@ -1105,7 +1129,7 @@ class ReolinkAudioHandler:
                 if not first_logged:
                     first_logged = True
                     _LOGGER.warning(
-                        "✓ First audio from doorbell mic via RTSP (%d bytes PCM @ %dHz)",
+                        "✓ First audio from doorbell mic (%d bytes PCM @ %dHz)",
                         len(pcm_data), AUDIO_INPUT_SAMPLE_RATE,
                     )
 
@@ -1127,7 +1151,7 @@ class ReolinkAudioHandler:
                     stderr_data = await asyncio.wait_for(proc.stderr.read(2000), timeout=2.0)
                     if stderr_data:
                         _LOGGER.warning(
-                            "ffmpeg RTSP audio stderr: %s",
+                            "ffmpeg audio stderr: %s",
                             stderr_data.decode(errors="replace").strip()[:500],
                         )
                 except (asyncio.TimeoutError, Exception):
@@ -1139,7 +1163,7 @@ class ReolinkAudioHandler:
                     except Exception:
                         pass
             self._listen_active = False
-            _LOGGER.warning("Audio input: RTSP reader stopped (sent %d chunks)", chunks_sent)
+            _LOGGER.warning("Audio input: stream reader stopped (sent %d chunks)", chunks_sent)
 
 async def auto_configure_reolink(
     hass: HomeAssistant,
@@ -1166,7 +1190,8 @@ async def auto_configure_reolink(
     host = reolink_config["host"]
     user = reolink_config["username"]
     password = reolink_config["password"]
-    rtsp_url = REOLINK_RTSP_SUB.format(host=host, user=user, password=password)
+    encoded_password = quote(password, safe="")
+    rtsp_url = REOLINK_RTSP_SUB.format(host=host, user=user, password=encoded_password)
 
     # Create a unique stream name
     stream_name = f"jeeves_{camera_entity_id.replace('.', '_')}"

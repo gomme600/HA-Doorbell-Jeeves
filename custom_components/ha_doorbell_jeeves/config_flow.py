@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from copy import deepcopy
 from typing import Any
 
@@ -365,7 +366,6 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
         self._data: dict[str, Any] = dict(config_entry.data) | dict(config_entry.options)
         self._entity_edit: dict[str, Any] = {}
         self._action_edit: dict[str, Any] = {}
-        self._identity_edit: dict[str, Any] = {}
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         return self.async_show_menu(
@@ -650,7 +650,9 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
         if user_input is not None:
             entity = store.get_entity(user_input["target_entity"])
             if entity:
-                entity.actions.append(self._build_action_from_input(user_input))
+                new_action = self._build_action_from_input(user_input)
+                entity.actions = [action for action in entity.actions if action.id != new_action.id]
+                entity.actions.append(new_action)
                 await store.async_add_entity(entity)
             return await self.async_step_entities()
         return self.async_show_form(
@@ -662,7 +664,11 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
         store = await self._async_get_store()
         if user_input is not None:
             global_entity = await self._ensure_global_actions_entity(store)
-            global_entity.actions.append(self._build_action_from_input(user_input))
+            new_action = self._build_action_from_input(user_input)
+            global_entity.actions = [
+                action for action in global_entity.actions if action.id != new_action.id
+            ]
+            global_entity.actions.append(new_action)
             await store.async_add_entity(global_entity)
             return await self.async_step_entities()
         return self.async_show_form(
@@ -751,11 +757,28 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                 )
             )
             return await self.async_step_entities()
+
+        notify_services = sorted(
+            service
+            for service in self.hass.services.async_services().get("notify", {}).keys()
+            if service != "reload"
+        )
+        if notify_services:
+            service_selector: Any = SelectSelector(
+                SelectSelectorConfig(
+                    options=[{"value": f"notify.{service}", "label": f"notify.{service}"} for service in notify_services],
+                    mode=SelectSelectorMode.DROPDOWN,
+                    custom_value=True,
+                )
+            )
+        else:
+            service_selector = TextSelector(TextSelectorConfig(type="text"))
+
         return self.async_show_form(
             step_id="add_notification",
             data_schema=vol.Schema(
                 {
-                    vol.Required("service"): TextSelector(TextSelectorConfig(type="text")),
+                    vol.Required("service"): service_selector,
                     vol.Required("name"): TextSelector(),
                     vol.Required("description"): TextSelector(TextSelectorConfig(multiline=True)),
                 }
@@ -1192,6 +1215,8 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
         return f"{entity_id}::{action_id}"
 
     def _decode_action_ref(self, action_ref: str) -> tuple[str, str]:
+        if "::" not in action_ref:
+            return action_ref, action_ref
         return tuple(action_ref.split("::", 1))  # type: ignore[return-value]
 
     def _security_selector(self) -> SelectSelector:
@@ -1203,7 +1228,14 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
         )
 
     def _slugify(self, text: str) -> str:
-        return text.lower().replace(" ", "_").replace("-", "_")
+        slug = text.lower().replace(" ", "_").replace("-", "_")
+        slug = re.sub(r"[^a-z0-9_]+", "_", slug)
+        slug = re.sub(r"_+", "_", slug).strip("_")
+        if not slug:
+            slug = "action"
+        if slug[0].isdigit():
+            slug = f"action_{slug}"
+        return slug
 
     async def _download_image_as_base64(self, url: str) -> str | None:
         import aiohttp  # noqa: PLC0415

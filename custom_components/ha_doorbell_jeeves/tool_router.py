@@ -242,10 +242,11 @@ class ToolRouter:
         ]
 
         try:
+            chat_tools = self._normalize_openai_chat_tools(self._tools)
             response = await client.chat.completions.create(
                 model=self._model,
                 messages=messages,
-                tools=self._tools if self._tools else None,
+                tools=chat_tools if chat_tools else None,
                 tool_choice="auto",
                 temperature=0.1,
             )
@@ -300,3 +301,25 @@ class ToolRouter:
             "If yes, call them. If no, respond with 'No action needed.' ---"
         )
         return "\n".join(parts)
+
+    def _normalize_openai_chat_tools(self, tools: list[Any]) -> list[Any]:
+        """Normalize tool schema for OpenAI chat completions."""
+        normalized: list[Any] = []
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            if "function" in tool:
+                normalized.append(tool)
+                continue
+            if tool.get("type") == "function" and "name" in tool:
+                normalized.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": tool.get("name", ""),
+                            "description": tool.get("description", ""),
+                            "parameters": tool.get("parameters", {"type": "object", "properties": {}}),
+                        },
+                    }
+                )
+        return normalized
