@@ -51,6 +51,7 @@ class GeminiLiveClient(BaseRealtimeClient):
         self._receive_task: asyncio.Task[None] | None = None
         self._connected = False
         self._conversation_turns: list[dict[str, str]] = []
+        self._recap_future: asyncio.Future[str] | None = None
 
     @property
     def connected(self) -> bool:
@@ -71,7 +72,7 @@ class GeminiLiveClient(BaseRealtimeClient):
         )
 
         live_config = types.LiveConnectConfig(
-            response_modalities=["AUDIO"],
+            response_modalities=["AUDIO", "TEXT"],
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=self._voice)
@@ -150,6 +151,61 @@ class GeminiLiveClient(BaseRealtimeClient):
         except Exception:
             _LOGGER.exception("Failed to inject context")
 
+    async def request_recap(self, outcome: str, timeout: float = 8.0) -> dict[str, str] | None:
+        """Ask the live model to generate a session recap as text before disconnecting.
+
+        The model already has full context of the conversation. We ask it to output
+        a structured JSON recap. This avoids a separate text-model API call and uses
+        the live session's unlimited quota.
+
+        Returns parsed recap dict or None on failure/timeout.
+        """
+        if not self._session or not self._connected:
+            return None
+
+        # Set up a future to capture the next text response
+        self._recap_future: asyncio.Future[str] = asyncio.get_event_loop().create_future()
+
+        prompt = (
+            "[SYSTEM] The conversation has ended. Generate a brief JSON recap with these keys:\n"
+            '- "visitor_name": name if known, else ""\n'
+            '- "visitor_description": brief visual description of the visitor\n'
+            '- "summary": 1-2 sentence summary of what happened\n'
+            '- "outcome": the interaction result\n'
+            f"Session end reason: {outcome}\n"
+            "Respond ONLY with the JSON object, no other text or audio."
+        )
+
+        try:
+            await self._session.send(
+                input=types.LiveClientContent(
+                    turns=[types.Content(role="user", parts=[types.Part(text=prompt)])],
+                    turn_complete=True,
+                )
+            )
+            # Wait for text response (captured by _process via _recap_future)
+            text_response = await asyncio.wait_for(self._recap_future, timeout=timeout)
+            # Try to parse JSON from response
+            import json  # noqa: PLC0415
+            # Strip any markdown code fences
+            clean = text_response.strip()
+            if clean.startswith("```"):
+                clean = clean.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+            recap = json.loads(clean)
+            return {
+                "visitor_description": recap.get("visitor_description", ""),
+                "summary": recap.get("summary", ""),
+                "outcome": recap.get("outcome", outcome),
+                "visitor_name": recap.get("visitor_name", ""),
+            }
+        except asyncio.TimeoutError:
+            _LOGGER.debug("Live recap request timed out after %.1fs", timeout)
+        except Exception:
+            _LOGGER.debug("Live recap parsing failed", exc_info=True)
+        finally:
+            self._recap_future = None  # type: ignore[assignment]
+        return None
+
     async def _inject_reference_images(self) -> None:
         if not self._reference_images:
             return
@@ -216,6 +272,9 @@ class GeminiLiveClient(BaseRealtimeClient):
                 elif part.text:
                     self._conversation_turns.append({"role": "assistant", "text": part.text})
                     self._on_transcript("assistant", part.text)
+                    # Resolve recap future if waiting
+                    if hasattr(self, "_recap_future") and self._recap_future and not self._recap_future.done():
+                        self._recap_future.set_result(part.text)
 
         if server_content and hasattr(server_content, "input_transcription"):
             t = getattr(server_content, "input_transcription", None)

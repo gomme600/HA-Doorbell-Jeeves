@@ -106,9 +106,9 @@ CONF_REOLINK_ENTRY_ID = "reolink_entry_id"
 # ─── Defaults ─────────────────────────────────────────────────────────────────
 
 DEFAULT_PROVIDER = PROVIDER_GEMINI
-DEFAULT_MODEL_GEMINI = "gemini-2.5-flash-native-audio-latest"
+DEFAULT_MODEL_GEMINI = "gemini-2.5-flash-native-audio-dialog"
 DEFAULT_MODEL_OPENAI = "gpt-4o-realtime-preview"
-DEFAULT_TOOL_MODEL_GEMINI = "gemini-2.5-flash"
+DEFAULT_TOOL_MODEL_GEMINI = "gemini-3.1-flash-lite"
 DEFAULT_TOOL_MODEL_OPENAI = "gpt-4.1"
 DEFAULT_VISION_FPS = 1.0
 DEFAULT_SESSION_TIMEOUT = 120
@@ -124,7 +124,7 @@ DEFAULT_VOICE_OPENAI = "alloy"
 DEFAULT_FRAME_MAX_WIDTH = 640
 DEFAULT_FRAME_MAX_HEIGHT = 480
 DEFAULT_FRAME_QUALITY = 70
-DEFAULT_VALIDATOR_MODEL = "gemini-2.5-flash"
+DEFAULT_VALIDATOR_MODEL = "gemini-3.1-flash-lite"
 
 DEFAULT_SYSTEM_PROMPT = """\
 You are Jeeves, a polite, efficient, and security-conscious digital concierge \

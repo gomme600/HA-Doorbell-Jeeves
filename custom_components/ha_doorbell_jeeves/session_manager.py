@@ -275,17 +275,10 @@ class JeevesSessionManager:
             provider = config.get(CONF_PROVIDER, PROVIDER_GEMINI)
             api_key: str = config[CONF_API_KEY]
             model: str = config.get(CONF_MODEL, DEFAULT_MODEL_GEMINI)
-            _INVALID_MODELS = {"gemini-2.5-flash-native-audio-dialog"}
-            if model in _INVALID_MODELS:
-                model = DEFAULT_MODEL_GEMINI
-                _LOGGER.warning("Replaced invalid model %s → %s", config.get(CONF_MODEL), model)
             dual_model = config.get(CONF_DUAL_MODEL_ENABLED, False)
             model_lacks_native_tools = (
                 provider == PROVIDER_GEMINI
-                and (
-                    model.startswith("gemini-2.5-flash-native-audio")
-                    or model == "gemini-2.5-flash-native-audio-dialog"
-                )
+                and model.startswith("gemini-") and "native-audio" in model
             )
             if model_lacks_native_tools and not dual_model:
                 _LOGGER.warning(
@@ -453,11 +446,19 @@ class JeevesSessionManager:
         self._silence_task = None
         self._ai_speaking_clear_task = None
 
+        # Request recap from the live model BEFORE disconnecting (it has full context)
+        live_recap: dict[str, str] | None = None
+        if self._client and self._client.connected:
+            try:
+                live_recap = await self._client.request_recap(reason)
+            except Exception:
+                _LOGGER.debug("Live recap request failed", exc_info=True)
+
         if self._client:
             await self._client.disconnect()
             self._client = None
 
-        await self._store_session_memory(reason)
+        await self._store_session_memory(reason, live_recap=live_recap)
         self._session_start_snapshot = ""  # Free memory
         self.hass.bus.async_fire(EVENT_SESSION_ENDED, {"entry_id": self.entry.entry_id})
         _LOGGER.info("Session ended (audit entries: %d)", len(self._security.audit_log))
@@ -1191,7 +1192,9 @@ class JeevesSessionManager:
             lines.append(f"- {visitor}: {memory.summary} [{memory.outcome}]")
         return "Recent memories:\n" + "\n".join(lines)
 
-    async def _store_session_memory(self, outcome: str) -> None:
+    async def _store_session_memory(
+        self, outcome: str, *, live_recap: dict[str, str] | None = None
+    ) -> None:
         """Generate and store a recap of the finished session."""
         if self._session_memory_saved or not self._session_started_at:
             return
@@ -1200,7 +1203,15 @@ class JeevesSessionManager:
         # Prefer the snapshot captured at session start (camera was definitely available)
         # Fall back to attempting a fresh capture at session end
         snapshot_b64 = self._session_start_snapshot or await self._capture_memory_snapshot()
-        recap = await self._generate_session_recap(outcome, snapshot_b64)
+
+        # Use live recap from the audio model (already had full context, no extra API call)
+        # Fall back to text-model recap or heuristic if live recap unavailable
+        if live_recap and live_recap.get("summary"):
+            recap = live_recap
+            _LOGGER.info("Using live model recap for memory")
+        else:
+            recap = await self._generate_session_recap(outcome, snapshot_b64)
+
         memory = SessionMemory(
             timestamp=timestamp,
             duration_seconds=duration_seconds,

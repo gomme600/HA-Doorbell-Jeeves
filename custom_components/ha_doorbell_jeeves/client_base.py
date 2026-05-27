@@ -39,3 +39,11 @@ class BaseRealtimeClient(ABC):
     @abstractmethod
     async def inject_context(self, text: str) -> None:
         """Inject a text context message into the session (for tool results in dual-model mode)."""
+
+    async def request_recap(self, outcome: str, timeout: float = 8.0) -> dict[str, str] | None:
+        """Request a session recap from the live model before disconnecting.
+
+        Default implementation returns None (not supported). Override in clients
+        that support text output from the live session.
+        """
+        return None

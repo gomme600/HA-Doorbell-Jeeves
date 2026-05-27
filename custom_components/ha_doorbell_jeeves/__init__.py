@@ -83,16 +83,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await _register_frontend_resources(hass)
         internal_data[_INTERNAL_FRONTEND_RESOURCES] = True
 
-    # ─── Data migration: fix invalid model names from older configs ───
-    _INVALID_MODELS = {"gemini-2.5-flash-native-audio-dialog"}
+    # ─── Data migration: fix model names from older configs ───
     stored_model = entry.data.get(CONF_MODEL) or entry.options.get(CONF_MODEL)
-    if stored_model in _INVALID_MODELS:
+    _MODEL_MIGRATIONS = {
+        "gemini-2.5-flash-native-audio-latest": "gemini-2.5-flash-native-audio-dialog",
+    }
+    if stored_model in _MODEL_MIGRATIONS:
         new_data = dict(entry.data)
-        new_data[CONF_MODEL] = DEFAULT_MODEL_GEMINI
+        new_data[CONF_MODEL] = _MODEL_MIGRATIONS[stored_model]
         hass.config_entries.async_update_entry(entry, data=new_data)
         _LOGGER.info(
             "Migrated model %s → %s for entry %s",
-            stored_model, DEFAULT_MODEL_GEMINI, entry.entry_id[:8],
+            stored_model, _MODEL_MIGRATIONS[stored_model], entry.entry_id[:8],
         )
 
     # Create session manager
