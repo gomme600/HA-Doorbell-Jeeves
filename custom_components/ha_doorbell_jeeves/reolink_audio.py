@@ -1095,7 +1095,7 @@ class ReolinkAudioHandler:
         During FDX (Full Duplex) talk, the camera sends mic audio back as
         CMD 202 packets — same format as what we send to the speaker.
 
-        We intercept at the protocol's bc_data_received level because the
+        We intercept at the protocol's parse_bc_data level because the
         library's normal parsing may drop CMD 202 packets with status=0
         (treats them as "unrequested messages with bad status code").
 
@@ -1106,11 +1106,40 @@ class ReolinkAudioHandler:
             return False
 
         # Find the protocol instance where data arrives
+        # Structure: bc._connection._protocol (BaichuanTcpClientProtocol)
         protocol = None
-        if hasattr(bc, "_connection") and bc._connection:
-            protocol = getattr(bc._connection, "_protocol", None)
+        connection = getattr(bc, "_connection", None)
+        if connection:
+            protocol = getattr(connection, "_protocol", None)
+            _LOGGER.info(
+                "Baichuan connection found: type=%s, protocol=%s, transport=%s",
+                type(connection).__name__,
+                type(protocol).__name__ if protocol else "None",
+                "yes" if getattr(connection, "_transport", None) else "no",
+            )
+        else:
+            _LOGGER.warning("Baichuan bc._connection is None")
+
         if not protocol:
-            _LOGGER.warning("Cannot install audio intercept: no protocol found on Baichuan connection")
+            # Try alternative paths
+            if hasattr(bc, "_protocol"):
+                protocol = bc._protocol
+                _LOGGER.info("Found protocol via bc._protocol")
+            elif connection and hasattr(connection, "protocol"):
+                protocol = connection.protocol
+                _LOGGER.info("Found protocol via connection.protocol")
+
+        if not protocol:
+            _LOGGER.warning(
+                "Cannot install audio intercept: no protocol found. "
+                "bc attrs: %s, connection attrs: %s",
+                [a for a in dir(bc) if not a.startswith("__")][:20],
+                [a for a in dir(connection) if not a.startswith("__")][:20] if connection else "N/A",
+            )
+            return False
+
+        if not hasattr(protocol, "parse_bc_data"):
+            _LOGGER.warning("Protocol has no parse_bc_data method — cannot intercept")
             return False
 
         # Patch parse_bc_data to intercept CMD 202 before status code filtering
