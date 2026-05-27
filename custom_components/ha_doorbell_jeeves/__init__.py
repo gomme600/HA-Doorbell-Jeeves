@@ -154,18 +154,26 @@ async def _register_frontend_resources(hass: HomeAssistant) -> None:
     if not card_path.exists():
         _LOGGER.warning("Memory timeline card file missing: %s", card_path)
         return
-    if hasattr(hass.http, "async_register_static_paths"):
-        from homeassistant.components.http import StaticPathConfig  # noqa: PLC0415
 
-        await hass.http.async_register_static_paths(
-            [StaticPathConfig(_MEMORY_TIMELINE_CARD_URL, str(card_path), cache_headers=False)]
-        )
-    else:
-        hass.http.register_static_path(
-            _MEMORY_TIMELINE_CARD_URL,
-            str(card_path),
-            cache_headers=False,
-        )
+    # Serve the card JS via a custom view with the correct MIME type
+    from aiohttp import web  # noqa: PLC0415
+
+    from homeassistant.components.http import HomeAssistantView  # noqa: PLC0415
+
+    class _CardJSView(HomeAssistantView):
+        """Serve the memory timeline card JavaScript with correct MIME."""
+
+        url = _MEMORY_TIMELINE_CARD_URL
+        name = f"api:{DOMAIN}:card_js"
+        requires_auth = False  # Frontend resources must load without auth
+
+        async def get(self, request: web.Request) -> web.FileResponse:
+            return web.FileResponse(
+                card_path,
+                headers={"Content-Type": "application/javascript; charset=utf-8"},
+            )
+
+    hass.http.register_view(_CardJSView())
 
     # Tell the HA frontend to load the card JS on every page
     from homeassistant.components.frontend import add_extra_js_url  # noqa: PLC0415
