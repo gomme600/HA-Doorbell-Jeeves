@@ -50,6 +50,7 @@ from .const import (
     CONF_TAKEOVER_ENERGY_THRESHOLD,
     CONF_TAKEOVER_POLL_INTERVAL,
     CONF_TAKEOVER_REOLINK_API,
+    CONF_TEXT_MODEL,
     CONF_TOOL_API_KEY,
     CONF_TOOL_BASE_URL,
     CONF_TOOL_MODEL,
@@ -65,6 +66,7 @@ from .const import (
     DEFAULT_SESSION_TIMEOUT,
     DEFAULT_SILENCE_TIMEOUT,
     DEFAULT_SYSTEM_PROMPT,
+    DEFAULT_TEXT_MODEL_GEMINI,
     DEFAULT_TOOL_MODEL_GEMINI,
     DEFAULT_TOOL_MODEL_OPENAI,
     DEFAULT_VISION_FPS,
@@ -1256,13 +1258,12 @@ class JeevesSessionManager:
         """Use Gemini to summarize the session, with a safe fallback."""
         transcript_text = self._conversation_text()
         provider = self._config.get(CONF_PROVIDER, PROVIDER_GEMINI)
-        tool_provider = self._config.get(CONF_TOOL_PROVIDER) or provider
         voice_api_key = self._config.get(CONF_API_KEY, "")
-        api_key = ""
-        if tool_provider == PROVIDER_GEMINI:
-            api_key = self._config.get(CONF_TOOL_API_KEY) or voice_api_key
-        elif provider == PROVIDER_GEMINI:
-            api_key = voice_api_key
+        # Use text model API key (fall back to tool key, then voice key)
+        api_key = (
+            self._config.get(CONF_TOOL_API_KEY)
+            or voice_api_key
+        )
         if not api_key:
             return self._fallback_session_recap(outcome)
 
@@ -1270,10 +1271,11 @@ class JeevesSessionManager:
             from google import genai  # noqa: PLC0415
             from google.genai import types  # noqa: PLC0415
 
+            # Prefer explicit text_model, fall back to tool_model, then default
             model = (
-                self._config.get(CONF_TOOL_MODEL) or DEFAULT_TOOL_MODEL_GEMINI
-                if tool_provider == PROVIDER_GEMINI
-                else DEFAULT_TOOL_MODEL_GEMINI
+                self._config.get(CONF_TEXT_MODEL)
+                or self._config.get(CONF_TOOL_MODEL)
+                or DEFAULT_TEXT_MODEL_GEMINI
             )
             client = await asyncio.to_thread(genai.Client, api_key=api_key)
             parts: list[Any] = [

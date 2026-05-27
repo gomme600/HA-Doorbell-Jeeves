@@ -69,6 +69,7 @@ from .const import (
     CONF_SESSION_TIMEOUT,
     CONF_STOP_ENTITIES,
     CONF_SYSTEM_PROMPT,
+    CONF_TEXT_MODEL,
     CONF_TOOL_API_KEY,
     CONF_TOOL_BASE_URL,
     CONF_TOOL_MODEL,
@@ -88,6 +89,7 @@ from .const import (
     DEFAULT_MODEL_OPENAI,
     DEFAULT_SESSION_TIMEOUT,
     DEFAULT_SYSTEM_PROMPT,
+    DEFAULT_TEXT_MODEL_GEMINI,
     DEFAULT_TOOL_MODEL_GEMINI,
     DEFAULT_TOOL_MODEL_OPENAI,
     DEFAULT_VALIDATOR_MODEL,
@@ -228,6 +230,53 @@ def _sync_manual_stream_fields(data: dict[str, Any]) -> None:
     output_for_legacy = _clean_text(data.get(CONF_GO2RTC_OUTPUT_STREAM_NAME, ""))
     if output_for_legacy:
         data[CONF_GO2RTC_STREAM_NAME] = output_for_legacy
+
+
+async def _check_model_capabilities(
+    hass: Any, provider: str, api_key: str, model_name: str
+) -> dict[str, bool]:
+    """Query the model's capabilities to determine what it supports.
+
+    Returns dict with keys: supports_text_output, supports_tools, supports_audio_output.
+    """
+    caps: dict[str, bool] = {
+        "supports_text_output": True,
+        "supports_tools": True,
+        "supports_audio_output": False,
+    }
+    if provider != PROVIDER_GEMINI or not api_key or not model_name:
+        return caps
+
+    try:
+        from google import genai  # noqa: PLC0415
+
+        def _get_model_info() -> dict[str, bool]:
+            client = genai.Client(api_key=api_key)
+            try:
+                model_info = client.models.get(model=f"models/{model_name}")
+            except Exception:
+                try:
+                    model_info = client.models.get(model=model_name)
+                except Exception:
+                    return caps  # Unknown model, assume full caps
+
+            result = {
+                "supports_text_output": True,
+                "supports_tools": True,
+                "supports_audio_output": False,
+            }
+
+            # For native audio dialog models, they output audio only (not text)
+            if "native-audio" in model_name or "audio-dialog" in model_name:
+                result["supports_audio_output"] = True
+                result["supports_text_output"] = False
+
+            return result
+
+        return await hass.async_add_executor_job(_get_model_info)
+    except Exception as err:
+        _LOGGER.debug("Model capability check failed: %s", err)
+    return caps
 
 
 class DoorbellJeevesConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -415,6 +464,7 @@ class DoorbellJeevesConfigFlow(ConfigFlow, domain=DOMAIN):
 
     async def async_step_provider(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         errors: dict[str, str] = {}
+        description_placeholders: dict[str, str] = {}
         provider = self._data.get(CONF_PROVIDER, PROVIDER_GEMINI)
         default_model = DEFAULT_MODEL_GEMINI if provider == PROVIDER_GEMINI else DEFAULT_MODEL_OPENAI
         default_voice = DEFAULT_VOICE_GEMINI if provider == PROVIDER_GEMINI else DEFAULT_VOICE_OPENAI
@@ -426,7 +476,19 @@ class DoorbellJeevesConfigFlow(ConfigFlow, domain=DOMAIN):
                 user_input.get(CONF_API_BASE_URL),
             )
             if valid:
+                # Check model capabilities to inform user
+                caps = await _check_model_capabilities(
+                    self.hass,
+                    user_input[CONF_PROVIDER],
+                    user_input[CONF_API_KEY],
+                    user_input[CONF_MODEL],
+                )
                 self._data.update(user_input)
+                self._data["_model_caps"] = caps
+                if not caps["supports_text_output"]:
+                    # Auto-set text model if voice model can't output text
+                    if not self._data.get(CONF_TEXT_MODEL):
+                        self._data[CONF_TEXT_MODEL] = DEFAULT_TEXT_MODEL_GEMINI
                 return await self.async_step_camera()
             errors["base"] = "invalid_api_key"
 
@@ -452,6 +514,7 @@ class DoorbellJeevesConfigFlow(ConfigFlow, domain=DOMAIN):
                 }
             ),
             errors=errors,
+            description_placeholders=description_placeholders,
         )
 
     async def async_step_camera(self, user_input: dict[str, Any] | None = None) -> FlowResult:
@@ -611,11 +674,21 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
 
     async def async_step_general(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         if user_input is not None:
+            # Check capabilities of the selected voice model
+            caps = await _check_model_capabilities(
+                self.hass,
+                user_input.get(CONF_PROVIDER, self._data.get(CONF_PROVIDER, PROVIDER_GEMINI)),
+                user_input.get(CONF_API_KEY, self._data.get(CONF_API_KEY, "")),
+                user_input.get(CONF_MODEL, ""),
+            )
+            if not caps["supports_text_output"] and not user_input.get(CONF_TEXT_MODEL):
+                user_input[CONF_TEXT_MODEL] = DEFAULT_TEXT_MODEL_GEMINI
             self._data.update(user_input)
             return self._save_options()
         provider = self._data.get(CONF_PROVIDER, PROVIDER_GEMINI)
         default_model = DEFAULT_MODEL_GEMINI if provider == PROVIDER_GEMINI else DEFAULT_MODEL_OPENAI
         default_voice = DEFAULT_VOICE_GEMINI if provider == PROVIDER_GEMINI else DEFAULT_VOICE_OPENAI
+        default_text_model = self._data.get(CONF_TEXT_MODEL) or DEFAULT_TEXT_MODEL_GEMINI
         return self.async_show_form(
             step_id="general",
             data_schema=vol.Schema(
@@ -637,6 +710,7 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                     ),
                     vol.Required(CONF_MODEL, default=self._data.get(CONF_MODEL, default_model)): TextSelector(),
                     vol.Required(CONF_VOICE, default=self._data.get(CONF_VOICE, default_voice)): TextSelector(),
+                    vol.Optional(CONF_TEXT_MODEL, default=default_text_model): TextSelector(),
                     vol.Required(
                         CONF_SESSION_TIMEOUT,
                         default=self._data.get(CONF_SESSION_TIMEOUT, DEFAULT_SESSION_TIMEOUT),

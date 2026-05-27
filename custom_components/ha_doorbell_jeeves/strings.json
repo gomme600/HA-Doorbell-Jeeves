@@ -96,13 +96,14 @@
       },
       "general": {
         "title": "General Settings",
-        "description": "Configure the AI provider, model, and session behavior.",
+        "description": "Configure the AI provider, model, and session behavior. The Text Model is used for memory recaps and summaries (required when the voice model is audio-only).",
         "data": {
           "provider": "AI Provider",
           "api_key": "API Key",
           "api_base_url": "API Base URL (optional)",
-          "model": "Model Name",
+          "model": "Voice Model Name",
           "voice": "Voice Name",
+          "text_model": "Text Model (for recaps/memories)",
           "session_timeout": "Session Timeout",
           "memory_retention_days": "Memory Retention (days)",
           "validator_model": "Security Validator Model"

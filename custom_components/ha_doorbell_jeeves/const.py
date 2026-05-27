@@ -29,6 +29,7 @@ CONF_TOOL_MODEL = "tool_model"
 CONF_TOOL_PROVIDER = "tool_provider"
 CONF_TOOL_API_KEY = "tool_api_key"
 CONF_TOOL_BASE_URL = "tool_base_url"
+CONF_TEXT_MODEL = "text_model"
 
 CONF_VISION_FPS = "vision_fps"
 CONF_FRAME_MAX_WIDTH = "frame_max_width"
@@ -110,6 +111,7 @@ DEFAULT_MODEL_GEMINI = "gemini-2.5-flash-native-audio-dialog"
 DEFAULT_MODEL_OPENAI = "gpt-4o-realtime-preview"
 DEFAULT_TOOL_MODEL_GEMINI = "gemini-3.1-flash-lite"
 DEFAULT_TOOL_MODEL_OPENAI = "gpt-4.1"
+DEFAULT_TEXT_MODEL_GEMINI = "gemini-3.1-flash-lite"
 DEFAULT_VISION_FPS = 1.0
 DEFAULT_SESSION_TIMEOUT = 120
 DEFAULT_SILENCE_TIMEOUT = 30.0
