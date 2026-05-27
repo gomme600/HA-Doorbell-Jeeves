@@ -1895,124 +1895,149 @@ class ReolinkAudioHandler:
             if not entity:
                 return None
 
-            # Use the camera entity's create_stream method
+            # Try to create and start a stream
+            stream = None
             if hasattr(entity, "async_create_stream"):
-                stream = await entity.async_create_stream()
-                if stream:
-                    # Start the stream and get HLS endpoint
-                    await stream.async_add_provider("hls")
+                try:
+                    stream = await entity.async_create_stream()
+                except Exception:
+                    pass
+
+            if not stream and hasattr(entity, "stream"):
+                stream = entity.stream
+
+            if stream:
+                try:
+                    # Ensure HLS provider is active
+                    if hasattr(stream, "add_provider"):
+                        stream.add_provider("hls")
+                    elif hasattr(stream, "async_add_provider"):
+                        await stream.async_add_provider("hls")
                     await stream.start()
-                    hls_path = stream.endpoint_url("hls")
+
+                    hls_path = None
+                    if hasattr(stream, "endpoint_url"):
+                        hls_path = stream.endpoint_url("hls")
+                    elif hasattr(stream, "hls_url"):
+                        hls_path = stream.hls_url
+
                     if hls_path:
-                        # Construct full internal URL (accessible from localhost)
-                        ha_port = self._hass.config.api.port if self._hass.config.api else 8123
+                        # Construct full internal URL accessible from localhost
+                        ha_port = 8123
+                        if hasattr(self._hass.config, "api") and self._hass.config.api:
+                            ha_port = self._hass.config.api.port or 8123
                         url = f"http://127.0.0.1:{ha_port}{hls_path}"
                         _LOGGER.warning("Audio input: using HA HLS stream: %s", hls_path)
                         return url
-
-            # Fallback: use the camera/stream WebSocket-style call
-            from homeassistant.components.camera import async_get_stream
-            stream = await async_get_stream(self._hass, camera_entity)
-            if stream:
-                hls_path = stream.endpoint_url("hls")
-                if hls_path:
-                    ha_port = self._hass.config.api.port if self._hass.config.api else 8123
-                    url = f"http://127.0.0.1:{ha_port}{hls_path}"
-                    _LOGGER.warning("Audio input: using HA HLS stream (fallback): %s", hls_path)
-                    return url
+                except Exception as exc:
+                    _LOGGER.debug("Could not start HLS stream: %s", exc)
         except Exception as exc:
-            _LOGGER.debug("Could not get HLS stream URL: %s", exc, exc_info=True)
+            _LOGGER.debug("Could not get HLS stream URL: %s", exc)
         return None
 
     async def _audio_input_loop(self, urls_to_try: list[str]) -> None:
         """Read audio from the best available source via ffmpeg.
 
-        Tries each URL in priority order until one works.
-        Sends 20ms PCM chunks (640 bytes at 16kHz) to Gemini.
+        Tries each URL in priority order until one works. Retries up to
+        MAX_RETRIES times with increasing delay if all URLs fail on first pass
+        (handles intermittent RTSP auth failures on Reolink cameras).
         """
-
+        MAX_RETRIES = 5
         proc: asyncio.subprocess.Process | None = None
 
-        for url in urls_to_try:
+        for attempt in range(MAX_RETRIES + 1):
             if not self._active or not self._listen_active:
                 return
-            _LOGGER.warning(
-                "Audio input: trying %s",
-                _mask_stream_url(url),
-            )
 
-            # Build ffmpeg args with protocol-specific options
-            ffmpeg_args = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats"]
-            if url.startswith("rtsp://"):
-                ffmpeg_args.extend(["-rtsp_transport", "tcp"])
-            elif url.startswith("rtmp://"):
-                # RTMP: use live stream mode with low latency
-                ffmpeg_args.extend(["-live_start_index", "-1"])
-            elif "m3u8" in url or "/hls/" in url:
-                # HLS: start from the live edge for lowest latency
-                ffmpeg_args.extend(["-live_start_index", "-1"])
-            elif url.startswith("https://"):
-                # HTTPS FLV: allow self-signed certs (Reolink cameras)
-                ffmpeg_args.extend(["-tls_verify", "0"])
-            ffmpeg_args.extend([
-                "-i", url,
-                "-vn",  # No video — audio only
-                "-acodec", "pcm_s16le",
-                "-ar", str(AUDIO_INPUT_SAMPLE_RATE),
-                "-ac", "1",
-                "-f", "s16le",
-                "pipe:1",
-            ])
-
-            proc = await asyncio.create_subprocess_exec(
-                *ffmpeg_args,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-
-            # Wait briefly to see if ffmpeg connects or dies immediately
-            # Connection refused exits almost instantly; real connections take longer
-            await asyncio.sleep(0.5)
-            if proc.returncode is not None:
-                # Fast failure — read error and try next URL
-                stderr_data = b""
-                try:
-                    stderr_data = await asyncio.wait_for(proc.stderr.read(2000), timeout=1.0)
-                except Exception:
-                    pass
+            if attempt > 0:
+                delay = min(3.0 * attempt, 10.0)
                 _LOGGER.warning(
-                    "Audio input: ffmpeg failed for %s (rc=%d): %s",
-                    _mask_stream_url(url),
-                    proc.returncode,
-                    stderr_data.decode(errors="replace").strip()[:300] if stderr_data else "no error",
+                    "Audio input: retry %d/%d after %.0fs delay...",
+                    attempt, MAX_RETRIES, delay,
                 )
+                await asyncio.sleep(delay)
+
+            for url in urls_to_try:
+                if not self._active or not self._listen_active:
+                    return
+                _LOGGER.warning(
+                    "Audio input: trying %s",
+                    _mask_stream_url(url),
+                )
+
+                # Build ffmpeg args with protocol-specific options
+                ffmpeg_args = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats"]
+                if url.startswith("rtsp://"):
+                    ffmpeg_args.extend(["-rtsp_transport", "tcp"])
+                elif url.startswith("rtmp://"):
+                    ffmpeg_args.extend(["-live_start_index", "-1"])
+                elif "m3u8" in url or "/hls/" in url:
+                    ffmpeg_args.extend(["-live_start_index", "-1"])
+                elif url.startswith("https://"):
+                    ffmpeg_args.extend(["-tls_verify", "0"])
+                ffmpeg_args.extend([
+                    "-i", url,
+                    "-vn",  # No video — audio only
+                    "-acodec", "pcm_s16le",
+                    "-ar", str(AUDIO_INPUT_SAMPLE_RATE),
+                    "-ac", "1",
+                    "-f", "s16le",
+                    "pipe:1",
+                ])
+
+                proc = await asyncio.create_subprocess_exec(
+                    *ffmpeg_args,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+
+                # Wait briefly to see if ffmpeg connects or dies immediately
+                await asyncio.sleep(0.5)
+                if proc.returncode is not None:
+                    stderr_data = b""
+                    try:
+                        stderr_data = await asyncio.wait_for(proc.stderr.read(2000), timeout=1.0)
+                    except Exception:
+                        pass
+                    _LOGGER.warning(
+                        "Audio input: ffmpeg failed for %s (rc=%d): %s",
+                        _mask_stream_url(url),
+                        proc.returncode,
+                        stderr_data.decode(errors="replace").strip()[:300] if stderr_data else "no error",
+                    )
+                    proc = None
+                    continue
+
+                # Wait more to confirm the stream is actually producing data
+                await asyncio.sleep(2.5)
+                if proc.returncode is not None:
+                    stderr_data = b""
+                    try:
+                        stderr_data = await asyncio.wait_for(proc.stderr.read(2000), timeout=1.0)
+                    except Exception:
+                        pass
+                    _LOGGER.warning(
+                        "Audio input: ffmpeg failed for %s (rc=%d): %s",
+                        _mask_stream_url(url),
+                        proc.returncode,
+                        stderr_data.decode(errors="replace").strip()[:300] if stderr_data else "no error",
+                    )
+                    proc = None
+                    continue
+
+                # ffmpeg is still running — this URL works
+                _LOGGER.warning("Audio input: ffmpeg stream reader connected (PID=%d)", proc.pid)
+                break
+            else:
+                # All URLs failed on this attempt — try again if retries remain
                 proc = None
                 continue
 
-            # Wait more to confirm the stream is actually producing data
-            await asyncio.sleep(2.5)
-            if proc.returncode is not None:
-                # ffmpeg exited — read error and try next URL
-                stderr_data = b""
-                try:
-                    stderr_data = await asyncio.wait_for(proc.stderr.read(2000), timeout=1.0)
-                except Exception:
-                    pass
-                _LOGGER.warning(
-                    "Audio input: ffmpeg failed for %s (rc=%d): %s",
-                    _mask_stream_url(url),
-                    proc.returncode,
-                    stderr_data.decode(errors="replace").strip()[:300] if stderr_data else "no error",
-                )
-                proc = None
-                continue
-
-            # ffmpeg is still running — this URL works
-            _LOGGER.warning("Audio input: ffmpeg stream reader connected (PID=%d)", proc.pid)
+            # We broke out of the inner loop — connection succeeded
             break
         else:
-            _LOGGER.warning("Audio input: all stream URLs failed — mic input disabled")
+            _LOGGER.warning("Audio input: all URLs failed after %d retries — mic input disabled", MAX_RETRIES)
             self._listen_active = False
             return
 
