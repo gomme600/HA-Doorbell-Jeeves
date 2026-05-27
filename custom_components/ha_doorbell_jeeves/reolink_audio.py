@@ -273,7 +273,7 @@ class ReolinkAudioHandler:
         return self._active
 
     async def start(self) -> None:
-        """Start 2-way audio: output via Baichuan, input via FDX on same connection."""
+        """Start 2-way audio: output via Baichuan, input via RTSP/stream."""
         if self._active:
             return
 
@@ -282,18 +282,19 @@ class ReolinkAudioHandler:
 
         self._active = True
 
-        # Start Baichuan talk output pipeline (ADPCM via port 9000)
-        # This also installs the FDX audio input intercept after talk starts
-        await self._start_output_pipeline()
-
-        # Start doorbell mic input (FDX intercept is primary; ffmpeg is fallback)
+        # Start doorbell mic input FIRST — establishes RTSP/stream connection
+        # before Baichuan talk session (which may consume a connection slot on
+        # the camera and cause RTSP 401 if started second).
         await self._start_audio_input()
 
+        # Start Baichuan talk output pipeline (ADPCM via port 9000)
+        await self._start_output_pipeline()
+
         _LOGGER.warning(
-            "Reolink audio handler started (host=%s, baichuan=%s, fdx_input=%s)",
+            "Reolink audio handler started (host=%s, baichuan=%s, mic_input=%s)",
             self._reolink_host,
             "connected" if self._baichuan else "failed",
-            self._baichuan_audio_input_active or "pending (after chime)",
+            "active" if self._listen_active else "disabled",
         )
 
     async def _discover_reolink_details(self) -> None:
@@ -1086,19 +1087,19 @@ class ReolinkAudioHandler:
         _LOGGER.warning("Audio input: starting stream-based mic capture")
         urls_to_try: list[str] = []
 
-        # Priority 1: RTMP (most reliable — password in query params)
-        rtmp_url = getattr(self, "_reolink_rtmp_url", None)
-        if rtmp_url:
-            urls_to_try.append(rtmp_url)
+        # Priority 1: Direct RTSP URL (lowest latency, works intermittently)
+        if getattr(self, "_reolink_rtsp_url", None):
+            urls_to_try.append(self._reolink_rtsp_url)
 
-        # Priority 2: HTTP-FLV (also query-param auth)
+        # Priority 2: HTTP-FLV (query-param auth, needs self-signed cert bypass)
         flv_url = getattr(self, "_reolink_flv_url", None)
         if flv_url:
             urls_to_try.append(flv_url)
 
-        # Priority 3: Direct RTSP URL
-        if getattr(self, "_reolink_rtsp_url", None):
-            urls_to_try.append(self._reolink_rtsp_url)
+        # Priority 3: RTMP (password in query params — often port 1935 is disabled)
+        rtmp_url = getattr(self, "_reolink_rtmp_url", None)
+        if rtmp_url:
+            urls_to_try.append(rtmp_url)
 
         # Priority 4: Camera entity stream source
         entity_stream_url = await self._get_camera_stream_source()
