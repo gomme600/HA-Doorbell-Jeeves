@@ -1057,37 +1057,30 @@ class ReolinkAudioHandler:
           2. FALLBACK: go2rtc existing stream / camera stream_source via ffmpeg
              (only used if Baichuan FDX is not available)
 
-        For Reolink cameras with FDX support, the audio intercept is installed
-        inside _baichuan_audio_output_loop AFTER TalkConfig is accepted. This
-        method only needs to handle the fallback case.
+        The camera's microphone audio is available via RTSP/stream, NOT via
+        the Baichuan CMD 202 talk channel. CMD 202 is used for SENDING audio
+        to the camera's speaker; the mic audio is part of the normal media stream.
         """
         self._listen_active = True
 
-        # If Baichuan talk is being set up and camera supports FDX,
-        # the output loop will install the audio intercept. Just wait.
-        if self._baichuan or self._talk_ability:
-            duplex = (self._talk_ability or {}).get("duplex", "")
-            if duplex == "FDX" or not self._talk_ability:
-                # Trust that the output loop will set up FDX input
-                _LOGGER.info(
-                    "Audio input: waiting for Baichuan FDX (output loop will install intercept)"
-                )
-                return
-
-        # FALLBACK: Use go2rtc/stream_source/RTSP via ffmpeg
-        _LOGGER.warning("No Baichuan FDX — falling back to stream-based audio input")
+        # Always use stream-based audio input for the microphone
+        # (The Baichuan FDX channel only carries video back, not mic audio)
+        _LOGGER.warning("Audio input: starting stream-based mic capture (ffmpeg/RTSP)")
         urls_to_try: list[str] = []
 
-        go2rtc_url = await self._get_go2rtc_audio_url()
-        if go2rtc_url:
-            urls_to_try.append(go2rtc_url)
+        # Priority 1: Direct RTSP URL (lowest latency)
+        if self._reolink_rtsp_url:
+            urls_to_try.append(self._reolink_rtsp_url)
 
+        # Priority 2: Camera entity stream source
         entity_stream_url = await self._get_camera_stream_source()
         if entity_stream_url and entity_stream_url not in urls_to_try:
             urls_to_try.append(entity_stream_url)
 
-        if self._reolink_rtsp_url and self._reolink_rtsp_url not in urls_to_try:
-            urls_to_try.append(self._reolink_rtsp_url)
+        # Priority 3: go2rtc proxy
+        go2rtc_url = await self._get_go2rtc_audio_url()
+        if go2rtc_url and go2rtc_url not in urls_to_try:
+            urls_to_try.append(go2rtc_url)
 
         if not urls_to_try:
             _LOGGER.warning("No audio input source available — mic input disabled")
@@ -1187,47 +1180,28 @@ class ReolinkAudioHandler:
                 cipher = _AES.new(key=aes_key, mode=_AES.MODE_CFB, iv=AES_IV, segment_size=128)
                 decrypted = cipher.decrypt(raw_payload)
 
-                # On first packet, verify decryption produced valid audio
+                # On first packet, log what we got
                 if decrypt_mode[0] is None:
-                    # Check for BcMedia magic (0x62773130 = "bw10") in decrypted data
                     import struct as _st
+                    decrypt_mode[0] = "aes"
                     if len(decrypted) >= 4:
                         magic_val = _st.unpack_from("<I", decrypted, 0)[0]
-                        if magic_val == 0x62773130:
-                            decrypt_mode[0] = "aes"
-                            _LOGGER.warning(
-                                "✓ Audio decrypt: AES decryption CONFIRMED (BcMedia magic found)"
-                            )
-                            return decrypted
-                        # Check if decrypted data has valid ADPCM header (predictor + step_index)
-                        step_idx = decrypted[2]
-                        if step_idx <= 88:
-                            decrypt_mode[0] = "aes"
-                            _LOGGER.warning(
-                                "✓ Audio decrypt: AES decryption likely correct "
-                                "(step_index=%d, first 16 hex: %s)",
-                                step_idx, decrypted[:16].hex(),
-                            )
-                            return decrypted
-                        # Also check if raw (unencrypted) is valid
-                        raw_step_idx = raw_payload[2] if len(raw_payload) > 2 else 255
-                        if raw_step_idx <= 88:
-                            decrypt_mode[0] = "none"
-                            _LOGGER.warning(
-                                "Audio decrypt: raw payload has valid step_index=%d, "
-                                "skipping AES decryption",
-                                raw_step_idx,
-                            )
-                            return raw_payload
-                        # Default to AES since we negotiated with AES encryption
-                        decrypt_mode[0] = "aes"
+                        # Check for known BcMedia magics
+                        known = {
+                            0x62773130: "ADPCM", 0x62773530: "AAC",
+                            0x31303031: "InfoV1", 0x32303031: "InfoV2",
+                        }
+                        name = known.get(magic_val, "")
+                        if not name and (0x63643030 <= magic_val <= 0x63643039):
+                            name = "IFrame"
+                        elif not name and (0x63643130 <= magic_val <= 0x63643139):
+                            name = "PFrame"
                         _LOGGER.warning(
-                            "Audio decrypt: using AES (negotiated enc=%s). "
-                            "Decrypted first 16 hex: %s | Raw first 16 hex: %s",
-                            self._talk_enc_type, decrypted[:16].hex(), raw_payload[:16].hex(),
+                            "✓ Audio decrypt: AES active (talk_enc=%s). "
+                            "First frame: %s (magic=0x%08x), first 16 hex: %s",
+                            self._talk_enc_type, name or "unknown",
+                            magic_val, decrypted[:16].hex(),
                         )
-                    else:
-                        decrypt_mode[0] = "aes"
 
                 return decrypted
             except ImportError:
@@ -1291,6 +1265,32 @@ class ReolinkAudioHandler:
                 payload = _decrypt_payload(raw_payload)
 
                 input_count[0] += 1
+
+                # For first few packets, also inspect the extension XML
+                if input_count[0] <= 3:
+                    ext_bytes = data[len_header:payload_start]
+                    ext_text = ""
+                    if ext_bytes:
+                        try:
+                            # Decrypt extension XML
+                            aes_key = getattr(bc, "_aes_key", None)
+                            if aes_key:
+                                try:
+                                    from Cryptodome.Cipher import AES as _AES2
+                                except ImportError:
+                                    from Crypto.Cipher import AES as _AES2
+                                AES_IV2 = b"0123456789abcdef"
+                                c = _AES2.new(key=aes_key, mode=_AES2.MODE_CFB, iv=AES_IV2, segment_size=128)
+                                ext_text = c.decrypt(ext_bytes).decode("utf-8", errors="replace")
+                        except Exception:
+                            ext_text = f"(decrypt failed, {len(ext_bytes)} bytes)"
+                    _LOGGER.warning(
+                        "FDX msg #%d: body=%d, ext_offset=%d, ext=%r, payload=%d bytes",
+                        input_count[0], rec_len_body, rec_payload_offset,
+                        ext_text[:200] if ext_text else "(none)",
+                        len(payload),
+                    )
+
                 if input_count[0] == 1:
                     _LOGGER.warning(
                         "✓ First CMD 202 from doorbell via Baichuan FDX "
