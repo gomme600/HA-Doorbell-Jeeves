@@ -175,8 +175,27 @@ class GeminiLiveClient(BaseRealtimeClient):
 
     async def _receive_loop(self) -> None:
         try:
-            async for response in self._session.receive():
-                await self._process(response)
+            # NOTE: In the GenAI SDK, session.receive() can complete after a turn.
+            # Re-enter receive() to keep the live session open across turns.
+            consecutive_empty_iters = 0
+            while self._connected and self._session:
+                saw_message = False
+                async for response in self._session.receive():
+                    saw_message = True
+                    await self._process(response)
+
+                if not self._connected:
+                    break
+
+                if saw_message:
+                    consecutive_empty_iters = 0
+                    continue
+
+                consecutive_empty_iters += 1
+                if consecutive_empty_iters >= 3:
+                    _LOGGER.warning("Gemini receive stream ended repeatedly with no events")
+                    break
+                await asyncio.sleep(0.1)
         except asyncio.CancelledError:
             pass
         except Exception:
