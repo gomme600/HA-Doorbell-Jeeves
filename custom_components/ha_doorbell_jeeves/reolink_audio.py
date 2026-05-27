@@ -2250,35 +2250,69 @@ class ReolinkAudioHandler:
     def _process_fdx_audio_payload(
         self, raw_payload: bytes, pkt_count: list, audio_count: list
     ) -> None:
-        """Process a single CMD 202 audio payload from the talk connection.
+        """Process a single CMD 202 payload from the talk connection.
 
-        Decrypts if needed, then tries to decode as ADPCM or BcMedia audio.
+        Decrypts if needed, then extracts ONLY genuine audio frames.
+        CRITICAL: Do NOT use raw G.711/ADPCM fallback on video data — that
+        produces garbage noise that Gemini interprets as speech.
         """
+        import struct as _st
+
         # Decrypt the payload (Baichuan uses AES-128-CFB for talk data)
         payload = self._decrypt_talk_payload(raw_payload)
 
+        if len(payload) < 4:
+            return
+
+        # Check the BcMedia magic to identify frame type
+        magic_val = _st.unpack_from("<I", payload, 0)[0]
+
+        # Known video/info magics — SKIP these entirely
+        VIDEO_MAGICS = {
+            0x31303031,  # InfoV1
+            0x32303031,  # InfoV2
+        }
+        # IFrame: 0x63643030-0x63643039, PFrame: 0x63643130-0x63643139
+        is_iframe = 0x63643030 <= magic_val <= 0x63643039
+        is_pframe = 0x63643130 <= magic_val <= 0x63643139
+        is_video = is_iframe or is_pframe or magic_val in VIDEO_MAGICS
+
+        # Known audio magics
+        ADPCM_MAGIC = 0x62773130
+        AAC_MAGIC = 0x62773530
+        is_audio_magic = magic_val in (ADPCM_MAGIC, AAC_MAGIC)
+
         if pkt_count[0] <= 5:
-            import struct as _st
-            magic_val = _st.unpack_from("<I", payload, 0)[0] if len(payload) >= 4 else 0
+            frame_type = "video" if is_video else ("AUDIO" if is_audio_magic else "unknown")
             _LOGGER.warning(
-                "FDX pkt #%d: %d bytes, magic=0x%08x, first16=%s",
-                pkt_count[0], len(payload), magic_val, payload[:16].hex(),
+                "FDX pkt #%d: %d bytes, magic=0x%08x (%s)",
+                pkt_count[0], len(payload), magic_val, frame_type,
             )
 
-        if pkt_count[0] == 1:
-            _LOGGER.warning(
-                "✓ First CMD 202 from camera (FDX mic audio) — %d bytes", len(payload)
-            )
+        if is_video:
+            # Pure video frame — skip entirely (do NOT decode as audio)
+            if pkt_count[0] == 1:
+                _LOGGER.warning(
+                    "FDX: first packet is VIDEO (0x%08x) — waiting for audio frames...",
+                    magic_val,
+                )
+            return
 
-        # Try parsing as BcMedia (may contain ADPCM audio frames)
+        # Try parsing as BcMedia (ADPCM or AAC audio frames)
         pcm_data = self._parse_bcmedia_to_pcm(payload)
         if pcm_data and self._listen_active:
             audio_count[0] += 1
+            if audio_count[0] == 1:
+                _LOGGER.warning(
+                    "✓ First REAL audio from FDX — %d bytes PCM (pkt #%d)",
+                    len(pcm_data), pkt_count[0],
+                )
             asyncio.ensure_future(self._on_audio_received(pcm_data))
             return
 
-        # Fallback: try raw ADPCM decode on the entire payload
-        if len(payload) >= 8 and self._listen_active:
+        # Only try raw ADPCM fallback if magic is completely unrecognized
+        # (not video, not known audio — could be raw audio data without BcMedia header)
+        if not is_audio_magic and not is_video and len(payload) >= 516:
             pcm_data = self._try_raw_adpcm_decode(payload)
             if pcm_data:
                 audio_count[0] += 1
@@ -2286,11 +2320,17 @@ class ReolinkAudioHandler:
 
         if pkt_count[0] == 50:
             _LOGGER.warning(
-                "FDX: 50 packets, %d decoded as audio", audio_count[0]
+                "FDX @50: %d audio frames (of %d total pkts, %d video skipped)",
+                audio_count[0], pkt_count[0], pkt_count[0] - audio_count[0],
+            )
+        elif pkt_count[0] == 200:
+            _LOGGER.warning(
+                "FDX @200: %d audio, %d video",
+                audio_count[0], pkt_count[0] - audio_count[0],
             )
         elif pkt_count[0] % 500 == 0:
             _LOGGER.warning(
-                "FDX: %d packets total, %d audio", pkt_count[0], audio_count[0]
+                "FDX @%d: %d audio", pkt_count[0], audio_count[0]
             )
 
     def _decrypt_talk_payload(self, raw_payload: bytes) -> bytes:
