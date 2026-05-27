@@ -145,7 +145,7 @@ class JeevesSessionManager:
         # Gate stays closed for ECHO_GATE_HOLD seconds after the last AI output
         # chunk is received (accounts for speaker buffer + physical echo).
         self._ai_last_output_time: float = 0.0
-        self._echo_gate_hold_sec: float = 2.0  # hold mic mute this long after last AI chunk
+        self._echo_gate_hold_sec: float = 4.0  # hold mic mute after last AI chunk (accounts for speaker-mic coupling)
 
     def _normalize_manual_audio_config(self) -> None:
         """Backfill split go2rtc stream keys from the legacy single stream key."""
