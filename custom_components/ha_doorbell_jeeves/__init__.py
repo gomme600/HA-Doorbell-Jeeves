@@ -55,8 +55,6 @@ PLATFORMS: list[Platform] = [Platform.SENSOR, Platform.CAMERA]
 _DOMAIN_INTERNAL = f"{DOMAIN}_internal"
 _INTERNAL_MEMORY_VIEWS = "memory_views_registered"
 _INTERNAL_FRONTEND_RESOURCES = "frontend_resources_registered"
-_MEMORY_TIMELINE_CARD_URL = "/ha_doorbell_jeeves/jeeves-memory-timeline-card.js"
-_MEMORY_TIMELINE_CARD_FILE = "jeeves-memory-timeline-card.js"
 
 # Type alias for runtime data stored on the config entry
 JeevesData = JeevesSessionManager
@@ -147,82 +145,14 @@ async def _async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None
 
 async def _register_frontend_resources(hass: HomeAssistant) -> None:
     """Register static frontend resources used by optional Lovelace cards."""
-    if not getattr(hass, "http", None):
-        _LOGGER.warning("HTTP component is not available; skipping frontend resource registration")
-        return
-    card_path = Path(__file__).parent / "frontend" / _MEMORY_TIMELINE_CARD_FILE
-    if not card_path.exists():
-        _LOGGER.warning("Memory timeline card file missing: %s", card_path)
-        return
+    from .memory_views import card_js_url  # noqa: PLC0415
 
-    # Register the file as a static path
-    if hasattr(hass.http, "async_register_static_paths"):
-        from homeassistant.components.http import StaticPathConfig  # noqa: PLC0415
+    # The card JS view is already registered by register_memory_views().
+    # Just tell the HA frontend to load it on every page.
+    from homeassistant.components.frontend import add_extra_js_url  # noqa: PLC0415
 
-        await hass.http.async_register_static_paths(
-            [StaticPathConfig(_MEMORY_TIMELINE_CARD_URL, str(card_path), cache_headers=False)]
-        )
-    else:
-        hass.http.register_static_path(
-            _MEMORY_TIMELINE_CARD_URL,
-            str(card_path),
-            cache_headers=False,
-        )
-
-    # Register as a Lovelace resource so it loads via <script> tag (not import())
-    # This avoids MIME type issues with the nosniff header.
-    await _ensure_lovelace_resource(hass, _MEMORY_TIMELINE_CARD_URL)
-    _LOGGER.debug("Registered memory timeline card resource: %s", _MEMORY_TIMELINE_CARD_URL)
-
-
-async def _ensure_lovelace_resource(hass: HomeAssistant, url: str) -> None:
-    """Ensure the URL is registered as a Lovelace dashboard resource."""
-    try:
-        from homeassistant.components.lovelace import dashboard  # noqa: PLC0415
-        from homeassistant.components.lovelace.const import (  # noqa: PLC0415
-            DOMAIN as LOVELACE_DOMAIN,
-        )
-
-        lovelace_data = hass.data.get(LOVELACE_DOMAIN)
-        if lovelace_data is None:
-            _LOGGER.debug("Lovelace data not available, using add_extra_js_url fallback")
-            from homeassistant.components.frontend import add_extra_js_url  # noqa: PLC0415
-
-            add_extra_js_url(hass, url)
-            return
-
-        # Check if using storage mode (default for most HA installs)
-        resources = getattr(lovelace_data, "resources", None)
-        if resources is None:
-            _LOGGER.debug("Lovelace resources not available, using add_extra_js_url fallback")
-            from homeassistant.components.frontend import add_extra_js_url  # noqa: PLC0415
-
-            add_extra_js_url(hass, url)
-            return
-
-        # Check if already registered
-        existing = await resources.async_get_items() if hasattr(resources, "async_get_items") else []
-        for item in existing:
-            if item.get("url") == url:
-                if item.get("type") == "js":
-                    _LOGGER.debug("Lovelace resource already registered: %s", url)
-                    return
-                # Remove old 'module' type entry and re-add as 'js'
-                item_id = item.get("id")
-                if item_id and hasattr(resources, "async_delete_item"):
-                    await resources.async_delete_item(item_id)
-                break
-
-        # Register as 'js' type (loaded via <script> tag, not import())
-        # to avoid MIME type enforcement with nosniff header
-        await resources.async_create_item({"res_type": "js", "url": url})
-        _LOGGER.info("Added Lovelace resource: %s", url)
-    except Exception as exc:  # noqa: BLE001
-        # Fallback to add_extra_js_url if Lovelace API isn't available
-        _LOGGER.debug("Lovelace resource registration failed (%s), using add_extra_js_url", exc)
-        from homeassistant.components.frontend import add_extra_js_url  # noqa: PLC0415
-
-        add_extra_js_url(hass, url)
+    add_extra_js_url(hass, card_js_url())
+    _LOGGER.debug("Registered memory timeline card resource: %s", card_js_url())
 
 
 async def _setup_reolink(hass: HomeAssistant, entry: ConfigEntry, config: dict[str, Any]) -> None:

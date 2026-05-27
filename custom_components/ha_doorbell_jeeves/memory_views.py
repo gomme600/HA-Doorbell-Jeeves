@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+from pathlib import Path
 
 from aiohttp import web
 
@@ -14,10 +15,38 @@ from .const import DOMAIN
 from .memory import SessionMemory
 from .session_manager import JeevesSessionManager
 
+_CARD_JS_PATH = Path(__file__).parent / "frontend" / "jeeves-memory-timeline-card.js"
+
 
 def memory_image_url(entry_id: str, memory_id: str) -> str:
     """Build the authenticated URL for a stored memory snapshot."""
     return f"/api/{DOMAIN}/memory_image/{entry_id}/{memory_id}"
+
+
+def card_js_url() -> str:
+    """URL where the timeline card JavaScript is served."""
+    return f"/api/{DOMAIN}/card_js"
+
+
+class JeevesCardJSView(HomeAssistantView):
+    """Serve the memory timeline card JS with correct MIME type."""
+
+    url = f"/api/{DOMAIN}/card_js"
+    name = f"api:{DOMAIN}:card_js"
+    requires_auth = False  # Frontend resources must load without auth
+
+    def __init__(self) -> None:
+        self._content: bytes | None = None
+
+    async def get(self, request: web.Request) -> web.Response:
+        """Return the card JavaScript with correct content type."""
+        if self._content is None:
+            self._content = _CARD_JS_PATH.read_bytes()
+        return web.Response(
+            body=self._content,
+            content_type="application/javascript",
+            headers={"Cache-Control": "no-cache"},
+        )
 
 
 class JeevesMemoryImageView(HomeAssistantView):
@@ -69,3 +98,4 @@ class JeevesMemoryImageView(HomeAssistantView):
 def register_memory_views(hass: HomeAssistant) -> None:
     """Register integration HTTP views once per Home Assistant instance."""
     hass.http.register_view(JeevesMemoryImageView(hass))
+    hass.http.register_view(JeevesCardJSView())
