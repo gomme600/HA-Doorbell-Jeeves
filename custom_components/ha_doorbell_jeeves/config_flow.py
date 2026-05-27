@@ -169,6 +169,20 @@ def _clean_text(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
+def _add_optional_entity_selector(
+    schema: dict[Any, Any],
+    key: str,
+    default_value: Any,
+    selector_config: EntitySelectorConfig,
+) -> None:
+    """Add an optional entity selector, avoiding invalid empty defaults."""
+    default_text = _clean_text(default_value)
+    if default_text:
+        schema[vol.Optional(key, default=default_text)] = EntitySelector(selector_config)
+    else:
+        schema[vol.Optional(key)] = EntitySelector(selector_config)
+
+
 class DoorbellJeevesConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle initial setup of Doorbell Jeeves."""
 
@@ -282,42 +296,45 @@ class DoorbellJeevesConfigFlow(ConfigFlow, domain=DOMAIN):
                     self._data.pop(CONF_GO2RTC_STREAM_NAME, None)
                 return await self.async_step_provider()
 
+        schema: dict[Any, Any] = {
+            vol.Required(
+                CONF_AUDIO_MANUAL_MODE,
+                default=manual_mode,
+            ): SelectSelector(
+                SelectSelectorConfig(
+                    options=[
+                        {
+                            "value": AUDIO_MANUAL_EXTERNAL_GO2RTC,
+                            "label": "External go2rtc stream",
+                        },
+                        {
+                            "value": AUDIO_MANUAL_HA_ENTITIES,
+                            "label": "Home Assistant entities (speaker + microphone)",
+                        },
+                    ],
+                    mode=SelectSelectorMode.DROPDOWN,
+                )
+            ),
+            vol.Optional(
+                CONF_GO2RTC_STREAM_NAME,
+                default=self._data.get(CONF_GO2RTC_STREAM_NAME, ""),
+            ): TextSelector(),
+        }
+        _add_optional_entity_selector(
+            schema,
+            CONF_MEDIA_PLAYER_ENTITY,
+            self._data.get(CONF_MEDIA_PLAYER_ENTITY),
+            EntitySelectorConfig(domain="media_player"),
+        )
+        _add_optional_entity_selector(
+            schema,
+            CONF_MICROPHONE_ENTITY,
+            self._data.get(CONF_MICROPHONE_ENTITY),
+            EntitySelectorConfig(),
+        )
         return self.async_show_form(
             step_id="manual_audio",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(
-                        CONF_AUDIO_MANUAL_MODE,
-                        default=manual_mode,
-                    ): SelectSelector(
-                        SelectSelectorConfig(
-                            options=[
-                                {
-                                    "value": AUDIO_MANUAL_EXTERNAL_GO2RTC,
-                                    "label": "External go2rtc stream",
-                                },
-                                {
-                                    "value": AUDIO_MANUAL_HA_ENTITIES,
-                                    "label": "Home Assistant entities (speaker + microphone)",
-                                },
-                            ],
-                            mode=SelectSelectorMode.DROPDOWN,
-                        )
-                    ),
-                    vol.Optional(
-                        CONF_GO2RTC_STREAM_NAME,
-                        default=self._data.get(CONF_GO2RTC_STREAM_NAME, ""),
-                    ): TextSelector(),
-                    vol.Optional(
-                        CONF_MEDIA_PLAYER_ENTITY,
-                        default=self._data.get(CONF_MEDIA_PLAYER_ENTITY) or None,
-                    ): EntitySelector(EntitySelectorConfig(domain="media_player")),
-                    vol.Optional(
-                        CONF_MICROPHONE_ENTITY,
-                        default=self._data.get(CONF_MICROPHONE_ENTITY) or None,
-                    ): EntitySelector(EntitySelectorConfig()),
-                }
-            ),
+            data_schema=vol.Schema(schema),
             errors=errors,
         )
 
@@ -732,39 +749,42 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                     self._data.pop(CONF_GO2RTC_STREAM_NAME, None)
                 return self._save_options()
 
+        schema: dict[Any, Any] = {
+            vol.Required(
+                CONF_AUDIO_MANUAL_MODE,
+                default=manual_mode,
+            ): SelectSelector(
+                SelectSelectorConfig(
+                    options=[
+                        {"value": AUDIO_MANUAL_EXTERNAL_GO2RTC, "label": "External go2rtc stream"},
+                        {
+                            "value": AUDIO_MANUAL_HA_ENTITIES,
+                            "label": "Home Assistant entities (speaker + microphone)",
+                        },
+                    ],
+                    mode=SelectSelectorMode.DROPDOWN,
+                )
+            ),
+            vol.Optional(
+                CONF_GO2RTC_STREAM_NAME,
+                default=self._data.get(CONF_GO2RTC_STREAM_NAME, ""),
+            ): TextSelector(),
+        }
+        _add_optional_entity_selector(
+            schema,
+            CONF_MEDIA_PLAYER_ENTITY,
+            self._data.get(CONF_MEDIA_PLAYER_ENTITY),
+            EntitySelectorConfig(domain="media_player"),
+        )
+        _add_optional_entity_selector(
+            schema,
+            CONF_MICROPHONE_ENTITY,
+            self._data.get(CONF_MICROPHONE_ENTITY),
+            EntitySelectorConfig(),
+        )
         return self.async_show_form(
             step_id="audio_manual",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(
-                        CONF_AUDIO_MANUAL_MODE,
-                        default=manual_mode,
-                    ): SelectSelector(
-                        SelectSelectorConfig(
-                            options=[
-                                {"value": AUDIO_MANUAL_EXTERNAL_GO2RTC, "label": "External go2rtc stream"},
-                                {
-                                    "value": AUDIO_MANUAL_HA_ENTITIES,
-                                    "label": "Home Assistant entities (speaker + microphone)",
-                                },
-                            ],
-                            mode=SelectSelectorMode.DROPDOWN,
-                        )
-                    ),
-                    vol.Optional(
-                        CONF_GO2RTC_STREAM_NAME,
-                        default=self._data.get(CONF_GO2RTC_STREAM_NAME, ""),
-                    ): TextSelector(),
-                    vol.Optional(
-                        CONF_MEDIA_PLAYER_ENTITY,
-                        default=self._data.get(CONF_MEDIA_PLAYER_ENTITY) or None,
-                    ): EntitySelector(EntitySelectorConfig(domain="media_player")),
-                    vol.Optional(
-                        CONF_MICROPHONE_ENTITY,
-                        default=self._data.get(CONF_MICROPHONE_ENTITY) or None,
-                    ): EntitySelector(EntitySelectorConfig()),
-                }
-            ),
+            data_schema=vol.Schema(schema),
             errors=errors,
         )
 
@@ -1437,29 +1457,28 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
             self._data[CONF_IDENTITY_MODE] = user_input.get(CONF_IDENTITY_MODE, IDENTITY_MODE_NONE)
             self._data[CONF_FACE_SENSOR_ENTITY] = _clean_text(user_input.get(CONF_FACE_SENSOR_ENTITY, ""))
             return self._save_options()
+        schema: dict[Any, Any] = {
+            vol.Required(CONF_IDENTITY_MODE, default=self._data.get(CONF_IDENTITY_MODE, IDENTITY_MODE_NONE)): SelectSelector(
+                SelectSelectorConfig(
+                    options=[
+                        {"value": IDENTITY_MODE_NONE, "label": "Disabled"},
+                        {"value": IDENTITY_MODE_SENSOR, "label": "External Sensor (e.g. Frigate)"},
+                        {"value": IDENTITY_MODE_REFERENCE_IMAGES, "label": "Reference Images"},
+                        {"value": IDENTITY_MODE_BOTH, "label": "Both Sensor + Reference Images"},
+                    ],
+                    mode=SelectSelectorMode.DROPDOWN,
+                )
+            )
+        }
+        _add_optional_entity_selector(
+            schema,
+            CONF_FACE_SENSOR_ENTITY,
+            self._data.get(CONF_FACE_SENSOR_ENTITY),
+            EntitySelectorConfig(domain="sensor"),
+        )
         return self.async_show_form(
             step_id="identity_settings",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(CONF_IDENTITY_MODE, default=self._data.get(CONF_IDENTITY_MODE, IDENTITY_MODE_NONE)): SelectSelector(
-                        SelectSelectorConfig(
-                            options=[
-                                {"value": IDENTITY_MODE_NONE, "label": "Disabled"},
-                                {"value": IDENTITY_MODE_SENSOR, "label": "External Sensor (e.g. Frigate)"},
-                                {"value": IDENTITY_MODE_REFERENCE_IMAGES, "label": "Reference Images"},
-                                {"value": IDENTITY_MODE_BOTH, "label": "Both Sensor + Reference Images"},
-                            ],
-                            mode=SelectSelectorMode.DROPDOWN,
-                        )
-                    ),
-                    vol.Optional(
-                        CONF_FACE_SENSOR_ENTITY,
-                        default=self._data.get(CONF_FACE_SENSOR_ENTITY) or None,
-                    ): EntitySelector(
-                        EntitySelectorConfig(domain="sensor")
-                    ),
-                }
-            ),
+            data_schema=vol.Schema(schema),
         )
 
     async def async_step_prompt(self, user_input: dict[str, Any] | None = None) -> FlowResult:
@@ -1537,11 +1556,15 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                 SelectSelectorConfig(options=entity_options or [], mode=SelectSelectorMode.DROPDOWN)
             )
         if include_target_automation:
-            schema[
-                vol.Optional("target_automation", default=defaults.get("target_automation") or None)
-            ] = EntitySelector(
-                EntitySelectorConfig(domain="automation")
-            )
+            target_automation = _clean_text(defaults.get("target_automation", ""))
+            if target_automation:
+                schema[vol.Optional("target_automation", default=target_automation)] = EntitySelector(
+                    EntitySelectorConfig(domain="automation")
+                )
+            else:
+                schema[vol.Optional("target_automation")] = EntitySelector(
+                    EntitySelectorConfig(domain="automation")
+                )
         schema[vol.Required("action_id", default=defaults.get("action_id", ""))] = TextSelector()
         schema[vol.Required("action_name", default=defaults.get("action_name", ""))] = TextSelector()
         schema[vol.Required("action_description", default=defaults.get("action_description", ""))] = TextSelector(
