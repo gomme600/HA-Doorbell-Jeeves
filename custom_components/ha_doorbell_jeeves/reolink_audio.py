@@ -281,6 +281,10 @@ class ReolinkAudioHandler:
         # IMA ADPCM decoder state for incoming audio
         self._decode_predictor: int = 0
         self._decode_step_index: int = 0
+        # Baichuan CMD 3 Preview stream state (mic audio via native protocol)
+        self._preview_active = False
+        self._preview_msg_num: int = 0
+        self._preview_audio_frames: int = 0
 
     @property
     def is_active(self) -> bool:
@@ -296,12 +300,26 @@ class ReolinkAudioHandler:
 
         self._active = True
 
-        # Start doorbell mic input FIRST — establishes RTSP/stream connection
-        # before Baichuan talk session (which may consume a connection slot on
-        # the camera and cause RTSP 401 if started second).
-        await self._start_audio_input()
+        # Create Baichuan connection FIRST — needed for both mic input (CMD 3
+        # Preview) and speaker output (CMD 201/202 Talk).
+        bc = await self._get_baichuan_object()
+        if bc:
+            self._baichuan = bc
 
-        # Start Baichuan talk output pipeline (ADPCM via port 9000)
+            # Try native Baichuan CMD 3 Preview for mic audio input.
+            # This is the most reliable method — uses the camera's native
+            # media stream protocol and doesn't depend on RTSP being enabled.
+            preview_ok = await self._start_preview_stream()
+            if preview_ok:
+                _LOGGER.warning("Audio input: using native Baichuan Preview stream (CMD 3)")
+            else:
+                _LOGGER.warning("Audio input: CMD 3 Preview failed, trying external methods")
+
+        # If Preview didn't work, fall back to external streaming methods
+        if not self._listen_active:
+            await self._start_audio_input()
+
+        # Start Baichuan talk output pipeline (speaker)
         await self._start_output_pipeline()
 
         _LOGGER.warning(
@@ -431,6 +449,9 @@ class ReolinkAudioHandler:
         # Stop Baichuan talk session
         await self._stop_baichuan_talk(0)
 
+        # Stop Preview stream (CMD 4)
+        await self._stop_preview_stream()
+
         # Cancel RTSP audio input task
         if self._input_processor_task and not self._input_processor_task.done():
             self._input_processor_task.cancel()
@@ -505,17 +526,19 @@ class ReolinkAudioHandler:
         to send ADPCM audio directly to the camera speaker.
         This bypasses RTSP entirely — works even when port 554 is blocked.
         """
-        # Get the Baichuan object (creates dedicated connection)
-        bc = await self._get_baichuan_object()
+        # Reuse existing Baichuan connection if available (created in start())
+        bc = self._baichuan
         if not bc:
-            _LOGGER.error(
-                "Cannot establish Baichuan talk connection. "
-                "Audio output to doorbell speaker will not work."
-            )
-            return
-
-        self._baichuan = bc
-        _LOGGER.warning("Got Baichuan connection to %s for talk", self._reolink_host)
+            # Fallback: create dedicated connection
+            bc = await self._get_baichuan_object()
+            if not bc:
+                _LOGGER.error(
+                    "Cannot establish Baichuan talk connection. "
+                    "Audio output to doorbell speaker will not work."
+                )
+                return
+            self._baichuan = bc
+            _LOGGER.warning("Got Baichuan connection to %s for talk", self._reolink_host)
 
         # Query TalkAbility to get audio parameters
         ability = await self._query_talk_ability()
@@ -688,8 +711,8 @@ class ReolinkAudioHandler:
 
         # Install Baichuan FDX audio intercept — captures mic audio from
         # the camera's media stream sent back via CMD 202 during full-duplex talk.
-        # Audio may arrive as ADPCM or AAC frames interleaved with video.
-        if ability.get("duplex") == "FDX" and not self._baichuan_audio_input_active:
+        # Skip if Preview intercept is already active (it handles both CMD 3 and CMD 202).
+        if ability.get("duplex") == "FDX" and not self._baichuan_audio_input_active and not self._preview_active:
             # Start AAC decoder task before installing intercept
             self._aac_queue = asyncio.Queue(maxsize=200)
             self._aac_decoder_task = asyncio.create_task(self._aac_decode_loop())
@@ -1119,6 +1142,423 @@ class ReolinkAudioHandler:
                 conn._transport.write(packet)
             else:
                 raise RuntimeError("Cannot find Baichuan transport to write talk data")
+
+    # ─── Audio Input: Native Baichuan CMD 3 Preview Stream ────────────────────────
+
+    async def _start_preview_stream(self) -> bool:
+        """Start a Baichuan CMD 3 (Preview) stream to get mic audio from the camera.
+
+        This subscribes to the camera's native media stream which includes both
+        video and audio. Unlike RTSP (which may be disabled), this uses the same
+        Baichuan TCP connection (port 9000) that talk uses.
+
+        Protocol flow:
+          1. Install parse hook to intercept CMD 3 response packets
+          2. Send CMD 3 with Preview XML body (subStream, channel 0)
+          3. Camera responds with continuous BcMedia frames (video + audio)
+          4. Hook extracts audio frames (ADPCM/AAC) and decodes to PCM
+
+        Returns True if the stream was started and initial data received.
+        """
+        bc = self._baichuan
+        if not bc:
+            return False
+
+        # Install the enhanced parse hook that handles BOTH CMD 3 and CMD 202
+        if not self._install_preview_audio_intercept():
+            _LOGGER.warning("Preview stream: failed to install protocol hook")
+            return False
+
+        # Build and send CMD 3 Preview request
+        try:
+            await self._send_preview_request(bc)
+        except Exception as exc:
+            _LOGGER.warning("Preview stream: failed to send CMD 3: %s", exc)
+            return False
+
+        # Wait briefly for the first audio frame to confirm the stream is working
+        self._listen_active = True
+        _LOGGER.warning("Preview stream: CMD 3 sent, waiting for audio frames...")
+
+        # Give the camera up to 3 seconds to start sending data
+        for _ in range(30):
+            await asyncio.sleep(0.1)
+            if self._preview_audio_frames > 0:
+                _LOGGER.warning(
+                    "✓ Preview stream: receiving audio! (%d frames in first %.1fs)",
+                    self._preview_audio_frames, 0.1 * (_ + 1),
+                )
+                return True
+
+        # No audio frames received — the stream might be video-only
+        if self._preview_active:
+            _LOGGER.warning(
+                "Preview stream: receiving data but no audio frames detected "
+                "(video-only?). Will keep listening in case audio starts later."
+            )
+            return True  # Keep the hook active — audio might come with talk session
+
+        _LOGGER.warning("Preview stream: no data received after 3s")
+        self._listen_active = False
+        return False
+
+    async def _send_preview_request(self, bc: Any) -> None:
+        """Construct and send a CMD 3 (Preview) request packet.
+
+        Packet structure (same as neolink's start_video):
+          - 24-byte Baichuan header (class 0x6414 has payload_offset field)
+          - Encrypted body: Preview XML requesting subStream
+          - No extension (payload_offset = 0)
+        """
+        from reolink_aio.baichuan import util as bc_util  # noqa: PLC0415
+
+        # Preview XML body — request subStream (lower bandwidth, still has audio)
+        preview_xml = (
+            '<?xml version="1.0" encoding="UTF-8" ?>\n'
+            "<body>\n"
+            '<Preview version="1.1">\n'
+            "<channelId>0</channelId>\n"
+            "<handle>256</handle>\n"
+            "<streamType>subStream</streamType>\n"
+            "</Preview>\n"
+            "</body>\n"
+        )
+
+        # Encrypt the body
+        body_bytes = preview_xml.encode("utf-8")
+        enc_type = self._talk_enc_type or bc_util.EncType.AES
+
+        if enc_type == bc_util.EncType.BC:
+            enc_body = bc_util.encrypt_baichuan(body_bytes, 0)  # ch_id=0 for channel 0
+        else:
+            enc_body = bc._aes_encrypt(body_bytes)
+
+        body_len = len(enc_body)
+
+        # Increment message counter
+        if not hasattr(bc, "_mess_id"):
+            bc._mess_id = 0
+        bc._mess_id = (bc._mess_id + 1) % 16777216
+        self._preview_msg_num = bc._mess_id
+
+        # Build 24-byte Baichuan header for CMD 3
+        # Byte layout: magic(4) + cmd_id(4) + body_len(4) + mess_id(4) + status+class(4) + payload_offset(4)
+        # mess_id bytes = ch_id(1) + stream_counter(3)
+        # For Preview: ch_id=0 (channel 0), stream_type encoded in counter byte 0
+        # We set the low byte of mess_id to 1 (= subStream stream_type in neolink)
+        cmd_id = 3  # MSG_ID_VIDEO (Preview)
+
+        # mess_id_bytes: ch_id=0 for channel 0 (NOT ch_id=channel+1 like for talk)
+        # The camera uses ch_id in responses to route back to us
+        ch_id = 0  # channel_id for preview (channel 0 direct)
+        mess_id_bytes = (
+            int(ch_id).to_bytes(1, "little")
+            + int(bc._mess_id).to_bytes(3, "little")
+        )
+
+        header = (
+            bytes.fromhex(bc_util.HEADER_MAGIC)
+            + int(cmd_id).to_bytes(4, "little")
+            + int(body_len).to_bytes(4, "little")
+            + mess_id_bytes
+            + bytes.fromhex("00001464")  # status_code=0, class=0x6414
+            + int(0).to_bytes(4, "little")  # payload_offset=0 (no extension, body IS payload)
+        )
+
+        packet = header + enc_body
+
+        _LOGGER.warning(
+            "Preview stream: sending CMD 3 (body=%d bytes, enc=%s, header=%s)",
+            body_len, enc_type, header.hex(),
+        )
+
+        # Write to transport
+        if hasattr(bc, "_mutex") and hasattr(bc, "_transport"):
+            async with bc._mutex:
+                bc._transport.write(packet)
+        elif hasattr(bc, "_protocol") and hasattr(bc._protocol, "transport"):
+            bc._protocol.transport.write(packet)
+        else:
+            conn = getattr(bc, "_connection", None)
+            if conn and hasattr(conn, "_transport"):
+                conn._transport.write(packet)
+            else:
+                raise RuntimeError("Cannot find Baichuan transport for CMD 3")
+
+    async def _stop_preview_stream(self) -> None:
+        """Send CMD 4 (Stop Video) to end the Preview stream."""
+        if not self._preview_active or not self._baichuan:
+            return
+
+        bc = self._baichuan
+        self._preview_active = False
+
+        try:
+            from reolink_aio.baichuan import util as bc_util  # noqa: PLC0415
+
+            # CMD 4 body is just the channel ID in a simple XML
+            stop_xml = (
+                '<?xml version="1.0" encoding="UTF-8" ?>\n'
+                "<body>\n"
+                '<Preview version="1.1">\n'
+                "<channelId>0</channelId>\n"
+                "<handle>256</handle>\n"
+                "<streamType>subStream</streamType>\n"
+                "</Preview>\n"
+                "</body>\n"
+            )
+
+            body_bytes = stop_xml.encode("utf-8")
+            enc_type = self._talk_enc_type or bc_util.EncType.AES
+
+            if enc_type == bc_util.EncType.BC:
+                enc_body = bc_util.encrypt_baichuan(body_bytes, 0)
+            else:
+                enc_body = bc._aes_encrypt(body_bytes)
+
+            body_len = len(enc_body)
+            bc._mess_id = (bc._mess_id + 1) % 16777216
+
+            ch_id = 0
+            mess_id_bytes = (
+                int(ch_id).to_bytes(1, "little")
+                + int(bc._mess_id).to_bytes(3, "little")
+            )
+
+            cmd_id = 4  # MSG_ID_VIDEO_STOP
+            header = (
+                bytes.fromhex(bc_util.HEADER_MAGIC)
+                + int(cmd_id).to_bytes(4, "little")
+                + int(body_len).to_bytes(4, "little")
+                + mess_id_bytes
+                + bytes.fromhex("00001464")
+                + int(0).to_bytes(4, "little")
+            )
+
+            packet = header + enc_body
+
+            if hasattr(bc, "_mutex") and hasattr(bc, "_transport"):
+                async with bc._mutex:
+                    bc._transport.write(packet)
+            elif hasattr(bc, "_protocol") and hasattr(bc._protocol, "transport"):
+                bc._protocol.transport.write(packet)
+            else:
+                conn = getattr(bc, "_connection", None)
+                if conn and hasattr(conn, "_transport"):
+                    conn._transport.write(packet)
+
+            _LOGGER.info("Preview stream: sent CMD 4 (stop), received %d audio frames total",
+                         self._preview_audio_frames)
+        except Exception as exc:
+            _LOGGER.debug("Preview stream stop error (non-critical): %s", exc)
+
+    def _install_preview_audio_intercept(self) -> bool:
+        """Hook into the Baichuan protocol to intercept CMD 3 and CMD 202 audio.
+
+        CMD 3 (Preview) responses contain the camera's full media stream
+        including mic audio as BcMedia frames (ADPCM or AAC).
+
+        CMD 202 (Talk FDX) may also contain mic audio in full-duplex mode.
+
+        We intercept at the protocol's parse_bc_data level to catch these
+        packets before the library drops them as "unrequested".
+
+        Returns True if the hook was successfully installed.
+        """
+        bc = self._baichuan
+        if not bc:
+            return False
+
+        # Find the protocol object
+        protocol = None
+        connection = getattr(bc, "_connection", None)
+
+        if hasattr(bc, "_protocol") and bc._protocol:
+            protocol = bc._protocol
+        if not protocol and connection:
+            protocol = getattr(connection, "_protocol", None)
+        if not protocol and connection:
+            transport = getattr(connection, "_transport", None)
+            if transport and hasattr(transport, "get_protocol"):
+                protocol = transport.get_protocol()
+
+        if not protocol:
+            _LOGGER.warning("Preview intercept FAILED: no protocol found")
+            return False
+
+        parse_method_name = None
+        for name in ["parse_bc_data", "parse_data"]:
+            if hasattr(protocol, name):
+                parse_method_name = name
+                break
+
+        if not parse_method_name:
+            _LOGGER.warning("Preview intercept FAILED: no parse method on protocol")
+            return False
+
+        _LOGGER.warning(
+            "Installing Preview+Talk audio intercept on %s.%s",
+            type(protocol).__name__, parse_method_name,
+        )
+
+        original_parse = getattr(protocol, parse_method_name)
+        input_count = [0]
+        decrypt_mode = [None]  # "aes", "none", or "bc"
+
+        def _decrypt_payload(raw_payload: bytes) -> bytes:
+            """Decrypt binary payload using the Baichuan AES session key."""
+            if decrypt_mode[0] == "none":
+                return raw_payload
+
+            aes_key = getattr(bc, "_aes_key", None)
+            if aes_key is None:
+                if decrypt_mode[0] is None:
+                    decrypt_mode[0] = "none"
+                    _LOGGER.warning("Preview decrypt: no AES key, assuming unencrypted")
+                return raw_payload
+
+            try:
+                try:
+                    from Cryptodome.Cipher import AES as _AES  # noqa: PLC0415
+                except ImportError:
+                    from Crypto.Cipher import AES as _AES  # noqa: PLC0415
+                AES_IV = b"0123456789abcdef"
+                cipher = _AES.new(key=aes_key, mode=_AES.MODE_CFB, iv=AES_IV, segment_size=128)
+                decrypted = cipher.decrypt(raw_payload)
+
+                if decrypt_mode[0] is None:
+                    import struct as _st
+                    decrypt_mode[0] = "aes"
+                    if len(decrypted) >= 4:
+                        magic_val = _st.unpack_from("<I", decrypted, 0)[0]
+                        known = {
+                            0x62773130: "ADPCM", 0x62773530: "AAC",
+                            0x31303031: "InfoV1", 0x32303031: "InfoV2",
+                        }
+                        name = known.get(magic_val, "")
+                        if not name and (0x63643030 <= magic_val <= 0x63643039):
+                            name = "IFrame"
+                        elif not name and (0x63643130 <= magic_val <= 0x63643139):
+                            name = "PFrame"
+                        _LOGGER.warning(
+                            "✓ Preview decrypt: AES active. First frame: %s (magic=0x%08x)",
+                            name or "unknown", magic_val,
+                        )
+                return decrypted
+            except ImportError:
+                _LOGGER.error("Preview decrypt: pycryptodome not installed")
+                decrypt_mode[0] = "none"
+                return raw_payload
+            except Exception as exc:
+                if decrypt_mode[0] is None:
+                    decrypt_mode[0] = "none"
+                    _LOGGER.warning("Preview decrypt failed (%s), assuming unencrypted", exc)
+                return raw_payload
+
+        def _patched_parse() -> None:
+            """Intercept CMD 3 (Preview) and CMD 202 (Talk FDX) for audio extraction."""
+            data = protocol._data
+            if not data or len(data) < 20:
+                original_parse()
+                return
+
+            rec_cmd_id = int.from_bytes(data[4:8], byteorder="little")
+
+            # Only intercept CMD 3 (Preview stream) and CMD 202 (Talk FDX)
+            if rec_cmd_id not in (3, 202):
+                original_parse()
+                return
+
+            # Extract the binary payload from the Baichuan packet
+            rec_len_body = int.from_bytes(data[8:12], byteorder="little")
+            mess_class = data[18:20].hex()
+
+            if mess_class in ["1464", "0000"]:
+                len_header = 24
+                if len(data) < 24:
+                    original_parse()
+                    return
+                rec_payload_offset = int.from_bytes(data[20:24], byteorder="little")
+            elif mess_class == "1466":
+                len_header = 20
+                rec_payload_offset = 0
+            else:
+                original_parse()
+                return
+
+            # Check we have the complete message
+            data_len = len(data)
+            len_body = data_len - len_header
+            if len_body < rec_len_body:
+                # Incomplete — let original handle buffering
+                original_parse()
+                return
+
+            if rec_payload_offset == 0:
+                rec_payload_offset = rec_len_body
+
+            # Extract binary payload (after extension/XML offset)
+            len_chunk = rec_len_body + len_header
+            payload_start = rec_payload_offset + len_header
+            raw_payload = data[payload_start:len_chunk]
+
+            if raw_payload:
+                # Decrypt the payload
+                payload = _decrypt_payload(raw_payload)
+
+                input_count[0] += 1
+                self._preview_active = True
+
+                # Log first packets for debugging
+                if input_count[0] <= 10:
+                    import struct as _st2
+                    magic_val = _st2.unpack_from("<I", payload, 0)[0] if len(payload) >= 4 else 0
+                    magic_names = {
+                        0x62773130: "ADPCM", 0x62773530: "AAC",
+                        0x31303031: "InfoV1", 0x32303031: "InfoV2",
+                    }
+                    name = magic_names.get(magic_val, "")
+                    if not name:
+                        if 0x63643030 <= magic_val <= 0x63643039:
+                            name = "IFrame"
+                        elif 0x63643130 <= magic_val <= 0x63643139:
+                            name = "PFrame"
+                        else:
+                            name = f"Unknown(0x{magic_val:08x})"
+                    _LOGGER.warning(
+                        "Preview pkt #%d (CMD %d): %d bytes, type=%s",
+                        input_count[0], rec_cmd_id, len(payload), name,
+                    )
+                elif input_count[0] == 50:
+                    _LOGGER.warning(
+                        "Preview stream: 50 packets received, audio_frames=%d",
+                        self._preview_audio_frames,
+                    )
+                elif input_count[0] % 500 == 0:
+                    _LOGGER.warning(
+                        "Preview stream: %d packets, %d audio frames",
+                        input_count[0], self._preview_audio_frames,
+                    )
+
+                # Parse BcMedia frames and extract audio
+                pcm_data = self._parse_bcmedia_to_pcm(payload)
+                if pcm_data:
+                    self._preview_audio_frames += 1
+                    if self._listen_active:
+                        asyncio.ensure_future(self._on_audio_received(pcm_data))
+
+            # Consume this message from the buffer
+            if len_body > rec_len_body:
+                protocol._data = data[len_chunk:]
+                if protocol._data and len(protocol._data) >= 4:
+                    if protocol._data[0:4].hex() == "f0debc0a":
+                        _patched_parse()
+            else:
+                protocol._data = b""
+
+        setattr(protocol, parse_method_name, _patched_parse)
+        _LOGGER.warning("✓ Preview+Talk audio intercept installed")
+        return True
 
     # ─── Audio Input (Native Baichuan FDX + ffmpeg fallback) ──────────────────────
 
