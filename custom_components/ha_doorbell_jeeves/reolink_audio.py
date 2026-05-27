@@ -1108,49 +1108,44 @@ class ReolinkAudioHandler:
     async def _start_audio_input(self) -> None:
         """Start receiving audio from the doorbell mic.
 
-        Priority order for stream sources:
-          1. go2rtc local RTSP relay (no auth needed, doesn't consume camera slot)
-          2. go2rtc HTTP stream (FLV/MP4 — same benefits as RTSP relay)
-          3. Direct RTSP to camera (may fail if slot is taken by HA)
-          4. HTTP-FLV to camera
-          5. RTMP to camera
-          6. Camera entity stream_source
+        Priority order:
+          1. go2rtc authenticated stream proxy (pipes via HA's go2rtc session)
+          2. Direct RTSP to camera (works intermittently)
+          3. HTTP-FLV to camera
+          4. RTMP to camera
+          5. Camera entity stream_source
 
-        go2rtc is the ideal source because:
-          - It already holds the camera's RTSP connection
-          - It re-publishes locally without auth
-          - It doesn't consume additional camera connection slots
-          - It includes the audio track from the camera microphone
+        The go2rtc proxy is most reliable because HA's internal go2rtc already
+        manages the RTSP connection to the camera. We access it through the
+        authenticated session (which handles BasicAuth automatically).
         """
         self._listen_active = True
         _LOGGER.warning("Audio input: starting stream-based mic capture")
+
+        # Priority 1: Try go2rtc authenticated proxy (most reliable)
+        go2rtc_started = await self._start_go2rtc_proxy_stream()
+        if go2rtc_started:
+            _LOGGER.warning("Audio input: using go2rtc authenticated proxy")
+            return
+
+        # Fallback: use direct ffmpeg with URL list
         urls_to_try: list[str] = []
 
-        # Priority 1: go2rtc local RTSP relay (most reliable)
-        go2rtc_rtsp_url = await self._get_go2rtc_rtsp_url()
-        if go2rtc_rtsp_url:
-            urls_to_try.append(go2rtc_rtsp_url)
-
-        # Priority 2: go2rtc HTTP FLV stream (fallback if RTSP port not exposed)
-        go2rtc_http_url = await self._get_go2rtc_http_stream_url()
-        if go2rtc_http_url:
-            urls_to_try.append(go2rtc_http_url)
-
-        # Priority 3: Direct RTSP URL (lowest latency but intermittent 401)
+        # Direct RTSP URL (works intermittently)
         if getattr(self, "_reolink_rtsp_url", None):
             urls_to_try.append(self._reolink_rtsp_url)
 
-        # Priority 4: HTTP-FLV (query-param auth, needs self-signed cert bypass)
+        # HTTP-FLV (query-param auth, needs self-signed cert bypass)
         flv_url = getattr(self, "_reolink_flv_url", None)
         if flv_url:
             urls_to_try.append(flv_url)
 
-        # Priority 5: RTMP (password in query params — often port 1935 is disabled)
+        # RTMP (password in query params — often port 1935 is disabled)
         rtmp_url = getattr(self, "_reolink_rtmp_url", None)
         if rtmp_url:
             urls_to_try.append(rtmp_url)
 
-        # Priority 6: Camera entity stream source (may be same as RTSP)
+        # Camera entity stream source (may be same as RTSP)
         entity_stream_url = await self._get_camera_stream_source()
         if entity_stream_url and entity_stream_url not in urls_to_try:
             urls_to_try.append(entity_stream_url)
@@ -1160,10 +1155,217 @@ class ReolinkAudioHandler:
             self._listen_active = False
             return
 
-        _LOGGER.warning("Audio input: will try %d source(s)", len(urls_to_try))
+        _LOGGER.warning("Audio input: will try %d fallback source(s)", len(urls_to_try))
         self._input_processor_task = asyncio.create_task(
             self._audio_input_loop(urls_to_try)
         )
+
+    async def _start_go2rtc_proxy_stream(self) -> bool:
+        """Start audio input by proxying go2rtc's stream through HA's authenticated session.
+
+        This avoids ffmpeg needing to authenticate directly with go2rtc.
+        Flow: go2rtc HTTP stream → aiohttp (with auth) → ffmpeg stdin → PCM stdout → AI
+
+        Returns True if the proxy stream was started successfully.
+        """
+        stream_name = await self._resolve_go2rtc_stream_name()
+        if not stream_name:
+            _LOGGER.info("go2rtc proxy: no stream name available")
+            return False
+
+        base_url = await _discover_go2rtc_url(self._hass)
+        if not base_url:
+            _LOGGER.info("go2rtc proxy: go2rtc not available")
+            return False
+
+        ha_session = _get_go2rtc_session(self._hass)
+        if not ha_session:
+            _LOGGER.info("go2rtc proxy: no authenticated session available")
+            return False
+
+        # Check if stream exists; register if not
+        try:
+            async with ha_session.get(
+                f"{base_url}/api/streams",
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                if resp.status != 200:
+                    _LOGGER.warning("go2rtc proxy: API returned %d", resp.status)
+                    return False
+                streams: dict = await resp.json()
+        except Exception as exc:
+            _LOGGER.warning("go2rtc proxy: failed to query streams: %s", exc)
+            return False
+
+        _LOGGER.warning("go2rtc streams: %s", list(streams.keys())[:10])
+
+        if stream_name not in streams:
+            # Register the stream
+            rtsp_url = getattr(self, "_reolink_rtsp_url", None)
+            if not rtsp_url:
+                _LOGGER.warning("go2rtc proxy: can't register — no RTSP URL")
+                return False
+            try:
+                params = [("name", stream_name), ("src", rtsp_url)]
+                async with ha_session.put(
+                    f"{base_url}/api/streams",
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status not in (200, 201):
+                        _LOGGER.warning(
+                            "go2rtc proxy: registration failed (%d)", resp.status
+                        )
+                        return False
+                _LOGGER.warning("go2rtc proxy: registered stream '%s'", stream_name)
+                await asyncio.sleep(3)  # Give go2rtc time to connect to camera
+            except Exception as exc:
+                _LOGGER.warning("go2rtc proxy: registration error: %s", exc)
+                return False
+
+        # Start the proxy task
+        stream_url = f"{base_url}/api/stream.mp4?src={stream_name}"
+        self._input_processor_task = asyncio.create_task(
+            self._go2rtc_proxy_loop(ha_session, stream_url)
+        )
+        return True
+
+    async def _go2rtc_proxy_loop(
+        self, session: aiohttp.ClientSession, stream_url: str
+    ) -> None:
+        """Read audio from go2rtc via authenticated HTTP and decode with ffmpeg.
+
+        Opens the go2rtc stream.mp4 endpoint using HA's authenticated session,
+        then pipes the response body into ffmpeg for PCM decoding.
+        """
+        CHUNK_SIZE = 640  # 20ms of 16kHz mono s16le
+        chunks_sent = 0
+        first_logged = False
+
+        # Start ffmpeg reading from stdin (pipe), outputting PCM
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats",
+            "-f", "mp4", "-i", "pipe:0",
+            "-vn",  # No video
+            "-acodec", "pcm_s16le",
+            "-ar", str(AUDIO_INPUT_SAMPLE_RATE),
+            "-ac", "1",
+            "-f", "s16le",
+            "pipe:1",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _LOGGER.warning(
+            "go2rtc proxy: ffmpeg started (PID=%d), connecting to stream...",
+            proc.pid,
+        )
+
+        try:
+            async with session.get(
+                stream_url,
+                timeout=aiohttp.ClientTimeout(total=None, connect=10),
+            ) as resp:
+                if resp.status != 200:
+                    _LOGGER.warning(
+                        "go2rtc proxy: stream returned %d", resp.status
+                    )
+                    return
+
+                _LOGGER.warning(
+                    "go2rtc proxy: connected (content-type=%s)",
+                    resp.content_type,
+                )
+
+                # Stream response body → ffmpeg stdin
+                # Read output from ffmpeg stdout in parallel
+                async def _feed_ffmpeg() -> None:
+                    """Feed HTTP response into ffmpeg stdin."""
+                    try:
+                        async for chunk in resp.content.iter_chunked(8192):
+                            if not self._active or not self._listen_active:
+                                break
+                            proc.stdin.write(chunk)
+                            await proc.stdin.drain()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        pass
+                    finally:
+                        try:
+                            proc.stdin.close()
+                        except Exception:
+                            pass
+
+                feed_task = asyncio.create_task(_feed_ffmpeg())
+
+                try:
+                    while self._active and self._listen_active and proc.returncode is None:
+                        try:
+                            pcm_data = await asyncio.wait_for(
+                                proc.stdout.readexactly(CHUNK_SIZE), timeout=5.0
+                            )
+                        except asyncio.IncompleteReadError as err:
+                            pcm_data = err.partial
+                            if not pcm_data:
+                                break
+                        except asyncio.TimeoutError:
+                            # Check if ffmpeg is still alive
+                            if proc.returncode is not None:
+                                break
+                            continue
+
+                        if not first_logged:
+                            first_logged = True
+                            _LOGGER.warning(
+                                "✓ First audio from go2rtc proxy (%d bytes PCM @ %dHz)",
+                                len(pcm_data), AUDIO_INPUT_SAMPLE_RATE,
+                            )
+
+                        chunks_sent += 1
+                        if chunks_sent % 500 == 0:
+                            _LOGGER.info(
+                                "go2rtc proxy: %d chunks sent to AI", chunks_sent
+                            )
+
+                        await self._on_audio_received(pcm_data)
+                finally:
+                    feed_task.cancel()
+                    try:
+                        await feed_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            _LOGGER.warning("go2rtc proxy stream error: %s", exc)
+        finally:
+            if proc and proc.returncode is None:
+                try:
+                    proc.terminate()
+                    await asyncio.wait_for(proc.wait(), timeout=3)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+            # Read stderr for debugging
+            if proc:
+                try:
+                    stderr_data = await asyncio.wait_for(
+                        proc.stderr.read(2000), timeout=2
+                    )
+                    if stderr_data:
+                        _LOGGER.warning(
+                            "go2rtc proxy ffmpeg stderr: %s",
+                            stderr_data.decode(errors="replace").strip()[:300],
+                        )
+                except Exception:
+                    pass
+
+            self._listen_active = False
+            _LOGGER.warning(
+                "go2rtc proxy: stopped (sent %d chunks to AI)", chunks_sent
+            )
 
     def _install_baichuan_audio_intercept(self) -> bool:
         """Hook into the Baichuan protocol to intercept incoming CMD 202 audio.
