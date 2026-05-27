@@ -247,7 +247,10 @@ class ReolinkAudioHandler:
     ) -> None:
         self._hass = hass
         self._stream_name = stream_name
-        self._on_audio_received = on_audio_received
+        self._on_audio_received_raw = on_audio_received
+        # Wrap callback with gain amplification for low-level doorbell mics
+        self._mic_gain: float = 16.0  # Amplification factor for doorbell mic
+        self._on_audio_received = self._amplify_and_forward
         self._output_reader_task: asyncio.Task[None] | None = None
         self._active = False
         self._send_count = 0
@@ -290,6 +293,34 @@ class ReolinkAudioHandler:
         # from fragmented Baichuan packets so multi-packet BcMedia frames
         # (especially large video frames) are correctly reassembled.
         self._preview_stream_buffer: bytearray = bytearray()
+
+    async def _amplify_and_forward(self, pcm_data: bytes) -> None:
+        """Apply gain amplification to PCM audio before forwarding to AI.
+
+        Doorbell microphones typically produce very low-level signals via the
+        Baichuan protocol. We amplify by self._mic_gain to bring the signal
+        into a range where Gemini's VAD can detect speech (~RMS 3000-10000).
+        """
+        import struct as _struct  # noqa: PLC0415
+
+        if self._mic_gain == 1.0:
+            await self._on_audio_received_raw(pcm_data)
+            return
+
+        gain = self._mic_gain
+        n_samples = len(pcm_data) // 2
+        samples = _struct.unpack(f"<{n_samples}h", pcm_data)
+        amplified = []
+        for s in samples:
+            v = int(s * gain)
+            # Clamp to int16 range
+            if v > 32767:
+                v = 32767
+            elif v < -32768:
+                v = -32768
+            amplified.append(v)
+        amplified_pcm = _struct.pack(f"<{n_samples}h", *amplified)
+        await self._on_audio_received_raw(amplified_pcm)
 
     @property
     def is_active(self) -> bool:
@@ -713,19 +744,22 @@ class ReolinkAudioHandler:
             sample_rate, block_size,
         )
 
-        # Install Baichuan FDX audio intercept — captures mic audio from
-        # the camera's media stream sent back via CMD 202 during full-duplex talk.
-        # Skip if Preview intercept is already active (it handles both CMD 3 and CMD 202).
-        if ability.get("duplex") == "FDX" and not self._baichuan_audio_input_active and not self._preview_active:
-            # Start AAC decoder task before installing intercept
-            self._aac_queue = asyncio.Queue(maxsize=200)
-            self._aac_decoder_task = asyncio.create_task(self._aac_decode_loop())
+        # Install Baichuan FDX audio intercept on the TALK connection.
+        # In FDX mode, the camera sends continuous mic audio back via CMD 202
+        # on the same talk connection — this provides much better audio than the
+        # sparse Preview stream (~1 frame/sec vs ~50 frames/sec in FDX).
+        if ability.get("duplex") == "FDX" and not self._baichuan_audio_input_active:
+            # Start AAC decoder task if not already running
+            if not self._aac_queue:
+                self._aac_queue = asyncio.Queue(maxsize=200)
+            if not self._aac_decoder_task or self._aac_decoder_task.done():
+                self._aac_decoder_task = asyncio.create_task(self._aac_decode_loop())
 
             success = self._install_baichuan_audio_intercept()
             if success:
                 self._baichuan_audio_input_active = True
                 _LOGGER.warning(
-                    "Baichuan FDX audio intercept active — listening for ADPCM/AAC mic audio"
+                    "✓ Baichuan FDX audio intercept active on TALK connection — continuous mic audio"
                 )
 
         # Pure Python resampler: 24kHz mono s16le → camera sample_rate mono s16le
@@ -2000,9 +2034,13 @@ class ReolinkAudioHandler:
         We intercept at the protocol's parse_bc_data level because the
         library's normal parsing may drop CMD 202 packets with status=0.
 
+        Uses the TALK connection (self._talk_baichuan) which is separate from
+        the Preview connection, avoiding interference.
+
         Returns True if the hook was successfully installed.
         """
-        bc = self._baichuan
+        # Use the dedicated talk connection for FDX audio intercept
+        bc = getattr(self, "_talk_baichuan", None) or self._baichuan
         if not bc:
             return False
 
