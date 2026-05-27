@@ -129,6 +129,12 @@ class JeevesMemoryTimelineCardEditor extends HTMLElement {
       const el = this.shadowRoot.getElementById(id);
       if (el) el.addEventListener("input", () => this._onChange());
     });
+
+    // Auto-emit config if entity dropdown has a value but config doesn't
+    const entitySelect = this.shadowRoot.getElementById("entity");
+    if (entitySelect && entitySelect.value && !this._config.entity) {
+      this._onChange();
+    }
   }
 
   _onChange() {
