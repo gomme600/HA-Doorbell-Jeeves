@@ -134,6 +134,7 @@ class JeevesSessionManager:
         self._ai_speaking_clear_task: asyncio.Task[None] | None = None
         self._session_end_reason: str = "session ended"
         self._session_memory_saved = False
+        self._session_start_snapshot: str = ""
         self._transcript_history: list[dict[str, str]] = []
 
     def _normalize_manual_audio_config(self) -> None:
@@ -267,6 +268,11 @@ class JeevesSessionManager:
         self._starting = True
         try:
             _LOGGER.warning("async_start_session: beginning startup sequence")
+
+            # Capture visitor snapshot immediately (camera is most likely available now)
+            self._session_start_snapshot = await self._capture_memory_snapshot()
+            if self._session_start_snapshot:
+                _LOGGER.debug("Captured session start snapshot (%d bytes)", len(self._session_start_snapshot))
 
             # Lazy Reolink go2rtc setup (deferred from entry load for timing)
             if getattr(self, "reolink_needs_setup", False):
@@ -460,6 +466,7 @@ class JeevesSessionManager:
             self._client = None
 
         await self._store_session_memory(reason)
+        self._session_start_snapshot = ""  # Free memory
         self.hass.bus.async_fire(EVENT_SESSION_ENDED, {"entry_id": self.entry.entry_id})
         _LOGGER.info("Session ended (audit entries: %d)", len(self._security.audit_log))
 
@@ -1130,7 +1137,9 @@ class JeevesSessionManager:
             return
         timestamp = time.time()
         duration_seconds = max(0.0, timestamp - self._session_started_at)
-        snapshot_b64 = await self._capture_memory_snapshot()
+        # Prefer the snapshot captured at session start (camera was definitely available)
+        # Fall back to attempting a fresh capture at session end
+        snapshot_b64 = self._session_start_snapshot or await self._capture_memory_snapshot()
         recap = await self._generate_session_recap(outcome, snapshot_b64)
         memory = SessionMemory(
             timestamp=timestamp,
@@ -1148,13 +1157,21 @@ class JeevesSessionManager:
         """Capture a camera image to attach to the stored memory."""
         camera_entity = self._config.get(CONF_CAMERA_ENTITY, "")
         if not camera_entity:
+            _LOGGER.warning("No camera entity configured for memory snapshot")
             return ""
         try:
             image = await self.hass.components.camera.async_get_image(camera_entity, timeout=5)
             if image and image.content:
-                return base64.b64encode(image.content).decode("ascii")
+                b64 = base64.b64encode(image.content).decode("ascii")
+                _LOGGER.info(
+                    "Memory snapshot captured from %s (%d bytes)",
+                    camera_entity,
+                    len(image.content),
+                )
+                return b64
+            _LOGGER.warning("Camera %s returned empty image", camera_entity)
         except Exception:
-            _LOGGER.debug("Failed to capture memory snapshot", exc_info=True)
+            _LOGGER.warning("Failed to capture memory snapshot from %s", camera_entity, exc_info=True)
         return ""
 
     async def _generate_session_recap(
