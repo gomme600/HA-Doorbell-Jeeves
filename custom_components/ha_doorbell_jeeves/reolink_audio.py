@@ -1293,24 +1293,47 @@ class ReolinkAudioHandler:
                 input_count[0] += 1
                 if input_count[0] == 1:
                     _LOGGER.warning(
-                        "✓ First audio from doorbell mic via Baichuan FDX "
-                        "(%d bytes, decrypt=%s). First 32 hex: %s",
+                        "✓ First CMD 202 from doorbell via Baichuan FDX "
+                        "(%d bytes, decrypt=%s). First 8 hex: %s",
                         len(payload), decrypt_mode[0] or "auto",
-                        payload[:32].hex(),
+                        payload[:8].hex(),
+                    )
+                elif input_count[0] == 50:
+                    _LOGGER.warning(
+                        "Baichuan FDX: 50 CMD 202 packets received, "
+                        "audio_frames_found=%s",
+                        hasattr(self, "_bcmedia_parse_logged"),
                     )
                 elif input_count[0] % 500 == 0:
-                    _LOGGER.warning("Baichuan audio input: %d packets received", input_count[0])
+                    _LOGGER.warning("Baichuan FDX input: %d packets received", input_count[0])
+
+                # Log packet sizes for first 10 to understand the stream
+                if input_count[0] <= 10:
+                    import struct as _st2
+                    magic_val = _st2.unpack_from("<I", payload, 0)[0] if len(payload) >= 4 else 0
+                    magic_names = {
+                        0x62773130: "ADPCM",
+                        0x62773530: "AAC",
+                        0x31303031: "InfoV1",
+                        0x32303031: "InfoV2",
+                    }
+                    name = magic_names.get(magic_val, "")
+                    if not name:
+                        if 0x63643030 <= magic_val <= 0x63643039:
+                            name = "IFrame"
+                        elif 0x63643130 <= magic_val <= 0x63643139:
+                            name = "PFrame"
+                        else:
+                            name = f"Unknown(0x{magic_val:08x})"
+                    _LOGGER.warning(
+                        "FDX pkt #%d: %d bytes, type=%s",
+                        input_count[0], len(payload), name,
+                    )
 
                 # Parse BcMedia and decode ADPCM → PCM
                 pcm_data = self._parse_bcmedia_to_pcm(payload)
                 if pcm_data and self._listen_active:
                     asyncio.ensure_future(self._on_audio_received(pcm_data))
-                elif not pcm_data and input_count[0] <= 5:
-                    # Video-only packets are normal in the mixed stream
-                    _LOGGER.debug(
-                        "Audio input: no audio in packet #%d (%d bytes, likely video)",
-                        input_count[0], len(payload),
-                    )
 
             # Consume this message from the buffer
             if len_body > rec_len_body:
