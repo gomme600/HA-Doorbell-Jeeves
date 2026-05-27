@@ -1173,7 +1173,7 @@ class ReolinkAudioHandler:
         try:
             await self._send_preview_request(bc)
         except Exception as exc:
-            _LOGGER.warning("Preview stream: failed to send CMD 3: %s", exc)
+            _LOGGER.warning("Preview stream: failed to send CMD 3: %s", exc, exc_info=True)
             return False
 
         # Wait briefly for the first audio frame to confirm the stream is working
@@ -1224,14 +1224,13 @@ class ReolinkAudioHandler:
             "</body>\n"
         )
 
-        # Encrypt the body
-        body_bytes = preview_xml.encode("utf-8")
+        # Encrypt the body (pass string — HA's reolink_aio _aes_encrypt expects str)
         enc_type = self._talk_enc_type or bc_util.EncType.AES
 
         if enc_type == bc_util.EncType.BC:
-            enc_body = bc_util.encrypt_baichuan(body_bytes, 0)  # ch_id=0 for channel 0
+            enc_body = bc_util.encrypt_baichuan(preview_xml, 0)  # ch_id=0 for channel 0
         else:
-            enc_body = bc._aes_encrypt(body_bytes)
+            enc_body = bc._aes_encrypt(preview_xml)
 
         body_len = len(enc_body)
 
@@ -1308,13 +1307,12 @@ class ReolinkAudioHandler:
                 "</body>\n"
             )
 
-            body_bytes = stop_xml.encode("utf-8")
             enc_type = self._talk_enc_type or bc_util.EncType.AES
 
             if enc_type == bc_util.EncType.BC:
-                enc_body = bc_util.encrypt_baichuan(body_bytes, 0)
+                enc_body = bc_util.encrypt_baichuan(stop_xml, 0)
             else:
-                enc_body = bc._aes_encrypt(body_bytes)
+                enc_body = bc._aes_encrypt(stop_xml)
 
             body_len = len(enc_body)
             bc._mess_id = (bc._mess_id + 1) % 16777216
