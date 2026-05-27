@@ -250,6 +250,7 @@ class ReolinkAudioHandler:
         self._reolink_flv_url: str = ""
         self._camera_entity_id: str | None = None
         self._reolink_entry_id: str | None = None
+        self._camera_unique_id: str | None = None  # go2rtc stream name
         # Baichuan talk state (output — speaker)
         self._baichuan: Any = None
         self._talk_host: Any = None  # Dedicated Host object for talk connection
@@ -300,9 +301,9 @@ class ReolinkAudioHandler:
     async def _discover_reolink_details(self) -> None:
         """Get Reolink camera connection details from HA's Reolink integration.
 
-        Discovers RTMP, FLV, and RTSP URLs for audio input.
-        RTMP is preferred because it passes credentials as query params,
-        avoiding URL-encoding issues with special characters in passwords.
+        Discovers:
+          - Camera unique_id (= go2rtc stream name for local RTSP relay)
+          - RTMP, FLV, and RTSP URLs for direct camera access (fallback)
         """
         # First try to get from the camera entity's config entry
         reolink_entry_id = self._reolink_entry_id
@@ -312,6 +313,22 @@ class ReolinkAudioHandler:
             if camera_entity.startswith("jeeves_"):
                 camera_entity = camera_entity.replace("jeeves_", "").replace("_", ".", 1)
             reolink_entry_id = find_reolink_entry_for_camera(self._hass, camera_entity)
+
+        # Discover camera unique_id from entity registry (= go2rtc stream name)
+        camera_entity = self._camera_entity_id or ""
+        if camera_entity:
+            try:
+                from homeassistant.helpers import entity_registry as er  # noqa: PLC0415
+                registry = er.async_get(self._hass)
+                entity_entry = registry.async_get(camera_entity)
+                if entity_entry and entity_entry.unique_id:
+                    self._camera_unique_id = entity_entry.unique_id
+                    _LOGGER.info(
+                        "Camera unique_id (go2rtc stream name): %s",
+                        self._camera_unique_id,
+                    )
+            except Exception as exc:
+                _LOGGER.debug("Could not get camera unique_id: %s", exc)
 
         if reolink_entry_id:
             reolink_config = get_reolink_config(self._hass, reolink_entry_id)
@@ -1074,47 +1091,51 @@ class ReolinkAudioHandler:
         """Start receiving audio from the doorbell mic.
 
         Priority order for stream sources:
-          1. RTMP (password as query param — avoids URL-encoding issues)
-          2. HTTP-FLV (also query-param auth, works over HTTP)
-          3. RTSP (password in URL userinfo — may fail with special chars)
-          4. Camera entity stream_source
-          5. go2rtc proxy
+          1. go2rtc local RTSP relay (no auth needed, doesn't consume camera slot)
+          2. go2rtc HTTP stream (FLV/MP4 — same benefits as RTSP relay)
+          3. Direct RTSP to camera (may fail if slot is taken by HA)
+          4. HTTP-FLV to camera
+          5. RTMP to camera
+          6. Camera entity stream_source
 
-        The camera's microphone audio is available via the media stream, NOT via
-        the Baichuan CMD 202 talk channel.
+        go2rtc is the ideal source because:
+          - It already holds the camera's RTSP connection
+          - It re-publishes locally without auth
+          - It doesn't consume additional camera connection slots
+          - It includes the audio track from the camera microphone
         """
         self._listen_active = True
         _LOGGER.warning("Audio input: starting stream-based mic capture")
         urls_to_try: list[str] = []
 
-        # Priority 1: Direct RTSP URL (lowest latency, works intermittently)
+        # Priority 1: go2rtc local RTSP relay (most reliable)
+        go2rtc_rtsp_url = await self._get_go2rtc_rtsp_url()
+        if go2rtc_rtsp_url:
+            urls_to_try.append(go2rtc_rtsp_url)
+
+        # Priority 2: go2rtc HTTP FLV stream (fallback if RTSP port not exposed)
+        go2rtc_http_url = await self._get_go2rtc_http_stream_url()
+        if go2rtc_http_url:
+            urls_to_try.append(go2rtc_http_url)
+
+        # Priority 3: Direct RTSP URL (lowest latency but intermittent 401)
         if getattr(self, "_reolink_rtsp_url", None):
             urls_to_try.append(self._reolink_rtsp_url)
 
-        # Priority 2: HTTP-FLV (query-param auth, needs self-signed cert bypass)
+        # Priority 4: HTTP-FLV (query-param auth, needs self-signed cert bypass)
         flv_url = getattr(self, "_reolink_flv_url", None)
         if flv_url:
             urls_to_try.append(flv_url)
 
-        # Priority 3: RTMP (password in query params — often port 1935 is disabled)
+        # Priority 5: RTMP (password in query params — often port 1935 is disabled)
         rtmp_url = getattr(self, "_reolink_rtmp_url", None)
         if rtmp_url:
             urls_to_try.append(rtmp_url)
 
-        # Priority 4: Camera entity stream source
+        # Priority 6: Camera entity stream source (may be same as RTSP)
         entity_stream_url = await self._get_camera_stream_source()
         if entity_stream_url and entity_stream_url not in urls_to_try:
             urls_to_try.append(entity_stream_url)
-
-        # Priority 5: go2rtc proxy
-        go2rtc_url = await self._get_go2rtc_audio_url()
-        if go2rtc_url and go2rtc_url not in urls_to_try:
-            urls_to_try.append(go2rtc_url)
-
-        # Priority 6: HA's internal HLS stream (higher latency but always works)
-        hls_url = await self._get_ha_hls_stream_url()
-        if hls_url and hls_url not in urls_to_try:
-            urls_to_try.append(hls_url)
 
         if not urls_to_try:
             _LOGGER.warning("No audio input source available — mic input disabled")
@@ -1763,6 +1784,89 @@ class ReolinkAudioHandler:
                 upsampled.extend([s, s])
             return struct_mod.pack(f"<{len(upsampled)}h", *upsampled)
         return pcm_data
+
+    async def _get_go2rtc_rtsp_url(self) -> str | None:
+        """Get the go2rtc local RTSP URL for the camera's stream.
+
+        go2rtc re-publishes all camera streams via a local RTSP server.
+        The stream name matches the camera entity's unique_id.
+
+        This is the BEST source for mic audio because:
+          - go2rtc already holds the camera's RTSP connection
+          - No auth needed on localhost
+          - Doesn't consume a second camera connection slot
+          - Includes both video and audio tracks
+        """
+        stream_name = self._camera_unique_id
+        if not stream_name:
+            return None
+
+        # go2rtc RTSP output port (standard HA default = 8554)
+        # Verify go2rtc is available first
+        base_url = await _discover_go2rtc_url(self._hass)
+        if not base_url:
+            return None
+
+        # Extract host/port from go2rtc API URL to derive RTSP port
+        # HA go2rtc API runs on 11984, RTSP on 8554
+        # Standard go2rtc API on 1984, RTSP on 8554
+        rtsp_url = f"rtsp://127.0.0.1:8554/{stream_name}"
+        _LOGGER.warning("go2rtc local RTSP URL: %s", rtsp_url)
+        return rtsp_url
+
+    async def _get_go2rtc_http_stream_url(self) -> str | None:
+        """Get a go2rtc HTTP stream URL (FLV format) as fallback.
+
+        If go2rtc's RTSP output port isn't accessible, the HTTP API
+        can provide a live FLV stream that includes audio.
+        """
+        stream_name = self._camera_unique_id
+        if not stream_name:
+            return None
+
+        base_url = await _discover_go2rtc_url(self._hass)
+        if not base_url:
+            return None
+
+        # Verify the stream exists in go2rtc
+        ha_session = _get_go2rtc_session(self._hass)
+        own_session: aiohttp.ClientSession | None = None
+        if not ha_session:
+            own_session = aiohttp.ClientSession()
+        session = ha_session or own_session
+
+        try:
+            async with session.get(
+                f"{base_url}/api/streams",
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                streams: dict = await resp.json()
+
+            if stream_name in streams:
+                url = f"{base_url}/api/stream.flv?src={stream_name}"
+                _LOGGER.warning("go2rtc HTTP FLV URL: %s", url)
+                return url
+
+            # Try partial match (some go2rtc versions use different naming)
+            for name in streams:
+                if stream_name in name or name in stream_name:
+                    url = f"{base_url}/api/stream.flv?src={name}"
+                    _LOGGER.warning("go2rtc HTTP FLV URL (partial match): %s", url)
+                    return url
+
+            _LOGGER.info(
+                "Camera stream '%s' not found in go2rtc (available: %s)",
+                stream_name, list(streams.keys())[:5],
+            )
+            return None
+        except Exception:
+            _LOGGER.debug("Failed to query go2rtc for HTTP stream", exc_info=True)
+            return None
+        finally:
+            if own_session:
+                await own_session.close()
 
     async def _get_go2rtc_audio_url(self) -> str | None:
         """Find and return an audio URL from go2rtc's existing streams.
