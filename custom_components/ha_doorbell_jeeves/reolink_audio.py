@@ -246,6 +246,8 @@ class ReolinkAudioHandler:
         self._reolink_pass: str | None = None
         self._reolink_rtsp_port: int = 554
         self._reolink_rtsp_url: str = ""
+        self._reolink_rtmp_url: str = ""
+        self._reolink_flv_url: str = ""
         self._camera_entity_id: str | None = None
         self._reolink_entry_id: str | None = None
         # Baichuan talk state (output — speaker)
@@ -297,7 +299,9 @@ class ReolinkAudioHandler:
     async def _discover_reolink_details(self) -> None:
         """Get Reolink camera connection details from HA's Reolink integration.
 
-        Accesses the runtime Host object to get the actual RTSP port and credentials.
+        Discovers RTMP, FLV, and RTSP URLs for audio input.
+        RTMP is preferred because it passes credentials as query params,
+        avoiding URL-encoding issues with special characters in passwords.
         """
         # First try to get from the camera entity's config entry
         reolink_entry_id = self._reolink_entry_id
@@ -315,38 +319,54 @@ class ReolinkAudioHandler:
                 self._reolink_user = reolink_config["username"]
                 self._reolink_pass = reolink_config["password"]
 
-            # Try to get the actual RTSP port from the runtime Host object
+            # Try to get stream URLs from the runtime Host object
             entry = self._hass.config_entries.async_get_entry(reolink_entry_id)
             if entry and hasattr(entry, "runtime_data") and entry.runtime_data:
                 try:
                     host_obj = entry.runtime_data.host
                     api = host_obj.api
+
+                    # RTMP (preferred — password in query params, no URL-encoding issues)
+                    rtmp_url = api.get_rtmp_stream_source(0, "sub")
+                    if rtmp_url:
+                        self._reolink_rtmp_url = rtmp_url
+                        _LOGGER.warning("Reolink RTMP URL: %s", _mask_stream_url(rtmp_url))
+
+                    # HTTP-FLV (second choice — also query-param auth)
+                    flv_url = api.get_flv_stream_source(0, "sub")
+                    if flv_url:
+                        self._reolink_flv_url = flv_url
+                        _LOGGER.warning("Reolink FLV URL: %s", _mask_stream_url(flv_url))
+
+                    # RTSP (last resort — password in URL userinfo, prone to encoding issues)
                     port = api.rtsp_port
                     if port:
                         self._reolink_rtsp_port = port
-                        _LOGGER.warning("Got RTSP port from Reolink integration: %d", port)
-
-                    # Try to get verified RTSP URL
                     rtsp_url = await api.get_rtsp_stream_source(0, "sub", check=False)
                     if rtsp_url:
                         self._reolink_rtsp_url = rtsp_url
                         _LOGGER.warning("Reolink RTSP URL: %s", _mask_stream_url(rtsp_url))
                 except Exception as exc:
-                    _LOGGER.warning("Could not get RTSP details from Reolink Host: %s", exc)
+                    _LOGGER.warning("Could not get stream details from Reolink Host: %s", exc)
 
-        # Build RTSP URL from credentials if not discovered from API
-        if not hasattr(self, "_reolink_rtsp_url") or not self._reolink_rtsp_url:
+        # Build fallback RTMP URL from credentials if not discovered from API
+        if not getattr(self, "_reolink_rtmp_url", None):
+            if self._reolink_host and self._reolink_user and self._reolink_pass:
+                self._reolink_rtmp_url = (
+                    f"rtmp://{self._reolink_host}:1935/bcs/channel0_sub.bcs"
+                    f"?channel=0&stream=1&user={self._reolink_user}"
+                    f"&password={self._reolink_pass}"
+                )
+
+        # Build fallback RTSP URL from credentials if not discovered from API
+        if not getattr(self, "_reolink_rtsp_url", None):
             if self._reolink_host and self._reolink_user and self._reolink_pass:
                 encoded_pass = quote(self._reolink_pass, safe="")
-                port = self._reolink_rtsp_port or 554
+                port = getattr(self, "_reolink_rtsp_port", 554) or 554
                 self._reolink_rtsp_url = (
                     f"rtsp://{self._reolink_user}:{encoded_pass}"
                     f"@{self._reolink_host}:{port}/h264Preview_01_sub"
                 )
-                _LOGGER.warning("Built RTSP URL from credentials: rtsp://%s:***@%s:%d/...",
-                               self._reolink_user, self._reolink_host, port)
-            else:
-                self._reolink_rtsp_url = ""
 
         if not self._reolink_host:
             _LOGGER.warning("Could not discover Reolink host — audio output may not work")
@@ -618,13 +638,14 @@ class ReolinkAudioHandler:
             sample_rate, block_size,
         )
 
-        # Install Baichuan FDX audio intercept NOW (talk is active, camera will send audio)
+        # Install Baichuan FDX audio intercept (diagnostic only — CMD 202
+        # actually carries video frames, not mic audio. Mic comes via RTMP/RTSP)
         if ability.get("duplex") == "FDX" and not self._baichuan_audio_input_active:
             success = self._install_baichuan_audio_intercept()
             if success:
                 self._baichuan_audio_input_active = True
-                _LOGGER.warning(
-                    "✓ Audio input: native Baichuan FDX active (zero-config, no RTSP)"
+                _LOGGER.debug(
+                    "Baichuan FDX intercept installed (diagnostic only — mic via RTMP)"
                 )
 
         # Pure Python resampler: 24kHz mono s16le → camera sample_rate mono s16le
@@ -1051,33 +1072,40 @@ class ReolinkAudioHandler:
     async def _start_audio_input(self) -> None:
         """Start receiving audio from the doorbell mic.
 
-        Strategy (zero-config, fully native):
-          1. PRIMARY: Baichuan FDX — installed by the output loop after talk starts
-             (camera sends mic audio back on same connection during full-duplex talk)
-          2. FALLBACK: go2rtc existing stream / camera stream_source via ffmpeg
-             (only used if Baichuan FDX is not available)
+        Priority order for stream sources:
+          1. RTMP (password as query param — avoids URL-encoding issues)
+          2. HTTP-FLV (also query-param auth, works over HTTP)
+          3. RTSP (password in URL userinfo — may fail with special chars)
+          4. Camera entity stream_source
+          5. go2rtc proxy
 
-        The camera's microphone audio is available via RTSP/stream, NOT via
-        the Baichuan CMD 202 talk channel. CMD 202 is used for SENDING audio
-        to the camera's speaker; the mic audio is part of the normal media stream.
+        The camera's microphone audio is available via the media stream, NOT via
+        the Baichuan CMD 202 talk channel.
         """
         self._listen_active = True
-
-        # Always use stream-based audio input for the microphone
-        # (The Baichuan FDX channel only carries video back, not mic audio)
-        _LOGGER.warning("Audio input: starting stream-based mic capture (ffmpeg/RTSP)")
+        _LOGGER.warning("Audio input: starting stream-based mic capture")
         urls_to_try: list[str] = []
 
-        # Priority 1: Direct RTSP URL (lowest latency)
-        if self._reolink_rtsp_url:
+        # Priority 1: RTMP (most reliable — password in query params)
+        rtmp_url = getattr(self, "_reolink_rtmp_url", None)
+        if rtmp_url:
+            urls_to_try.append(rtmp_url)
+
+        # Priority 2: HTTP-FLV (also query-param auth)
+        flv_url = getattr(self, "_reolink_flv_url", None)
+        if flv_url:
+            urls_to_try.append(flv_url)
+
+        # Priority 3: Direct RTSP URL
+        if getattr(self, "_reolink_rtsp_url", None):
             urls_to_try.append(self._reolink_rtsp_url)
 
-        # Priority 2: Camera entity stream source
+        # Priority 4: Camera entity stream source
         entity_stream_url = await self._get_camera_stream_source()
         if entity_stream_url and entity_stream_url not in urls_to_try:
             urls_to_try.append(entity_stream_url)
 
-        # Priority 3: go2rtc proxy
+        # Priority 5: go2rtc proxy
         go2rtc_url = await self._get_go2rtc_audio_url()
         if go2rtc_url and go2rtc_url not in urls_to_try:
             urls_to_try.append(go2rtc_url)
@@ -1087,6 +1115,7 @@ class ReolinkAudioHandler:
             self._listen_active = False
             return
 
+        _LOGGER.warning("Audio input: will try %d source(s)", len(urls_to_try))
         self._input_processor_task = asyncio.create_task(
             self._audio_input_loop(urls_to_try)
         )
@@ -1857,10 +1886,13 @@ class ReolinkAudioHandler:
                 _mask_stream_url(url),
             )
 
-            # Build ffmpeg args — add RTSP-specific options only for rtsp:// URLs
+            # Build ffmpeg args with protocol-specific options
             ffmpeg_args = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats"]
             if url.startswith("rtsp://"):
                 ffmpeg_args.extend(["-rtsp_transport", "tcp"])
+            elif url.startswith("rtmp://"):
+                # RTMP: use live stream mode with low latency
+                ffmpeg_args.extend(["-live_start_index", "-1"])
             ffmpeg_args.extend([
                 "-i", url,
                 "-vn",  # No video — audio only
