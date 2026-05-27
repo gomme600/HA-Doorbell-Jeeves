@@ -1209,8 +1209,9 @@ class ReolinkAudioHandler:
                 input_count[0] += 1
                 if input_count[0] == 1:
                     _LOGGER.warning(
-                        "✓ First audio from doorbell mic via Baichuan FDX (%d bytes payload)",
-                        len(payload),
+                        "✓ First audio from doorbell mic via Baichuan FDX (%d bytes payload). "
+                        "First 32 bytes: %s",
+                        len(payload), payload[:32].hex(),
                     )
                 elif input_count[0] % 500 == 0:
                     _LOGGER.warning("Baichuan audio input: %d packets received", input_count[0])
@@ -1219,6 +1220,13 @@ class ReolinkAudioHandler:
                 pcm_data = self._parse_bcmedia_to_pcm(payload)
                 if pcm_data and self._listen_active:
                     asyncio.ensure_future(self._on_audio_received(pcm_data))
+                elif not pcm_data and input_count[0] <= 3:
+                    _LOGGER.warning(
+                        "Audio input: pcm_data=None for packet #%d (payload=%d bytes, "
+                        "listen_active=%s). Raw hex[:64]: %s",
+                        input_count[0], len(payload), self._listen_active,
+                        payload[:64].hex(),
+                    )
 
             # Consume this message from the buffer
             if len_body > rec_len_body:
@@ -1260,6 +1268,10 @@ class ReolinkAudioHandler:
         pcm_out = bytearray()
         offset = 0
 
+        if not payload or len(payload) < HEADER_SIZE:
+            _LOGGER.warning("BcMedia parse: payload too short (%d bytes)", len(payload) if payload else 0)
+            return None
+
         while offset + HEADER_SIZE <= len(payload):
             # Read BcMedia header
             try:
@@ -1270,7 +1282,14 @@ class ReolinkAudioHandler:
                 break
 
             if magic != MAGIC:
-                # Not a valid BcMedia frame — skip remaining
+                # Not a valid BcMedia frame — try raw ADPCM fallback
+                if offset == 0:
+                    _LOGGER.debug(
+                        "BcMedia magic mismatch at offset 0: got 0x%08x (%s), "
+                        "expected 0x%08x. First 32 bytes: %s. Trying raw ADPCM fallback.",
+                        magic, payload[:4].hex(), MAGIC, payload[:32].hex(),
+                    )
+                    return self._try_raw_adpcm_decode(payload)
                 break
 
             offset += HEADER_SIZE
@@ -1290,7 +1309,61 @@ class ReolinkAudioHandler:
             padded_size = block_size + ((-block_size) % 8)
             offset += padded_size
 
+        if not pcm_out and offset == 0:
+            _LOGGER.debug(
+                "BcMedia parse produced no PCM. Payload len=%d, first 32 bytes: %s",
+                len(payload), payload[:32].hex(),
+            )
+            return self._try_raw_adpcm_decode(payload)
+
         return bytes(pcm_out) if pcm_out else None
+
+    def _try_raw_adpcm_decode(self, payload: bytes) -> bytes | None:
+        """Fallback: try decoding payload directly as IMA ADPCM blocks.
+
+        Some cameras send raw ADPCM without BcMedia framing during FDX input.
+        The block starts with a 4-byte header (predictor + step_index + reserved)
+        followed by packed nibbles.
+        """
+        if not payload or len(payload) < 8:
+            return None
+
+        # Determine block size from talk ability if available
+        ability = self._talk_ability
+        if ability:
+            length_per_encoder = ability.get("length_per_encoder", 1024)
+            expected_block_size = (length_per_encoder // 2) + 4
+        else:
+            expected_block_size = 516  # Default: (1024/2)+4
+
+        pcm_out = bytearray()
+        offset = 0
+
+        while offset + 4 < len(payload):
+            # Try to decode from current offset as a single ADPCM block
+            remaining = len(payload) - offset
+            block_size = min(expected_block_size, remaining)
+            if block_size < 8:
+                break
+
+            adpcm_block = payload[offset: offset + block_size]
+            pcm_block = self._decode_ima_adpcm_block(adpcm_block)
+            if pcm_block:
+                pcm_out.extend(pcm_block)
+
+            # Advance with 8-byte alignment padding
+            padded_size = block_size + ((-block_size) % 8)
+            offset += padded_size
+
+        if pcm_out:
+            if not hasattr(self, "_raw_fallback_logged"):
+                self._raw_fallback_logged = True
+                _LOGGER.warning(
+                    "Audio input: using raw ADPCM decode fallback (%d bytes PCM from %d bytes payload)",
+                    len(pcm_out), len(payload),
+                )
+            return bytes(pcm_out)
+        return None
 
     def _decode_ima_adpcm_block(self, block: bytes) -> bytes | None:
         """Decode a single IMA/DVI ADPCM block to 16-bit PCM samples.
