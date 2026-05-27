@@ -61,6 +61,7 @@ class MemoryStore:
 
     def __init__(self, hass: HomeAssistant, entry_id: str) -> None:
         self._hass = hass
+        self._entry_id = entry_id
         self._store = Store(hass, STORAGE_VERSION, f"{STORAGE_KEY_PREFIX}.{entry_id}")
         self._memories: list[SessionMemory] = []
         self._retention_days: int = DEFAULT_MEMORY_RETENTION_DAYS
@@ -99,7 +100,9 @@ class MemoryStore:
         self._memories.append(memory)
         await self._prune_old_memories()
         await self.async_save()
-        self._hass.bus.async_fire(EVENT_MEMORY, memory.to_dict())
+        payload = memory.to_dict()
+        payload["entry_id"] = self._entry_id
+        self._hass.bus.async_fire(EVENT_MEMORY, payload)
         _LOGGER.info("Stored session memory %s", memory.id)
 
     async def _prune_old_memories(self) -> None:

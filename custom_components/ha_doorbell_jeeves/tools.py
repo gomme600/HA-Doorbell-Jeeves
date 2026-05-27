@@ -18,14 +18,26 @@ from typing import Any
 from homeassistant.core import HomeAssistant
 
 from .const import (
+    CONF_LLMVISION_CAMERAS,
+    CONF_LLMVISION_CATEGORIES,
+    CONF_LLMVISION_HOURS_BACK,
+    CONF_LLMVISION_INCLUDE_NO_ACTIVITY,
+    CONF_LLMVISION_MAX_EVENTS,
+    CONF_LLMVISION_TIMELINE_ENABLED,
     DEFAULT_CALENDAR_DAYS,
     DEFAULT_HISTORY_HOURS,
+    DEFAULT_LLMVISION_HOURS_BACK,
+    DEFAULT_LLMVISION_INCLUDE_NO_ACTIVITY,
+    DEFAULT_LLMVISION_MAX_EVENTS,
     GLOBAL_ACTIONS_ENTITY_ID,
     GLOBAL_ACTIONS_ENTITY_NAME,
     MAX_CALENDAR_DAYS,
     MAX_HISTORY_HOURS,
+    MAX_LLMVISION_EVENTS,
+    MAX_LLMVISION_HOURS,
     TOOL_GET_CALENDAR,
     TOOL_GET_HISTORY,
+    TOOL_GET_LLMVISION_EVENTS,
     TOOL_SEARCH_EVENTS,
     TOOL_VIEW_CAMERA,
 )
@@ -40,7 +52,11 @@ def _readable_entities(store: DataStore) -> list[ManagedEntity]:
     return [entity for entity in store.managed_entities if entity.entity_id != GLOBAL_ACTIONS_ENTITY_ID]
 
 
-def build_system_context(store: DataStore, hass: HomeAssistant) -> str:
+def build_system_context(
+    store: DataStore,
+    hass: HomeAssistant,
+    config: dict[str, Any] | None = None,
+) -> str:
     """Build the entity/action context block appended to the system prompt.
 
     This tells the AI what entities it can see, what actions it can perform,
@@ -94,6 +110,15 @@ def build_system_context(store: DataStore, hass: HomeAssistant) -> str:
         lines.append("• recall_memories: Search past doorbell conversations for useful context")
         lines.append("These are useful for answering questions about what happened recently.")
 
+    llmvision_enabled = bool((config or {}).get(CONF_LLMVISION_TIMELINE_ENABLED, False))
+    llmvision_service = hass.services.has_service("llmvision", "get_events")
+    if llmvision_enabled and llmvision_service:
+        lines.append("\n--- LLM VISION TIMELINE ---")
+        lines.append(
+            "• get_llmvision_events: Query recent LLM Vision detections "
+            "(timeline events with titles, descriptions, labels, camera names, and key frames)."
+        )
+
     # Notification targets
     if store.notification_targets:
         lines.append("\n--- NOTIFICATION TARGETS ---")
@@ -103,7 +128,10 @@ def build_system_context(store: DataStore, hass: HomeAssistant) -> str:
     return "\n".join(lines)
 
 
-def build_gemini_tools(store: DataStore) -> list[Any]:
+def build_gemini_tools(
+    store: DataStore,
+    config: dict[str, Any] | None = None,
+) -> list[Any]:
     """Build Gemini-format tool declarations from managed entities."""
     from google.genai import types  # noqa: PLC0415
 
@@ -238,6 +266,48 @@ def build_gemini_tools(store: DataStore) -> list[Any]:
             },
         ))
 
+    llmvision_enabled = bool((config or {}).get(CONF_LLMVISION_TIMELINE_ENABLED, False))
+    if llmvision_enabled:
+        declarations.append(types.FunctionDeclaration(
+            name=TOOL_GET_LLMVISION_EVENTS,
+            description=(
+                "Query recent events from the LLM Vision timeline. Use this for "
+                "questions about recently seen objects, motion, deliveries, or "
+                "activities around specific cameras."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Optional keyword filter (e.g. 'football', 'package', 'person').",
+                    },
+                    "hours_back": {
+                        "type": "integer",
+                        "description": "How many hours back to search (1-168).",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of events to return (1-200).",
+                    },
+                    "cameras": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional camera entity filters.",
+                    },
+                    "categories": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional category filters.",
+                    },
+                    "include_no_activity": {
+                        "type": "boolean",
+                        "description": "Whether to include 'no activity' timeline events.",
+                    },
+                },
+            },
+        ))
+
     # ─── Session memory and hangup tools ─────────────────────────────────────
     declarations.append(types.FunctionDeclaration(
         name="recall_memories",
@@ -333,7 +403,10 @@ def build_gemini_tools(store: DataStore) -> list[Any]:
     return [types.Tool(function_declarations=declarations)]
 
 
-def build_openai_tools(store: DataStore) -> list[dict[str, Any]]:
+def build_openai_tools(
+    store: DataStore,
+    config: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     """Build OpenAI-format tool declarations from managed entities."""
     tools: list[dict[str, Any]] = []
     readable_entities = _readable_entities(store)
@@ -465,6 +538,49 @@ def build_openai_tools(store: DataStore) -> list[dict[str, Any]]:
             },
         })
 
+    llmvision_enabled = bool((config or {}).get(CONF_LLMVISION_TIMELINE_ENABLED, False))
+    if llmvision_enabled:
+        tools.append({
+            "type": "function",
+            "name": TOOL_GET_LLMVISION_EVENTS,
+            "description": (
+                "Query recent events from the LLM Vision timeline. Use this for "
+                "questions about recently seen objects, motion, deliveries, or "
+                "activities around specific cameras."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Optional keyword filter (e.g. 'football', 'package', 'person').",
+                    },
+                    "hours_back": {
+                        "type": "integer",
+                        "description": "How many hours back to search (1-168).",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of events to return (1-200).",
+                    },
+                    "cameras": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional camera entity filters.",
+                    },
+                    "categories": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional category filters.",
+                    },
+                    "include_no_activity": {
+                        "type": "boolean",
+                        "description": "Whether to include 'no activity' timeline events.",
+                    },
+                },
+            },
+        })
+
     # Session memory and hangup tools
     tools.append({
         "type": "function",
@@ -568,6 +684,7 @@ async def execute_tool_call(
     store: DataStore,
     function_name: str,
     arguments: dict[str, Any],
+    config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Execute a tool call with strict entity validation."""
     try:
@@ -588,6 +705,8 @@ async def execute_tool_call(
             return await _execute_get_history(hass, store, arguments)
         if function_name == TOOL_SEARCH_EVENTS:
             return await _execute_search_events(hass, store, arguments)
+        if function_name == TOOL_GET_LLMVISION_EVENTS:
+            return await _execute_get_llmvision_events(hass, arguments, config)
 
         # Notification
         if function_name.startswith("notify_"):
@@ -650,7 +769,11 @@ async def _execute_get_calendar(
     Uses HA's calendar.get_events service to retrieve scheduled events.
     """
     calendar_id = arguments.get("calendar_entity_id", "")
-    days_ahead = min(int(arguments.get("days_ahead", DEFAULT_CALENDAR_DAYS)), MAX_CALENDAR_DAYS)
+    try:
+        requested_days = int(arguments.get("days_ahead", DEFAULT_CALENDAR_DAYS))
+    except (TypeError, ValueError):
+        requested_days = DEFAULT_CALENDAR_DAYS
+    days_ahead = max(1, min(requested_days, MAX_CALENDAR_DAYS))
 
     # Validate entity is managed
     allowed = [e.entity_id for e in store.managed_entities if e.entity_id.startswith("calendar.")]
@@ -718,7 +841,11 @@ async def _execute_get_history(
     Uses HA's history component to retrieve past states.
     """
     entity_id = arguments.get("entity_id", "")
-    hours_back = min(int(arguments.get("hours_back", DEFAULT_HISTORY_HOURS)), MAX_HISTORY_HOURS)
+    try:
+        requested_hours = int(arguments.get("hours_back", DEFAULT_HISTORY_HOURS))
+    except (TypeError, ValueError):
+        requested_hours = DEFAULT_HISTORY_HOURS
+    hours_back = max(1, min(requested_hours, MAX_HISTORY_HOURS))
 
     # Validate entity is managed
     allowed = [e.entity_id for e in _readable_entities(store)]
@@ -798,7 +925,11 @@ async def _execute_search_events(
     attributes, and entity names across all managed entities.
     """
     query = arguments.get("query", "").lower().strip()
-    hours_back = min(int(arguments.get("hours_back", DEFAULT_HISTORY_HOURS)), MAX_HISTORY_HOURS)
+    try:
+        requested_hours = int(arguments.get("hours_back", DEFAULT_HISTORY_HOURS))
+    except (TypeError, ValueError):
+        requested_hours = DEFAULT_HISTORY_HOURS
+    hours_back = max(1, min(requested_hours, MAX_HISTORY_HOURS))
 
     if not query:
         return {"error": "Search query cannot be empty."}
@@ -886,6 +1017,164 @@ async def _execute_search_events(
             "note": "Full history search unavailable, showing current state matches",
             "matches": current_matches,
         }
+
+
+async def _execute_get_llmvision_events(
+    hass: HomeAssistant,
+    arguments: dict[str, Any],
+    config: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Query events from the LLM Vision timeline integration."""
+    cfg = config or {}
+    if not cfg.get(CONF_LLMVISION_TIMELINE_ENABLED, False):
+        return {"error": "LLM Vision timeline integration is disabled in Jeeves options."}
+    if not hass.services.has_service("llmvision", "get_events"):
+        return {"error": "LLM Vision service 'llmvision.get_events' is not available."}
+
+    def _normalize_list(value: Any) -> list[str]:
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return []
+
+    try:
+        default_hours = int(cfg.get(CONF_LLMVISION_HOURS_BACK, DEFAULT_LLMVISION_HOURS_BACK))
+    except (TypeError, ValueError):
+        default_hours = DEFAULT_LLMVISION_HOURS_BACK
+    try:
+        default_limit = int(cfg.get(CONF_LLMVISION_MAX_EVENTS, DEFAULT_LLMVISION_MAX_EVENTS))
+    except (TypeError, ValueError):
+        default_limit = DEFAULT_LLMVISION_MAX_EVENTS
+
+    try:
+        requested_hours = int(arguments.get("hours_back", default_hours))
+    except (TypeError, ValueError):
+        requested_hours = default_hours
+    try:
+        requested_limit = int(arguments.get("limit", default_limit))
+    except (TypeError, ValueError):
+        requested_limit = default_limit
+
+    hours_back = max(1, min(requested_hours, MAX_LLMVISION_HOURS))
+    limit = max(1, min(requested_limit, MAX_LLMVISION_EVENTS))
+    raw_include_no_activity = arguments.get(
+        "include_no_activity",
+        cfg.get(
+            CONF_LLMVISION_INCLUDE_NO_ACTIVITY,
+            DEFAULT_LLMVISION_INCLUDE_NO_ACTIVITY,
+        ),
+    )
+    if isinstance(raw_include_no_activity, str):
+        include_no_activity = raw_include_no_activity.strip().lower() in {"1", "true", "yes", "on"}
+    else:
+        include_no_activity = bool(raw_include_no_activity)
+
+    cameras = _normalize_list(arguments.get("cameras"))
+    if not cameras:
+        cameras = _normalize_list(cfg.get(CONF_LLMVISION_CAMERAS, []))
+    categories = _normalize_list(arguments.get("categories"))
+    if not categories:
+        categories = _normalize_list(cfg.get(CONF_LLMVISION_CATEGORIES, []))
+
+    query = str(arguments.get("query", "") or "").strip().lower()
+
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(hours=hours_back)
+    payload: dict[str, Any] = {
+        "start": start.isoformat(),
+        "end": now.isoformat(),
+        "limit": limit,
+        "include_no_activity": include_no_activity,
+    }
+    if cameras:
+        payload["cameras"] = cameras
+    if categories:
+        payload["categories"] = categories
+
+    try:
+        response = await hass.services.async_call(
+            "llmvision",
+            "get_events",
+            payload,
+            blocking=True,
+            return_response=True,
+        )
+    except Exception as err:
+        return {"error": f"Failed to query llmvision.get_events: {err}"}
+
+    events_raw = response.get("events", []) if isinstance(response, dict) else []
+    if not isinstance(events_raw, list):
+        events_raw = []
+
+    filtered: list[dict[str, Any]] = []
+
+    def _as_text(value: Any) -> str:
+        if value is None:
+            return ""
+        if hasattr(value, "isoformat"):
+            try:
+                return str(value.isoformat())
+            except Exception:
+                return str(value)
+        return str(value)
+
+    def _sort_key(item: dict[str, Any]) -> float:
+        raw = item.get("start", "")
+        if isinstance(raw, (int, float)):
+            return float(raw)
+        if isinstance(raw, str):
+            candidate = raw.replace("Z", "+00:00")
+            try:
+                return datetime.fromisoformat(candidate).timestamp()
+            except ValueError:
+                return 0.0
+        return 0.0
+
+    for event in events_raw:
+        if not isinstance(event, dict):
+            continue
+        title = str(event.get("title", "") or "")
+        description = str(event.get("description", "") or "")
+        label = str(event.get("label", "") or "")
+        camera_name = str(event.get("camera_name", "") or "")
+        search_blob = f"{title} {description} {label} {camera_name}".lower()
+        if query and query not in search_blob:
+            continue
+        filtered.append(
+            {
+                "id": event.get("uid", ""),
+                "title": title,
+                "description": description,
+                "label": label,
+                "camera": camera_name,
+                "start": _as_text(event.get("start", "")),
+                "end": _as_text(event.get("end", "")),
+                "key_frame": _as_text(event.get("key_frame", "")),
+            }
+        )
+
+    filtered.sort(key=_sort_key, reverse=True)
+    filtered = filtered[:limit]
+
+    return {
+        "success": True,
+        "query": query,
+        "hours_back": hours_back,
+        "limit": limit,
+        "filters": {
+            "cameras": cameras,
+            "categories": categories,
+            "include_no_activity": include_no_activity,
+        },
+        "event_count": len(filtered),
+        "events": filtered,
+        "message": (
+            f"Found {len(filtered)} LLM Vision timeline event(s) in the last {hours_back} hour(s)."
+            if filtered
+            else f"No LLM Vision timeline events found in the last {hours_back} hour(s)."
+        ),
+    }
 
 
 # ─── Standard Tool Implementations ───────────────────────────────────────────

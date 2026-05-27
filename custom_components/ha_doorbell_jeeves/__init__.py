@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import logging
 import re
+from pathlib import Path
 from typing import Any
 
 import voluptuous as vol
 
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers import config_validation as cv
 
@@ -41,10 +43,17 @@ from .const import (
     SERVICE_START_SESSION,
     SERVICE_STOP_SESSION,
 )
+from .memory_views import register_memory_views
 from .models import EntityAction, KnownIdentity, ManagedEntity
 from .session_manager import JeevesSessionManager
 
 _LOGGER = logging.getLogger(__name__)
+PLATFORMS: list[Platform] = [Platform.SENSOR, Platform.CAMERA]
+_DOMAIN_INTERNAL = f"{DOMAIN}_internal"
+_INTERNAL_MEMORY_VIEWS = "memory_views_registered"
+_INTERNAL_FRONTEND_RESOURCES = "frontend_resources_registered"
+_MEMORY_TIMELINE_CARD_URL = "/ha_doorbell_jeeves/jeeves-memory-timeline-card.js"
+_MEMORY_TIMELINE_CARD_FILE = "jeeves-memory-timeline-card.js"
 
 # Type alias for runtime data stored on the config entry
 JeevesData = JeevesSessionManager
@@ -65,6 +74,13 @@ def _normalize_action_id(action_id: str) -> str:
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Doorbell Jeeves from a config entry."""
     hass.data.setdefault(DOMAIN, {})
+    internal_data = hass.data.setdefault(_DOMAIN_INTERNAL, {})
+    if not internal_data.get(_INTERNAL_MEMORY_VIEWS):
+        register_memory_views(hass)
+        internal_data[_INTERNAL_MEMORY_VIEWS] = True
+    if not internal_data.get(_INTERNAL_FRONTEND_RESOURCES):
+        await _register_frontend_resources(hass)
+        internal_data[_INTERNAL_FRONTEND_RESOURCES] = True
 
     # ─── Data migration: fix invalid model names from older configs ───
     _INVALID_MODELS = {"gemini-2.5-flash-native-audio-dialog"}
@@ -95,6 +111,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if not hass.services.has_service(DOMAIN, SERVICE_START_SESSION):
         _register_services(hass)
 
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
     # Listen for options updates
     entry.async_on_unload(entry.add_update_listener(_async_update_options))
 
@@ -108,6 +126,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a Doorbell Jeeves config entry."""
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if not unload_ok:
+        return False
+
     manager: JeevesSessionManager = hass.data[DOMAIN].pop(entry.entry_id, None)
     if manager:
         await manager.async_stop_session()
@@ -118,6 +140,30 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def _async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Handle options update — reload the integration."""
     await hass.config_entries.async_reload(entry.entry_id)
+
+
+async def _register_frontend_resources(hass: HomeAssistant) -> None:
+    """Register static frontend resources used by optional Lovelace cards."""
+    if not getattr(hass, "http", None):
+        _LOGGER.warning("HTTP component is not available; skipping frontend resource registration")
+        return
+    card_path = Path(__file__).parent / "frontend" / _MEMORY_TIMELINE_CARD_FILE
+    if not card_path.exists():
+        _LOGGER.warning("Memory timeline card file missing: %s", card_path)
+        return
+    if hasattr(hass.http, "async_register_static_paths"):
+        from homeassistant.components.http import StaticPathConfig  # noqa: PLC0415
+
+        await hass.http.async_register_static_paths(
+            [StaticPathConfig(_MEMORY_TIMELINE_CARD_URL, str(card_path), cache_headers=False)]
+        )
+    else:
+        hass.http.register_static_path(
+            _MEMORY_TIMELINE_CARD_URL,
+            str(card_path),
+            cache_headers=False,
+        )
+    _LOGGER.debug("Registered memory timeline card resource: %s", _MEMORY_TIMELINE_CARD_URL)
 
 
 async def _setup_reolink(hass: HomeAssistant, entry: ConfigEntry, config: dict[str, Any]) -> None:

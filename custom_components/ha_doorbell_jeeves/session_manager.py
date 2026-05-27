@@ -72,6 +72,7 @@ from .const import (
     IDENTITY_MODE_SENSOR,
     PROVIDER_GEMINI,
     SECURITY_MODE_AUTO,
+    TOOL_GET_LLMVISION_EVENTS,
 )
 from .frame_processor import process_frame
 from .memory import MemoryStore, SessionMemory
@@ -135,6 +136,27 @@ class JeevesSessionManager:
     @property
     def security(self) -> SecurityManager:
         return self._security
+
+    def get_memories(self, limit: int | None = None) -> list[SessionMemory]:
+        """Return stored memories, newest first."""
+        memories = sorted(
+            self._memory_store.memories,
+            key=lambda memory: memory.timestamp,
+            reverse=True,
+        )
+        if limit is not None:
+            return memories[: max(0, limit)]
+        return memories
+
+    def get_latest_memory(self) -> SessionMemory | None:
+        """Return the most recent stored memory, if available."""
+        memories = self.get_memories(limit=1)
+        return memories[0] if memories else None
+
+    @property
+    def memory_retention_days(self) -> int:
+        """Configured memory retention period."""
+        return self._memory_store.retention_days
 
     async def async_initialize(self) -> None:
         """Load persistent data and register start triggers."""
@@ -249,7 +271,7 @@ class JeevesSessionManager:
             )
 
             base_prompt: str = config.get(CONF_SYSTEM_PROMPT, DEFAULT_SYSTEM_PROMPT)
-            entity_context = build_system_context(self.store, self.hass)
+            entity_context = build_system_context(self.store, self.hass, config)
             identity_context = self._build_identity_context()
             full_prompt = base_prompt
             if entity_context:
@@ -258,8 +280,10 @@ class JeevesSessionManager:
                 full_prompt += f"\n\n{identity_context}"
 
             reference_images = self._get_reference_images()
-            gemini_tools = await self.hass.async_add_executor_job(build_gemini_tools, self.store)
-            openai_tools = build_openai_tools(self.store)
+            gemini_tools = await self.hass.async_add_executor_job(
+                build_gemini_tools, self.store, config
+            )
+            openai_tools = build_openai_tools(self.store, config)
 
             if dual_model:
                 await self._setup_tool_router(config, full_prompt, gemini_tools, openai_tools)
@@ -538,15 +562,16 @@ class JeevesSessionManager:
         from .tool_router import ToolRouter  # noqa: PLC0415
 
         # Tool model config (defaults to same provider/key as voice model)
-        tool_provider = config.get(CONF_TOOL_PROVIDER, config.get(CONF_PROVIDER, PROVIDER_GEMINI))
-        tool_api_key = config.get(CONF_TOOL_API_KEY, config.get(CONF_API_KEY, ""))
-        tool_base_url = config.get(CONF_TOOL_BASE_URL, config.get(CONF_API_BASE_URL))
+        tool_provider = config.get(CONF_TOOL_PROVIDER) or config.get(CONF_PROVIDER, PROVIDER_GEMINI)
+        voice_api_key = config.get(CONF_API_KEY, "")
+        tool_api_key = config.get(CONF_TOOL_API_KEY) or voice_api_key
+        tool_base_url = config.get(CONF_TOOL_BASE_URL) or config.get(CONF_API_BASE_URL)
 
         if tool_provider == PROVIDER_GEMINI:
-            tool_model = config.get(CONF_TOOL_MODEL, DEFAULT_TOOL_MODEL_GEMINI)
+            tool_model = config.get(CONF_TOOL_MODEL) or DEFAULT_TOOL_MODEL_GEMINI
             tools = gemini_tools
         else:
-            tool_model = config.get(CONF_TOOL_MODEL, DEFAULT_TOOL_MODEL_OPENAI)
+            tool_model = config.get(CONF_TOOL_MODEL) or DEFAULT_TOOL_MODEL_OPENAI
             tools = openai_tools
 
         async def _inject_context(text: str) -> None:
@@ -847,6 +872,7 @@ class JeevesSessionManager:
             "get_calendar_events",
             "get_entity_history",
             "search_events",
+            TOOL_GET_LLMVISION_EVENTS,
             "read_entity_state",
             "recall_memories",
         )
@@ -879,7 +905,13 @@ class JeevesSessionManager:
                         "instruction": "Inform the visitor this action cannot be completed.",
                     }
 
-        result = await execute_tool_call(self.hass, self.store, function_name, arguments)
+        result = await execute_tool_call(
+            self.hass,
+            self.store,
+            function_name,
+            arguments,
+            self._config,
+        )
 
         if result.get("_image_base64") and self._client:
             await self._client.send_image(
@@ -1074,12 +1106,13 @@ class JeevesSessionManager:
         """Use Gemini to summarize the session, with a safe fallback."""
         transcript_text = self._conversation_text()
         provider = self._config.get(CONF_PROVIDER, PROVIDER_GEMINI)
-        tool_provider = self._config.get(CONF_TOOL_PROVIDER, provider)
+        tool_provider = self._config.get(CONF_TOOL_PROVIDER) or provider
+        voice_api_key = self._config.get(CONF_API_KEY, "")
         api_key = ""
         if tool_provider == PROVIDER_GEMINI:
-            api_key = self._config.get(CONF_TOOL_API_KEY, "")
+            api_key = self._config.get(CONF_TOOL_API_KEY) or voice_api_key
         elif provider == PROVIDER_GEMINI:
-            api_key = self._config.get(CONF_API_KEY, "")
+            api_key = voice_api_key
         if not api_key:
             return self._fallback_session_recap(outcome)
 
@@ -1088,7 +1121,7 @@ class JeevesSessionManager:
             from google.genai import types  # noqa: PLC0415
 
             model = (
-                self._config.get(CONF_TOOL_MODEL, DEFAULT_TOOL_MODEL_GEMINI)
+                self._config.get(CONF_TOOL_MODEL) or DEFAULT_TOOL_MODEL_GEMINI
                 if tool_provider == PROVIDER_GEMINI
                 else DEFAULT_TOOL_MODEL_GEMINI
             )

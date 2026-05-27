@@ -47,6 +47,12 @@ from .const import (
     CONF_FRAME_MAX_WIDTH,
     CONF_FRAME_QUALITY,
     CONF_IDENTITY_MODE,
+    CONF_LLMVISION_CAMERAS,
+    CONF_LLMVISION_CATEGORIES,
+    CONF_LLMVISION_HOURS_BACK,
+    CONF_LLMVISION_INCLUDE_NO_ACTIVITY,
+    CONF_LLMVISION_MAX_EVENTS,
+    CONF_LLMVISION_TIMELINE_ENABLED,
     CONF_MEDIA_PLAYER_ENTITY,
     CONF_MEMORY_RETENTION_DAYS,
     CONF_MODEL,
@@ -66,6 +72,9 @@ from .const import (
     DEFAULT_FRAME_MAX_HEIGHT,
     DEFAULT_FRAME_MAX_WIDTH,
     DEFAULT_FRAME_QUALITY,
+    DEFAULT_LLMVISION_HOURS_BACK,
+    DEFAULT_LLMVISION_INCLUDE_NO_ACTIVITY,
+    DEFAULT_LLMVISION_MAX_EVENTS,
     DEFAULT_MEMORY_RETENTION_DAYS,
     DEFAULT_MODEL_GEMINI,
     DEFAULT_MODEL_OPENAI,
@@ -314,7 +323,9 @@ class DoorbellJeevesConfigFlow(ConfigFlow, domain=DOMAIN):
             data_schema=vol.Schema(
                 {
                     vol.Optional("start_entities", default=start_entities): EntitySelector(
-                        EntitySelectorConfig(domain=["binary_sensor", "input_boolean"], multiple=True)
+                        EntitySelectorConfig(
+                            domain=["binary_sensor", "input_boolean", "button"], multiple=True
+                        )
                     ),
                     vol.Optional(CONF_STOP_ENTITIES, default=self._data.get(CONF_STOP_ENTITIES, [])): EntitySelector(
                         EntitySelectorConfig(multiple=True)
@@ -370,7 +381,17 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         return self.async_show_menu(
             step_id="init",
-            menu_options=["general", "dual_model", "vision", "entities", "security", "triggers", "identities", "prompt"],
+            menu_options=[
+                "general",
+                "dual_model",
+                "vision",
+                "timeline",
+                "entities",
+                "security",
+                "triggers",
+                "identities",
+                "prompt",
+            ],
         )
 
     async def async_step_general(self, user_input: dict[str, Any] | None = None) -> FlowResult:
@@ -475,6 +496,94 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                     ): NumberSelector(NumberSelectorConfig(min=10, max=100, step=5, mode=NumberSelectorMode.SLIDER)),
                 }
             ),
+        )
+
+    async def async_step_timeline(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Configure optional LLM Vision timeline integration."""
+        llmvision_available = self.hass.services.has_service("llmvision", "get_events")
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            enabled = bool(user_input.get(CONF_LLMVISION_TIMELINE_ENABLED, False))
+            if enabled and not llmvision_available:
+                errors["base"] = "llmvision_not_found"
+            else:
+                updated = dict(user_input)
+                updated[CONF_LLMVISION_CAMERAS] = list(user_input.get(CONF_LLMVISION_CAMERAS, []))
+                updated[CONF_LLMVISION_CATEGORIES] = [
+                    str(category).strip().lower()
+                    for category in user_input.get(CONF_LLMVISION_CATEGORIES, [])
+                    if str(category).strip()
+                ]
+                self._data.update(updated)
+                return self._save_options()
+
+        category_options = [
+            {"value": "person", "label": "person"},
+            {"value": "people", "label": "people"},
+            {"value": "animal", "label": "animal"},
+            {"value": "vehicle", "label": "vehicle"},
+            {"value": "package", "label": "package"},
+            {"value": "motion", "label": "motion"},
+            {"value": "no_activity", "label": "no_activity"},
+            {"value": "unknown", "label": "unknown"},
+        ]
+
+        return self.async_show_form(
+            step_id="timeline",
+            data_schema=vol.Schema(
+                {
+                    vol.Optional(
+                        CONF_LLMVISION_TIMELINE_ENABLED,
+                        default=self._data.get(CONF_LLMVISION_TIMELINE_ENABLED, False),
+                    ): BooleanSelector(),
+                    vol.Optional(
+                        CONF_LLMVISION_HOURS_BACK,
+                        default=self._data.get(
+                            CONF_LLMVISION_HOURS_BACK, DEFAULT_LLMVISION_HOURS_BACK
+                        ),
+                    ): NumberSelector(
+                        NumberSelectorConfig(min=1, max=168, step=1, mode=NumberSelectorMode.SLIDER)
+                    ),
+                    vol.Optional(
+                        CONF_LLMVISION_MAX_EVENTS,
+                        default=self._data.get(
+                            CONF_LLMVISION_MAX_EVENTS, DEFAULT_LLMVISION_MAX_EVENTS
+                        ),
+                    ): NumberSelector(
+                        NumberSelectorConfig(min=1, max=200, step=1, mode=NumberSelectorMode.SLIDER)
+                    ),
+                    vol.Optional(
+                        CONF_LLMVISION_INCLUDE_NO_ACTIVITY,
+                        default=self._data.get(
+                            CONF_LLMVISION_INCLUDE_NO_ACTIVITY,
+                            DEFAULT_LLMVISION_INCLUDE_NO_ACTIVITY,
+                        ),
+                    ): BooleanSelector(),
+                    vol.Optional(
+                        CONF_LLMVISION_CAMERAS,
+                        default=self._data.get(CONF_LLMVISION_CAMERAS, []),
+                    ): EntitySelector(EntitySelectorConfig(domain="camera", multiple=True)),
+                    vol.Optional(
+                        CONF_LLMVISION_CATEGORIES,
+                        default=self._data.get(CONF_LLMVISION_CATEGORIES, []),
+                    ): SelectSelector(
+                        SelectSelectorConfig(
+                            options=category_options,
+                            mode=SelectSelectorMode.DROPDOWN,
+                            multiple=True,
+                            custom_value=True,
+                        )
+                    ),
+                }
+            ),
+            errors=errors,
+            description_placeholders={
+                "status": (
+                    "Detected ✅"
+                    if llmvision_available
+                    else "Not detected ❌ (install and configure LLM Vision first)"
+                )
+            },
         )
 
     async def async_step_entities(self, user_input: dict[str, Any] | None = None) -> FlowResult:
@@ -903,7 +1012,9 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
         is_reolink = self._data.get(CONF_AUDIO_MODE) == AUDIO_MODE_REOLINK
         schema: dict[Any, Any] = {
             vol.Optional("start_entities", default=start_entity_ids): EntitySelector(
-                EntitySelectorConfig(domain=["binary_sensor", "input_boolean"], multiple=True)
+                EntitySelectorConfig(
+                    domain=["binary_sensor", "input_boolean", "button"], multiple=True
+                )
             ),
             vol.Optional(CONF_STOP_ENTITIES, default=self._data.get(CONF_STOP_ENTITIES, [])): EntitySelector(
                 EntitySelectorConfig(multiple=True)

@@ -26,6 +26,8 @@
 | 📷 On-demand cameras | AI can view any camera to answer visitor questions |
 | 📅 Calendar access | AI can check schedules for availability questions |
 | 📜 Event history | AI can search recent motion/detection events |
+| 🕒 LLM Vision timeline | Optional `llmvision.get_events` tool for recent detections |
+| 🧾 Memory timeline card | Scrollable custom dashboard card with summaries + images |
 | ⏱️ Session timeout | Configurable auto-hangup (default 120s) |
 | 🔍 Audit trail | Full session logging per action |
 | ⚙️ GUI config | No YAML required — full menu-driven options flow |
@@ -67,7 +69,7 @@ For local models, select "OpenAI / Compatible" and set the base URL to your serv
 - Go to **Options → Dual Model** in the integration settings
 - Enable "Dual Model Mode"
 - Select the tool model provider and model name
-- Optionally use a different API key for the tool model
+- Optionally use a different API key for the tool model (leave blank to reuse the voice model key)
 
 ### When to use
 - ✅ **Enable** if your voice model is `gemini-2.5-flash-native-audio-dialog` (no native tool support)
@@ -140,6 +142,7 @@ After initial setup, configure via **Settings → Integrations → Configure**:
 |---------|-------------------|
 | **General** | AI provider, model, voice, timeout, validator model |
 | **Vision** | Camera entity, FPS, resolution, quality |
+| **Timeline Integration** | LLM Vision event tool settings (lookback, filters, limits) |
 | **Entities & Actions** | Add/remove managed entities, custom actions, notifications |
 | **Security** | Default security mode, PIN code, validator model |
 | **Triggers** | Start triggers (doorbell press), stop triggers (door opens) |
@@ -285,6 +288,79 @@ automation:
 | `ha_doorbell_jeeves_action_blocked` | Action rejected by security |
 | `ha_doorbell_jeeves_security_alert` | Threat indicators detected |
 | `ha_doorbell_jeeves_validator_decision` | Validator AI decision logged |
+| `ha_doorbell_jeeves_memory` | Session memory recap is stored |
+
+---
+
+## 🧩 Dashboard Memory Cards
+
+Doorbell Jeeves now exposes memory entities you can add directly to the dashboard:
+
+- **Memories** (`sensor`) — total stored memory count
+- **Latest Memory Summary** (`sensor`) — newest recap summary
+- **Memory Feed** (`sensor`) — all saved memories with image URLs + prebuilt markdown feed
+- **Latest Memory Image** (`camera`) — newest saved snapshot image
+
+### Recommended dashboard setup
+1. Add a **Tile card** for **Latest Memory Summary**.
+2. Add a **Tile card** for **Memories** (optional).
+3. Add a **Picture Entity card** for **Latest Memory Image** to display the snapshot.
+
+### All-in-one scrollable memory card (summaries + images)
+Use one **Markdown card** with the `Memory Feed` sensor:
+
+```yaml
+type: markdown
+title: Doorbell Memory Feed
+content: >
+  {{ state_attr('sensor.YOUR_MEMORY_FEED_ENTITY', 'dashboard_markdown') }}
+```
+
+Replace `sensor.YOUR_MEMORY_FEED_ENTITY` with your actual `Memory Feed` entity.
+
+### Jeeves Memory Timeline card (LLM timeline-style)
+The integration also serves a custom Lovelace card resource at:
+
+```
+/ha_doorbell_jeeves/jeeves-memory-timeline-card.js
+```
+
+1. Add this dashboard resource (**Settings → Dashboards → Resources**):
+
+```yaml
+url: /ha_doorbell_jeeves/jeeves-memory-timeline-card.js
+type: module
+```
+
+2. Add the custom card:
+
+```yaml
+type: custom:jeeves-memory-timeline-card
+entity: sensor.YOUR_MEMORY_FEED_ENTITY
+title: Doorbell Memories
+max_items: 100
+show_images: true
+relative_time: true
+height: 70vh
+```
+
+The card renders a single scrollable timeline of saved memory summaries and images.
+
+If you run multiple Jeeves instances, each entry creates its own set of memory entities.
+
+## 🕒 LLM Vision Timeline Integration
+
+If you use the [LLM Vision integration](https://github.com/valentinfrlch/ha-llmvision), Jeeves can query recent timeline events through a dedicated tool.
+
+### Setup
+1. Install and configure LLM Vision so `llmvision.get_events` is available.
+2. Open **Doorbell Jeeves → Configure → Timeline Integration**.
+3. Enable **LLM Vision Timeline Tool** and set defaults:
+   - lookback window (hours),
+   - max events per query,
+   - optional camera/category filters.
+
+When enabled, Jeeves can answer questions like: "Did you recently see a football in the garden?"
 
 ---
 
@@ -314,6 +390,7 @@ automation:
 - Python 3.12+
 - Gemini API key, OpenAI API key, or local model server
 - Camera entity (Reolink recommended, or any HA camera)
+- `ffmpeg` available in the Home Assistant runtime (required for Reolink audio pipelines)
 
 ---
 
@@ -322,15 +399,20 @@ automation:
 ```
 custom_components/ha_doorbell_jeeves/
 ├── __init__.py           # Entry point, service registration
+├── camera.py             # Latest memory snapshot camera entity
 ├── client_base.py        # Abstract client protocol
 ├── config_flow.py        # Setup wizard + options flow (menu-driven)
 ├── const.py              # Constants, providers, modes
 ├── frame_processor.py    # Pillow-based downscaling
+├── frontend/
+│   └── jeeves-memory-timeline-card.js  # Custom Lovelace memory timeline card
 ├── gemini_client.py      # Gemini Live API implementation
 ├── manifest.json         # Integration metadata
+├── memory_views.py       # HTTP endpoints for stored memory images
 ├── models.py             # ManagedEntity, EntityAction, KnownIdentity
 ├── openai_client.py      # OpenAI Realtime implementation
 ├── reolink_audio.py      # Reolink go2rtc 2-way audio handler
+├── sensor.py             # Memory summary/feed dashboard sensors
 ├── security.py           # Validator, rate limiting, audit
 ├── services.yaml         # Service definitions
 ├── session_manager.py    # Session orchestrator + triggers
