@@ -285,6 +285,10 @@ class ReolinkAudioHandler:
         self._preview_active = False
         self._preview_msg_num: int = 0
         self._preview_audio_frames: int = 0
+        # Streaming BcMedia parser buffer — accumulates decrypted payloads
+        # from fragmented Baichuan packets so multi-packet BcMedia frames
+        # (especially large video frames) are correctly reassembled.
+        self._preview_stream_buffer: bytearray = bytearray()
 
     @property
     def is_active(self) -> bool:
@@ -1219,16 +1223,18 @@ class ReolinkAudioHandler:
         """
         from reolink_aio.baichuan import util as bc_util  # noqa: PLC0415
 
-        _LOGGER.warning("CMD3 v2.9.21b: _send_preview_request entered")
+        _LOGGER.warning("CMD3 v2.9.23: _send_preview_request entered")
 
-        # Preview XML body — request subStream (lower bandwidth, still has audio)
+        # Preview XML body — request mainStream for full-quality audio
+        # mainStream: handle=0, continuous audio at full sample rate
+        # subStream (handle=256) has reduced audio that's too sparse for speech
         preview_xml = (
             '<?xml version="1.0" encoding="UTF-8" ?>\n'
             "<body>\n"
             '<Preview version="1.1">\n'
             "<channelId>0</channelId>\n"
-            "<handle>256</handle>\n"
-            "<streamType>subStream</streamType>\n"
+            "<handle>0</handle>\n"
+            "<streamType>mainStream</streamType>\n"
             "</Preview>\n"
             "</body>\n"
         )
@@ -1313,18 +1319,19 @@ class ReolinkAudioHandler:
 
         bc = self._baichuan
         self._preview_active = False
+        self._preview_stream_buffer.clear()
 
         try:
             from reolink_aio.baichuan import util as bc_util  # noqa: PLC0415
 
-            # CMD 4 body is just the channel ID in a simple XML
+            # CMD 4 body — must match the stream we started (mainStream, handle=0)
             stop_xml = (
                 '<?xml version="1.0" encoding="UTF-8" ?>\n'
                 "<body>\n"
                 '<Preview version="1.1">\n'
                 "<channelId>0</channelId>\n"
-                "<handle>256</handle>\n"
-                "<streamType>subStream</streamType>\n"
+                "<handle>0</handle>\n"
+                "<streamType>mainStream</streamType>\n"
                 "</Preview>\n"
                 "</body>\n"
             )
@@ -1535,44 +1542,29 @@ class ReolinkAudioHandler:
                 input_count[0] += 1
                 self._preview_active = True
 
-                # Log first packets for debugging
-                if input_count[0] <= 15:
+                # Log first few packets for debugging
+                if input_count[0] <= 5:
                     import struct as _st2
                     magic_val = _st2.unpack_from("<I", payload, 0)[0] if len(payload) >= 4 else 0
-                    magic_names = {
-                        0x62773130: "ADPCM", 0x62773530: "AAC",
-                        0x31303031: "InfoV1", 0x32303031: "InfoV2",
-                    }
-                    name = magic_names.get(magic_val, "")
-                    if not name:
-                        if 0x63643030 <= magic_val <= 0x63643039:
-                            name = "IFrame"
-                        elif 0x63643130 <= magic_val <= 0x63643139:
-                            name = "PFrame"
-                        else:
-                            name = f"Unknown(0x{magic_val:08x})"
                     _LOGGER.warning(
-                        "Preview pkt #%d (CMD %d): %d bytes, type=%s, payload_offset=%d, first16=%s",
-                        input_count[0], rec_cmd_id, len(payload), name,
-                        rec_payload_offset, payload[:16].hex() if len(payload) >= 16 else payload.hex(),
+                        "Preview pkt #%d (CMD %d): %d bytes, first4=0x%08x, buf=%d",
+                        input_count[0], rec_cmd_id, len(payload), magic_val,
+                        len(self._preview_stream_buffer),
                     )
                 elif input_count[0] == 50:
                     _LOGGER.warning(
-                        "Preview stream: 50 packets received, audio_frames=%d",
-                        self._preview_audio_frames,
+                        "Preview stream: 50 packets, audio_frames=%d, buf=%d",
+                        self._preview_audio_frames, len(self._preview_stream_buffer),
                     )
-                elif input_count[0] % 500 == 0:
+                elif input_count[0] % 200 == 0:
                     _LOGGER.warning(
                         "Preview stream: %d packets, %d audio frames",
                         input_count[0], self._preview_audio_frames,
                     )
 
-                # Parse BcMedia frames and extract audio
-                pcm_data = self._parse_bcmedia_to_pcm(payload)
-                if pcm_data:
-                    self._preview_audio_frames += 1
-                    if self._listen_active:
-                        asyncio.ensure_future(self._on_audio_received(pcm_data))
+                # Accumulate into streaming buffer and parse complete BcMedia frames
+                self._preview_stream_buffer.extend(payload)
+                self._parse_preview_stream_buffer()
             else:
                 # Empty payload — might be an ACK or status-only response
                 input_count[0] += 1
@@ -1595,6 +1587,190 @@ class ReolinkAudioHandler:
         setattr(protocol, parse_method_name, _patched_parse)
         _LOGGER.warning("✓ Preview+Talk audio intercept installed")
         return True
+
+    def _parse_preview_stream_buffer(self) -> None:
+        """Parse complete BcMedia frames from the accumulated preview stream buffer.
+
+        The camera fragments BcMedia frames across multiple Baichuan CMD 3 packets.
+        A single BcMedia video frame (32-byte header + payload) may arrive as:
+          - Packet 1: BcMedia header (32 bytes with magic + sizes)
+          - Packet 2: Video data (N bytes)
+
+        We accumulate all decrypted payloads into _preview_stream_buffer and
+        extract complete frames. Incomplete frames remain in the buffer.
+        """
+        import struct as struct_mod  # noqa: PLC0415
+
+        MAGIC_ADPCM = 0x62773130
+        MAGIC_AAC = 0x62773530
+        MAGIC_INFO_V1 = 0x31303031
+        MAGIC_INFO_V2 = 0x32303031
+        IFRAME_BASE = 0x63643030
+        PFRAME_BASE = 0x63643130
+        PAD = 8
+
+        buf = self._preview_stream_buffer
+        frames_processed = 0
+        max_iterations = 200  # safety limit per call
+
+        while len(buf) >= 8 and frames_processed < max_iterations:
+            magic = struct_mod.unpack_from("<I", buf, 0)[0]
+
+            if magic == MAGIC_ADPCM:
+                # ADPCM: magic(4) + plen1(2) + plen2(2) + data_magic(2) + half_block(2) + data(plen1-4) + pad
+                if len(buf) < 8:
+                    break
+                plen1 = struct_mod.unpack_from("<H", buf, 4)[0]
+                block_size = plen1 - 4 if plen1 > 4 else plen1
+                total = 4 + 4 + block_size  # magic + sub-header(4) + data
+                total += (-plen1) % PAD  # padding
+                # We need: 4(magic) + 4(plen1+plen2) + 4(data_magic+half_block) + block_size + pad
+                frame_total = 4 + 8 + block_size + ((-plen1) % PAD)
+                if len(buf) < frame_total:
+                    break  # need more data
+                # Extract ADPCM audio
+                adpcm_block = bytes(buf[12:12 + block_size])
+                pcm_block = self._decode_ima_adpcm_block(adpcm_block)
+                if pcm_block:
+                    self._preview_audio_frames += 1
+                    if self._listen_active:
+                        asyncio.ensure_future(self._on_audio_received(pcm_block))
+                del buf[:frame_total]
+                frames_processed += 1
+
+            elif magic == MAGIC_AAC:
+                # AAC: magic(4) + plen1(2) + plen2(2) + aac_data(plen1) + pad
+                if len(buf) < 8:
+                    break
+                plen1 = struct_mod.unpack_from("<H", buf, 4)[0]
+                frame_total = 8 + plen1 + ((-plen1) % PAD)
+                if len(buf) < frame_total:
+                    break  # need more data
+                aac_data = bytes(buf[8:8 + plen1])
+                # Log first AAC frame
+                if not hasattr(self, "_stream_aac_logged"):
+                    self._stream_aac_logged = True
+                    _LOGGER.warning(
+                        "✓ Streaming AAC frame: %d bytes, ADTS=%s",
+                        len(aac_data), aac_data[:4].hex() if len(aac_data) >= 4 else "?",
+                    )
+                # Queue for decoder
+                if self._aac_queue is not None:
+                    try:
+                        self._aac_queue.put_nowait(aac_data)
+                    except asyncio.QueueFull:
+                        pass
+                    self._preview_audio_frames += 1
+                    if self._listen_active:
+                        # Also try direct decode for low-latency
+                        pcm = self._try_aac_to_pcm_direct(aac_data)
+                        if pcm:
+                            asyncio.ensure_future(self._on_audio_received(pcm))
+                del buf[:frame_total]
+                frames_processed += 1
+
+            elif (IFRAME_BASE <= magic <= IFRAME_BASE + 9) or \
+                 (PFRAME_BASE <= magic <= PFRAME_BASE + 9):
+                # Video frame: magic(4) + video_type(4) + payload_size(4) +
+                #   add_header_size(4) + microseconds(4) + unknown(4) +
+                #   additional_header(N) + video_data(M) + padding
+                if len(buf) < 24:
+                    break
+                payload_size = struct_mod.unpack_from("<I", buf, 8)[0]
+                add_header_size = struct_mod.unpack_from("<I", buf, 12)[0]
+                # Total frame size: 24 (fixed header) + add_header + payload + padding
+                frame_total = 24 + add_header_size + payload_size
+                frame_total += (-(payload_size)) % PAD
+                if len(buf) < frame_total:
+                    break  # incomplete — wait for more data
+                # Skip video frame (don't need it for audio)
+                del buf[:frame_total]
+                frames_processed += 1
+
+            elif magic in (MAGIC_INFO_V1, MAGIC_INFO_V2):
+                # Info frames — skip
+                if len(buf) < 8:
+                    break
+                header_size = struct_mod.unpack_from("<I", buf, 4)[0]
+                frame_total = 4 + header_size + ((-header_size) % PAD)
+                if len(buf) < frame_total:
+                    break
+                del buf[:frame_total]
+                frames_processed += 1
+
+            else:
+                # Unknown magic — not a recognized BcMedia frame start.
+                # Try to find next known magic by scanning forward.
+                # This handles cases where decryption produced garbage at start.
+                found_next = False
+                for scan_offset in range(4, min(len(buf), 4096), 4):
+                    if scan_offset + 4 > len(buf):
+                        break
+                    scan_magic = struct_mod.unpack_from("<I", buf, scan_offset)[0]
+                    if (scan_magic == MAGIC_ADPCM or scan_magic == MAGIC_AAC or
+                        scan_magic in (MAGIC_INFO_V1, MAGIC_INFO_V2) or
+                        (IFRAME_BASE <= scan_magic <= IFRAME_BASE + 9) or
+                        (PFRAME_BASE <= scan_magic <= PFRAME_BASE + 9)):
+                        # Found a valid frame start — skip the garbage before it
+                        if not hasattr(self, "_stream_skip_logged"):
+                            self._stream_skip_logged = True
+                            _LOGGER.warning(
+                                "Stream buffer: skipped %d bytes of unknown data "
+                                "(magic=0x%08x) to reach next frame (magic=0x%08x)",
+                                scan_offset, magic, scan_magic,
+                            )
+                        del buf[:scan_offset]
+                        found_next = True
+                        break
+
+                if not found_next:
+                    # No recognizable magic in buffer — might be partial frame
+                    # or all garbage. If buffer is large, try raw audio decode
+                    # on the first chunk, then discard.
+                    if len(buf) > 2048:
+                        # Possibly raw audio — try G.711/ADPCM decode on first portion
+                        raw_chunk = bytes(buf[:1024])
+                        pcm = self._try_raw_adpcm_decode(raw_chunk)
+                        if pcm:
+                            self._preview_audio_frames += 1
+                            if self._listen_active:
+                                asyncio.ensure_future(self._on_audio_received(pcm))
+                        del buf[:1024]
+                        frames_processed += 1
+                    else:
+                        break  # wait for more data to find a magic
+
+        # Log first successful streaming parse
+        if frames_processed > 0 and not hasattr(self, "_stream_parse_logged"):
+            self._stream_parse_logged = True
+            _LOGGER.warning(
+                "✓ Streaming BcMedia parser active: %d frames processed, "
+                "%d audio total, buf_remaining=%d",
+                frames_processed, self._preview_audio_frames, len(buf),
+            )
+
+        # Safety: if buffer grows too large without finding frames, truncate
+        if len(buf) > 65536:
+            _LOGGER.warning(
+                "Stream buffer overflow (%d bytes), discarding. Audio frames so far: %d",
+                len(buf), self._preview_audio_frames,
+            )
+            buf.clear()
+
+    def _try_aac_to_pcm_direct(self, aac_data: bytes) -> bytes | None:
+        """Try to detect if AAC data has ADTS header and is actually G.711/raw PCM.
+
+        Some Reolink cameras send raw audio (not AAC) in the AAC BcMedia container.
+        Check if the data starts with ADTS sync (0xFFF) — if so, it's real AAC
+        and should go through the ffmpeg decoder. If not, try raw decode.
+        """
+        if len(aac_data) < 2:
+            return None
+        # Real AAC ADTS starts with 0xFFF (12 bits)
+        if (aac_data[0] == 0xFF) and ((aac_data[1] & 0xF0) == 0xF0):
+            return None  # Real AAC — let ffmpeg handle it
+        # Not ADTS — try as raw G.711
+        return self._try_raw_adpcm_decode(aac_data)
 
     # ─── Audio Input (Native Baichuan FDX + ffmpeg fallback) ──────────────────────
 
