@@ -1193,10 +1193,17 @@ class JeevesSessionManager:
 
                 if self._client and self._active:
                     try:
-                        await self._client.send_audio(audio_bytes)
+                        # Split large chunks into ~128ms segments (4096 bytes at 16kHz/16-bit)
+                        # Gemini VAD needs small chunks to detect speech boundaries accurately
+                        CHUNK_SIZE = 4096
+                        for offset in range(0, len(audio_bytes), CHUNK_SIZE):
+                            segment = audio_bytes[offset:offset + CHUNK_SIZE]
+                            if segment:
+                                await self._client.send_audio(segment)
                         forwarded += 1
                         if forwarded == 1:
-                            _LOGGER.warning("✓ First microphone chunk forwarded to AI session")
+                            _LOGGER.warning("✓ First microphone chunk forwarded to AI session (%d bytes, split into %d segments)",
+                                            len(audio_bytes), (len(audio_bytes) + CHUNK_SIZE - 1) // CHUNK_SIZE)
                         elif forwarded % 500 == 0:
                             _LOGGER.info("Microphone chunks forwarded to AI: %d", forwarded)
                     except Exception:

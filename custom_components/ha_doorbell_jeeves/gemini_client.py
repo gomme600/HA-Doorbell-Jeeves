@@ -133,7 +133,8 @@ class GeminiLiveClient(BaseRealtimeClient):
         Uses LiveClientContent (content turn) instead of send_realtime_input(video=)
         because the native audio dialog model does not support realtime video input
         but can accept images as inline_data in user content turns.
-        turn_complete=False keeps it passive (model sees it without responding).
+        turn_complete=True marks the visual update as a complete turn so it doesn't
+        block the model's VAD-triggered audio responses.
         """
         if not self._session or not self._connected:
             return
@@ -147,7 +148,7 @@ class GeminiLiveClient(BaseRealtimeClient):
                             data=image_bytes, mime_type=mime_type
                         ))],
                     )],
-                    turn_complete=False,
+                    turn_complete=True,
                 )
             )
         except Exception:

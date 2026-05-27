@@ -112,7 +112,7 @@ DEFAULT_MODEL_OPENAI = "gpt-4o-realtime-preview"
 DEFAULT_TOOL_MODEL_GEMINI = "gemini-3.1-flash-lite"
 DEFAULT_TOOL_MODEL_OPENAI = "gpt-4.1"
 DEFAULT_TEXT_MODEL_GEMINI = "gemini-3.1-flash-lite"
-DEFAULT_VISION_FPS = 1.0
+DEFAULT_VISION_FPS = 0.2  # 1 frame per 5 seconds (native audio model needs turn_complete=True per frame)
 DEFAULT_SESSION_TIMEOUT = 120
 DEFAULT_SILENCE_TIMEOUT = 30.0
 DEFAULT_CHIME_DELAY = 3.0
