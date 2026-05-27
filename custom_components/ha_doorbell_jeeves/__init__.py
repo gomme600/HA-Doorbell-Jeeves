@@ -155,36 +155,67 @@ async def _register_frontend_resources(hass: HomeAssistant) -> None:
         _LOGGER.warning("Memory timeline card file missing: %s", card_path)
         return
 
-    # Serve the card JS via a custom view with the correct MIME type.
-    # HA's static path serving returns text/plain for .js files and the strict
-    # nosniff header prevents browsers from executing import()'d modules.
-    from aiohttp import web  # noqa: PLC0415
+    # Register the file as a static path
+    if hasattr(hass.http, "async_register_static_paths"):
+        from homeassistant.components.http import StaticPathConfig  # noqa: PLC0415
 
-    from homeassistant.components.http import HomeAssistantView  # noqa: PLC0415
+        await hass.http.async_register_static_paths(
+            [StaticPathConfig(_MEMORY_TIMELINE_CARD_URL, str(card_path), cache_headers=False)]
+        )
+    else:
+        hass.http.register_static_path(
+            _MEMORY_TIMELINE_CARD_URL,
+            str(card_path),
+            cache_headers=False,
+        )
 
-    card_bytes = card_path.read_bytes()
+    # Register as a Lovelace resource so it loads via <script> tag (not import())
+    # This avoids MIME type issues with the nosniff header.
+    await _ensure_lovelace_resource(hass, _MEMORY_TIMELINE_CARD_URL)
+    _LOGGER.debug("Registered memory timeline card resource: %s", _MEMORY_TIMELINE_CARD_URL)
 
-    class _CardJSView(HomeAssistantView):
-        """Serve the memory timeline card JavaScript with correct MIME."""
 
-        url = "/api/ha_doorbell_jeeves/card.js"
-        name = f"api:{DOMAIN}:card_js"
-        requires_auth = False  # Frontend resources must load without auth
+async def _ensure_lovelace_resource(hass: HomeAssistant, url: str) -> None:
+    """Ensure the URL is registered as a Lovelace dashboard resource."""
+    try:
+        from homeassistant.components.lovelace import dashboard  # noqa: PLC0415
+        from homeassistant.components.lovelace.const import (  # noqa: PLC0415
+            DOMAIN as LOVELACE_DOMAIN,
+        )
 
-        async def get(self, request: web.Request) -> web.Response:
-            return web.Response(
-                body=card_bytes,
-                content_type="application/javascript",
-                headers={"Cache-Control": "no-cache"},
-            )
+        lovelace_data = hass.data.get(LOVELACE_DOMAIN)
+        if lovelace_data is None:
+            _LOGGER.debug("Lovelace data not available, using add_extra_js_url fallback")
+            from homeassistant.components.frontend import add_extra_js_url  # noqa: PLC0415
 
-    hass.http.register_view(_CardJSView())
+            add_extra_js_url(hass, url)
+            return
 
-    # Tell the HA frontend to load the card JS on every page
-    from homeassistant.components.frontend import add_extra_js_url  # noqa: PLC0415
+        # Check if using storage mode (default for most HA installs)
+        resources = lovelace_data.get("resources")
+        if resources is None:
+            _LOGGER.debug("Lovelace resources not available, using add_extra_js_url fallback")
+            from homeassistant.components.frontend import add_extra_js_url  # noqa: PLC0415
 
-    add_extra_js_url(hass, "/api/ha_doorbell_jeeves/card.js")
-    _LOGGER.debug("Registered memory timeline card resource at /api/ha_doorbell_jeeves/card.js")
+            add_extra_js_url(hass, url)
+            return
+
+        # Check if already registered
+        existing = await resources.async_get_items() if hasattr(resources, "async_get_items") else []
+        for item in existing:
+            if item.get("url") == url:
+                _LOGGER.debug("Lovelace resource already registered: %s", url)
+                return
+
+        # Register new resource
+        await resources.async_create_item({"res_type": "module", "url": url})
+        _LOGGER.info("Added Lovelace resource: %s", url)
+    except Exception as exc:  # noqa: BLE001
+        # Fallback to add_extra_js_url if Lovelace API isn't available
+        _LOGGER.debug("Lovelace resource registration failed (%s), using add_extra_js_url", exc)
+        from homeassistant.components.frontend import add_extra_js_url  # noqa: PLC0415
+
+        add_extra_js_url(hass, url)
 
 
 async def _setup_reolink(hass: HomeAssistant, entry: ConfigEntry, config: dict[str, Any]) -> None:
