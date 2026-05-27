@@ -83,19 +83,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await _register_frontend_resources(hass)
         internal_data[_INTERNAL_FRONTEND_RESOURCES] = True
 
-    # ─── Data migration: fix model names from older configs ───
-    stored_model = entry.data.get(CONF_MODEL) or entry.options.get(CONF_MODEL)
-    _MODEL_MIGRATIONS = {
-        "gemini-2.5-flash-native-audio-latest": "gemini-2.5-flash-native-audio-dialog",
-    }
-    if stored_model in _MODEL_MIGRATIONS:
-        new_data = dict(entry.data)
-        new_data[CONF_MODEL] = _MODEL_MIGRATIONS[stored_model]
-        hass.config_entries.async_update_entry(entry, data=new_data)
-        _LOGGER.info(
-            "Migrated model %s → %s for entry %s",
-            stored_model, _MODEL_MIGRATIONS[stored_model], entry.entry_id[:8],
-        )
+    # ─── Data migration: update tool model defaults for better rate limits ───
+    # Migrate stored tool_model from gemini-2.5-flash (20 RPD) to gemini-3.1-flash-lite (500 RPD)
+    _TOOL_MODEL_MIGRATIONS = {"gemini-2.5-flash": "gemini-3.1-flash-lite"}
+    for store in ("data", "options"):
+        store_dict = getattr(entry, store, {}) or {}
+        stored_tool_model = store_dict.get("tool_model", "")
+        if stored_tool_model in _TOOL_MODEL_MIGRATIONS:
+            new_store = dict(store_dict)
+            new_store["tool_model"] = _TOOL_MODEL_MIGRATIONS[stored_tool_model]
+            if store == "data":
+                hass.config_entries.async_update_entry(entry, data=new_store)
+            else:
+                hass.config_entries.async_update_entry(entry, options=new_store)
+            _LOGGER.info(
+                "Migrated tool_model %s → %s", stored_tool_model,
+                _TOOL_MODEL_MIGRATIONS[stored_tool_model],
+            )
 
     # Create session manager
     manager = JeevesSessionManager(hass, entry)
