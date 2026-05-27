@@ -1195,16 +1195,25 @@ class JeevesSessionManager:
                 if self._client and self._active:
                     try:
                         # Split large chunks into ~128ms segments (4096 bytes at 16kHz/16-bit)
-                        # Gemini VAD needs small chunks to detect speech boundaries accurately
+                        # CRITICAL: Send at real-time rate! The Gemini VAD expects audio
+                        # to arrive at a constant pace. Sending bursts followed by gaps
+                        # confuses VAD speech detection.
                         CHUNK_SIZE = 4096
+                        SEGMENT_INTERVAL = 0.125  # ~128ms per 4096 bytes at 16kHz/16-bit
+                        segments = []
                         for offset in range(0, len(audio_bytes), CHUNK_SIZE):
                             segment = audio_bytes[offset:offset + CHUNK_SIZE]
                             if segment:
-                                await self._client.send_audio(segment)
+                                segments.append(segment)
+                        for idx, segment in enumerate(segments):
+                            await self._client.send_audio(segment)
+                            # Pace sends at real-time rate (skip delay on last segment)
+                            if idx < len(segments) - 1:
+                                await asyncio.sleep(SEGMENT_INTERVAL)
                         forwarded += 1
                         if forwarded == 1:
-                            _LOGGER.warning("✓ First microphone chunk forwarded to AI session (%d bytes, split into %d segments)",
-                                            len(audio_bytes), (len(audio_bytes) + CHUNK_SIZE - 1) // CHUNK_SIZE)
+                            _LOGGER.warning("✓ First microphone chunk forwarded to AI session (%d bytes, split into %d segments, paced at %.0fms)",
+                                            len(audio_bytes), len(segments), SEGMENT_INTERVAL * 1000)
                         elif forwarded == 10:
                             _LOGGER.warning("Mic forward: 10 chunks sent to AI (audio flowing)")
                         elif forwarded == 50:
