@@ -163,8 +163,17 @@ class JeevesMemoryTimelineCard extends HTMLElement {
     return document.createElement("jeeves-memory-timeline-card-editor");
   }
 
-  static getStubConfig() {
+  static getStubConfig(hass) {
+    // Auto-detect a memory feed entity if possible
+    let entity = "";
+    if (hass && hass.states) {
+      const feedEntity = Object.keys(hass.states).find(
+        (e) => e.startsWith("sensor.") && e.includes("memory_feed")
+      );
+      if (feedEntity) entity = feedEntity;
+    }
     return {
+      entity,
       title: "Jeeves Memories",
       max_items: 50,
       number_of_days: 30,
@@ -176,10 +185,8 @@ class JeevesMemoryTimelineCard extends HTMLElement {
   }
 
   setConfig(config) {
-    if (!config || !config.entity) {
-      throw new Error("Please select a Memory Feed entity");
-    }
     this._config = {
+      entity: "",
       title: "Jeeves Memories",
       max_items: 50,
       number_of_days: 30,
@@ -189,6 +196,7 @@ class JeevesMemoryTimelineCard extends HTMLElement {
       compact: false,
       ...config,
     };
+    this._needsEntity = !this._config.entity;
     if (!this.shadowRoot) {
       this.attachShadow({ mode: "open" });
     }
@@ -283,11 +291,26 @@ class JeevesMemoryTimelineCard extends HTMLElement {
   _render() {
     if (!this.shadowRoot || !this._config || !this._hass) return;
 
+    if (this._needsEntity || !this._config.entity) {
+      this.shadowRoot.innerHTML = `
+        <ha-card>
+          <div class="card-header"><span class="header-title">${this._esc(this._config.title || "Jeeves Memories")}</span></div>
+          <div class="empty-state">
+            <ha-icon icon="mdi:cog"></ha-icon>
+            <p>Select a Memory Feed entity</p>
+            <span class="empty-hint">Open the card editor to choose your Jeeves memory feed sensor</span>
+          </div>
+        </ha-card>
+        ${this._styles()}
+      `;
+      return;
+    }
+
     const state = this._hass.states[this._config.entity];
     if (!state) {
       this.shadowRoot.innerHTML = `
         <ha-card>
-          <div class="card-header">${this._esc(this._config.title)}</div>
+          <div class="card-header"><span class="header-title">${this._esc(this._config.title)}</span></div>
           <div class="empty-state">
             <ha-icon icon="mdi:database-off"></ha-icon>
             <p>Entity not found: <code>${this._esc(this._config.entity)}</code></p>
