@@ -232,6 +232,7 @@ class GeminiLiveClient(BaseRealtimeClient):
             _LOGGER.exception("Failed to inject reference images")
 
     async def _receive_loop(self) -> None:
+        turns_completed = 0
         try:
             # NOTE: In the GenAI SDK, session.receive() can complete after a turn.
             # Re-enter receive() to keep the live session open across turns.
@@ -246,19 +247,22 @@ class GeminiLiveClient(BaseRealtimeClient):
                     break
 
                 if saw_message:
+                    turns_completed += 1
                     consecutive_empty_iters = 0
+                    _LOGGER.debug("Gemini turn %d completed, re-entering receive()", turns_completed)
                     continue
 
                 consecutive_empty_iters += 1
                 if consecutive_empty_iters >= 3:
-                    _LOGGER.warning("Gemini receive stream ended repeatedly with no events")
+                    _LOGGER.warning("Gemini receive stream ended repeatedly with no events (turns=%d)", turns_completed)
                     break
                 await asyncio.sleep(0.1)
         except asyncio.CancelledError:
             pass
         except Exception:
-            _LOGGER.exception("Gemini receive loop error")
+            _LOGGER.exception("Gemini receive loop error (turns=%d)", turns_completed)
         finally:
+            _LOGGER.warning("Gemini receive loop exiting (turns=%d, connected=%s)", turns_completed, self._connected)
             if self._connected:
                 self._connected = False
                 self._on_session_end()
@@ -281,6 +285,7 @@ class GeminiLiveClient(BaseRealtimeClient):
         if server_content and hasattr(server_content, "input_transcription"):
             t = getattr(server_content, "input_transcription", None)
             if t and hasattr(t, "text") and t.text:
+                _LOGGER.warning("Input transcription from Gemini: %s", t.text[:200])
                 self._conversation_turns.append({"role": "user", "text": t.text})
                 self._on_transcript("user", t.text)
 
@@ -289,6 +294,15 @@ class GeminiLiveClient(BaseRealtimeClient):
             if t and hasattr(t, "text") and t.text:
                 self._conversation_turns.append({"role": "assistant", "text": t.text})
                 self._on_transcript("assistant", t.text)
+
+        # Log interrupted/turn_complete signals
+        if server_content:
+            interrupted = getattr(server_content, "interrupted", None)
+            turn_complete = getattr(server_content, "turn_complete", None)
+            if interrupted:
+                _LOGGER.warning("Gemini: model output was INTERRUPTED (user started speaking)")
+            if turn_complete:
+                _LOGGER.debug("Gemini: turn_complete signal received")
 
         if tool_call:
             await self._handle_tool_call(tool_call)

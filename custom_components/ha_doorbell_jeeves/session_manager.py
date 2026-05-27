@@ -516,8 +516,25 @@ class JeevesSessionManager:
                 self._interrupt_detector.process_audio_frame(audio_bytes)
             if mic_rx_count == 1:
                 _LOGGER.warning("✓ First microphone chunk received from doorbell (%d bytes)", len(audio_bytes))
+                # Diagnostic: compute RMS of first chunk to verify audio signal
+                import struct as _s
+                samples = _s.unpack(f"<{len(audio_bytes)//2}h", audio_bytes)
+                rms = (sum(s*s for s in samples) / len(samples)) ** 0.5
+                peak = max(abs(s) for s in samples)
+                _LOGGER.warning(
+                    "Audio diagnostic: RMS=%.1f, peak=%d, samples=%d (expect non-zero for valid audio)",
+                    rms, peak, len(samples),
+                )
             elif mic_rx_count % 500 == 0:
                 _LOGGER.info("Microphone input received: %d chunks", mic_rx_count)
+
+            # Save first 5 seconds of audio to WAV for diagnostic playback
+            if mic_rx_count <= 100:
+                if not hasattr(self, "_debug_pcm_buf"):
+                    self._debug_pcm_buf = bytearray()
+                self._debug_pcm_buf.extend(audio_bytes)
+                if mic_rx_count == 100:
+                    self._save_debug_wav(bytes(self._debug_pcm_buf))
 
             if self._mic_queue is None:
                 return
@@ -817,6 +834,24 @@ class JeevesSessionManager:
     def _touch_audio_activity(self) -> None:
         """Mark the current time as the latest audio activity."""
         self._last_audio_activity = asyncio.get_running_loop().time()
+
+    def _save_debug_wav(self, pcm_data: bytes) -> None:
+        """Save raw PCM data as a WAV file for debugging audio quality."""
+        import struct, wave  # noqa: PLC0415, E401
+
+        wav_path = "/config/debug_mic_audio.wav"
+        try:
+            with wave.open(wav_path, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)  # 16-bit
+                wf.setframerate(16000)
+                wf.writeframes(pcm_data)
+            _LOGGER.warning(
+                "Saved debug mic audio WAV: %s (%d bytes, %.1fs)",
+                wav_path, len(pcm_data), len(pcm_data) / (16000 * 2),
+            )
+        except Exception:
+            _LOGGER.exception("Failed to save debug WAV")
 
     # ─── Identity Context ─────────────────────────────────────────────────────
 

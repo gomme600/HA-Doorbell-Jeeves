@@ -8,6 +8,7 @@ configurable security policies.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from pathlib import Path
@@ -156,10 +157,11 @@ async def _register_frontend_resources(hass: HomeAssistant) -> None:
 
     from .memory_views import card_js_url  # noqa: PLC0415
 
-    # Compute a short hash of the JS file for cache-busting
+    # Compute a short hash of the JS file for cache-busting (avoid blocking I/O in event loop)
     js_file = Path(__file__).parent / "frontend" / "jeeves-memory-timeline-card.js"
     try:
-        content = js_file.read_bytes()
+        loop = asyncio.get_running_loop()
+        content = await loop.run_in_executor(None, js_file.read_bytes)
         file_hash = hashlib.md5(content).hexdigest()[:8]  # noqa: S324
     except OSError:
         file_hash = "1"
