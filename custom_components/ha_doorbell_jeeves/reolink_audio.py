@@ -258,16 +258,20 @@ class ReolinkAudioHandler:
         self._pcm_overflow_warned = False
         self._ffmpeg_proc: asyncio.subprocess.Process | None = None
         self._chime_delay: float = DEFAULT_CHIME_DELAY
-        # Audio input state (RTSP mic via ffmpeg)
+        # Audio input state (native Baichuan FDX + ffmpeg fallback)
         self._listen_active = False
         self._input_processor_task: asyncio.Task[None] | None = None
+        self._baichuan_audio_input_active = False
+        # IMA ADPCM decoder state for incoming audio
+        self._decode_predictor: int = 0
+        self._decode_step_index: int = 0
 
     @property
     def is_active(self) -> bool:
         return self._active
 
     async def start(self) -> None:
-        """Start 2-way audio: receive from doorbell mic, prepare output pipeline."""
+        """Start 2-way audio: output via Baichuan, input via FDX on same connection."""
         if self._active:
             return
 
@@ -277,14 +281,17 @@ class ReolinkAudioHandler:
         self._active = True
 
         # Start Baichuan talk output pipeline (ADPCM via port 9000)
+        # This also installs the FDX audio input intercept after talk starts
         await self._start_output_pipeline()
 
-        # Start doorbell mic input (RTSP/RTMP → ffmpeg → PCM → AI)
+        # Start doorbell mic input (FDX intercept is primary; ffmpeg is fallback)
         await self._start_audio_input()
 
         _LOGGER.warning(
-            "Reolink audio handler started (stream=%s, host=%s, mic input active=%s)",
-            self._stream_name, self._reolink_host, self._listen_active,
+            "Reolink audio handler started (host=%s, baichuan=%s, fdx_input=%s)",
+            self._reolink_host,
+            "connected" if self._baichuan else "failed",
+            self._baichuan_audio_input_active or "pending (after chime)",
         )
 
     async def _discover_reolink_details(self) -> None:
@@ -610,6 +617,15 @@ class ReolinkAudioHandler:
             "Baichuan talk session started! Streaming audio (rate=%d, block=%d)...",
             sample_rate, block_size,
         )
+
+        # Install Baichuan FDX audio intercept NOW (talk is active, camera will send audio)
+        if ability.get("duplex") == "FDX" and not self._baichuan_audio_input_active:
+            success = self._install_baichuan_audio_intercept()
+            if success:
+                self._baichuan_audio_input_active = True
+                _LOGGER.warning(
+                    "✓ Audio input: native Baichuan FDX active (zero-config, no RTSP)"
+                )
 
         # Start ffmpeg resampler: 24kHz mono s16le → camera sample_rate mono s16le
         try:
@@ -1021,43 +1037,297 @@ class ReolinkAudioHandler:
             else:
                 raise RuntimeError("Cannot find Baichuan transport to write talk data")
 
-    # ─── Audio Input (Mic Receive via RTSP/ffmpeg) ──────────────────────────────
+    # ─── Audio Input (Native Baichuan FDX + ffmpeg fallback) ──────────────────────
 
     async def _start_audio_input(self) -> None:
         """Start receiving audio from the doorbell mic.
 
-        Strategy (zero-config, uses HA's existing infrastructure):
-          1. Try go2rtc's existing stream for the camera (HA already set it up)
-          2. Try the camera entity's stream_source() (authenticated RTSP from integration)
-          3. Try raw RTSP URLs (legacy fallback)
+        Strategy (zero-config, fully native):
+          1. PRIMARY: Baichuan FDX — installed by the output loop after talk starts
+             (camera sends mic audio back on same connection during full-duplex talk)
+          2. FALLBACK: go2rtc existing stream / camera stream_source via ffmpeg
+             (only used if Baichuan FDX is not available)
 
-        All methods use ffmpeg to extract audio as 16kHz PCM.
+        For Reolink cameras with FDX support, the audio intercept is installed
+        inside _baichuan_audio_output_loop AFTER TalkConfig is accepted. This
+        method only needs to handle the fallback case.
         """
-        # Build list of URLs to try, prioritizing the integration's own streams
+        self._listen_active = True
+
+        # If Baichuan talk is being set up and camera supports FDX,
+        # the output loop will install the audio intercept. Just wait.
+        if self._baichuan or self._talk_ability:
+            duplex = (self._talk_ability or {}).get("duplex", "")
+            if duplex == "FDX" or not self._talk_ability:
+                # Trust that the output loop will set up FDX input
+                _LOGGER.info(
+                    "Audio input: waiting for Baichuan FDX (output loop will install intercept)"
+                )
+                return
+
+        # FALLBACK: Use go2rtc/stream_source/RTSP via ffmpeg
+        _LOGGER.warning("No Baichuan FDX — falling back to stream-based audio input")
         urls_to_try: list[str] = []
 
-        # Method 1: go2rtc existing stream (HA sets this up for Reolink cameras)
         go2rtc_url = await self._get_go2rtc_audio_url()
         if go2rtc_url:
             urls_to_try.append(go2rtc_url)
 
-        # Method 2: Camera entity's stream_source (authenticated by the integration)
         entity_stream_url = await self._get_camera_stream_source()
         if entity_stream_url and entity_stream_url not in urls_to_try:
             urls_to_try.append(entity_stream_url)
 
-        # Method 3: RTSP URL from Reolink API (if runtime Host is available)
         if self._reolink_rtsp_url and self._reolink_rtsp_url not in urls_to_try:
             urls_to_try.append(self._reolink_rtsp_url)
 
         if not urls_to_try:
             _LOGGER.warning("No audio input source available — mic input disabled")
+            self._listen_active = False
             return
 
-        self._listen_active = True
         self._input_processor_task = asyncio.create_task(
             self._audio_input_loop(urls_to_try)
         )
+
+    def _install_baichuan_audio_intercept(self) -> bool:
+        """Hook into the Baichuan protocol to intercept incoming CMD 202 audio.
+
+        During FDX (Full Duplex) talk, the camera sends mic audio back as
+        CMD 202 packets — same format as what we send to the speaker.
+
+        We intercept at the protocol's bc_data_received level because the
+        library's normal parsing may drop CMD 202 packets with status=0
+        (treats them as "unrequested messages with bad status code").
+
+        Returns True if the hook was successfully installed.
+        """
+        bc = self._baichuan
+        if not bc:
+            return False
+
+        # Find the protocol instance where data arrives
+        protocol = None
+        if hasattr(bc, "_connection") and bc._connection:
+            protocol = getattr(bc._connection, "_protocol", None)
+        if not protocol:
+            _LOGGER.warning("Cannot install audio intercept: no protocol found on Baichuan connection")
+            return False
+
+        # Patch parse_bc_data to intercept CMD 202 before status code filtering
+        original_parse = protocol.parse_bc_data
+        input_count = [0]  # mutable counter for closure
+        from reolink_aio.baichuan.util import HEADER_MAGIC  # noqa: PLC0415
+
+        def _patched_parse_bc_data() -> None:
+            """Patched parser that intercepts CMD 202 audio before normal processing."""
+            data = protocol._data
+            if not data or len(data) < 20:
+                original_parse()
+                return
+
+            # Quick check: is this CMD 202?
+            rec_cmd_id = int.from_bytes(data[4:8], byteorder="little")
+            if rec_cmd_id != 202:
+                original_parse()
+                return
+
+            # It's CMD 202 — extract the binary payload ourselves
+            rec_len_body = int.from_bytes(data[8:12], byteorder="little")
+            mess_class = data[18:20].hex()
+
+            if mess_class in ["1464", "0000"]:
+                len_header = 24
+                if len(data) < 24:
+                    original_parse()
+                    return
+                rec_payload_offset = int.from_bytes(data[20:24], byteorder="little")
+            elif mess_class == "1466":
+                len_header = 20
+                rec_payload_offset = 0
+            else:
+                original_parse()
+                return
+
+            # Check we have the full message
+            data_len = len(data)
+            len_body = data_len - len_header
+            if len_body < rec_len_body:
+                # Incomplete — let original handle buffering
+                original_parse()
+                return
+
+            if rec_payload_offset == 0:
+                rec_payload_offset = rec_len_body
+
+            # Extract the binary audio payload (after the Extension XML)
+            len_chunk = rec_len_body + len_header
+            payload_start = rec_payload_offset + len_header
+            payload = data[payload_start:len_chunk]
+
+            if payload:
+                input_count[0] += 1
+                if input_count[0] == 1:
+                    _LOGGER.warning(
+                        "✓ First audio from doorbell mic via Baichuan FDX (%d bytes payload)",
+                        len(payload),
+                    )
+                elif input_count[0] % 500 == 0:
+                    _LOGGER.info("Baichuan audio input: %d packets received", input_count[0])
+
+                # Parse BcMedia and decode ADPCM → PCM
+                pcm_data = self._parse_bcmedia_to_pcm(payload)
+                if pcm_data and self._listen_active:
+                    asyncio.ensure_future(self._on_audio_received(pcm_data))
+
+            # Consume this message from the buffer (same as what parse_bc_data does)
+            if len_body > rec_len_body:
+                protocol._data = data[len_chunk:]
+                # Check if there are more messages to parse
+                if protocol._data and protocol._data[0:4].hex() == HEADER_MAGIC:
+                    _patched_parse_bc_data()
+            else:
+                protocol._data = b""
+
+        protocol.parse_bc_data = _patched_parse_bc_data
+        _LOGGER.info("Baichuan audio intercept installed (CMD 202 parser patch)")
+        return True
+        return True
+
+    def _parse_bcmedia_to_pcm(self, payload: bytes) -> bytes | None:
+        """Parse BcMedia frames from incoming audio and decode ADPCM to 16-bit PCM.
+
+        BcMedia frame format (same as what we build for output):
+          - 4 bytes: magic (0x62773130 = "bw10")
+          - 2 bytes: payload_len
+          - 2 bytes: payload_len (repeated)
+          - 2 bytes: data_magic (0x0100)
+          - 2 bytes: block_size_halved
+          - N bytes: ADPCM block (4-byte header + nibbles)
+          - padding to 8-byte alignment
+
+        ADPCM block header:
+          - 2 bytes: initial predictor (i16 LE)
+          - 1 byte: step table index (0–88)
+          - 1 byte: reserved
+          - remaining: packed 4-bit nibbles (low nibble first)
+        """
+        import struct as struct_mod  # noqa: PLC0415
+
+        MAGIC = 0x62773130
+        HEADER_SIZE = 12
+        pcm_out = bytearray()
+        offset = 0
+
+        while offset + HEADER_SIZE <= len(payload):
+            # Read BcMedia header
+            try:
+                magic, plen1, plen2, data_magic, block_halved = struct_mod.unpack_from(
+                    "<IHHHH", payload, offset
+                )
+            except struct_mod.error:
+                break
+
+            if magic != MAGIC:
+                # Not a valid BcMedia frame — skip remaining
+                break
+
+            offset += HEADER_SIZE
+            block_size = (block_halved * 2) + 4  # Reconstruct block size
+
+            if offset + block_size > len(payload):
+                break
+
+            adpcm_block = payload[offset: offset + block_size]
+
+            # Decode this ADPCM block to PCM
+            pcm_block = self._decode_ima_adpcm_block(adpcm_block)
+            if pcm_block:
+                pcm_out.extend(pcm_block)
+
+            # Advance past block + padding
+            padded_size = block_size + ((-block_size) % 8)
+            offset += padded_size
+
+        return bytes(pcm_out) if pcm_out else None
+
+    def _decode_ima_adpcm_block(self, block: bytes) -> bytes | None:
+        """Decode a single IMA/DVI ADPCM block to 16-bit PCM samples.
+
+        Block layout:
+          - bytes 0-1: initial predictor (i16 LE)
+          - byte 2: step table index (0–88)
+          - byte 3: reserved
+          - bytes 4+: packed 4-bit nibbles (low nibble first)
+
+        Returns PCM bytes (16-bit LE mono).
+        """
+        import struct as struct_mod  # noqa: PLC0415
+
+        if len(block) < 4:
+            return None
+
+        # IMA ADPCM step table
+        STEP_TABLE = [
+            7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31,
+            34, 37, 41, 45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143,
+            157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544,
+            598, 658, 724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878,
+            2066, 2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358, 5894,
+            6484, 7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899, 15289, 16818,
+            18500, 20350, 22385, 24623, 27086, 29794, 32767,
+        ]
+        INDEX_TABLE = [-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8]
+
+        # Read block header
+        predictor = struct_mod.unpack_from("<h", block, 0)[0]
+        step_index = block[2]
+        step_index = max(0, min(88, step_index))
+
+        pcm_samples = []
+        pcm_samples.append(predictor)
+
+        # Decode nibbles
+        for i in range(4, len(block)):
+            byte = block[i]
+            for nibble in (byte & 0x0F, (byte >> 4) & 0x0F):
+                step = STEP_TABLE[step_index]
+                diff = step >> 3
+                if nibble & 1:
+                    diff += step >> 2
+                if nibble & 2:
+                    diff += step >> 1
+                if nibble & 4:
+                    diff += step
+                if nibble & 8:
+                    predictor -= diff
+                else:
+                    predictor += diff
+                predictor = max(-32768, min(32767, predictor))
+                pcm_samples.append(predictor)
+                step_index += INDEX_TABLE[nibble]
+                step_index = max(0, min(88, step_index))
+
+        # Store decoder state for continuity across blocks
+        self._decode_predictor = predictor
+        self._decode_step_index = step_index
+
+        # Convert to bytes (16-bit LE)
+        return struct_mod.pack(f"<{len(pcm_samples)}h", *pcm_samples)
+
+    async def _resample_pcm_if_needed(self, pcm_data: bytes, src_rate: int) -> bytes:
+        """Resample PCM from camera rate to 16kHz if needed."""
+        if src_rate == AUDIO_INPUT_SAMPLE_RATE:
+            return pcm_data
+        # Simple linear resampling for common rates (8kHz → 16kHz = duplicate samples)
+        if src_rate == 8000 and AUDIO_INPUT_SAMPLE_RATE == 16000:
+            import struct as struct_mod  # noqa: PLC0415
+            samples = struct_mod.unpack(f"<{len(pcm_data)//2}h", pcm_data)
+            # Duplicate each sample for 2x upsampling
+            upsampled = []
+            for s in samples:
+                upsampled.extend([s, s])
+            return struct_mod.pack(f"<{len(upsampled)}h", *upsampled)
+        return pcm_data
 
     async def _get_go2rtc_audio_url(self) -> str | None:
         """Find and return an audio URL from go2rtc's existing streams.
