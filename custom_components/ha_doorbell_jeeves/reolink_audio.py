@@ -1212,6 +1212,8 @@ class ReolinkAudioHandler:
         """
         from reolink_aio.baichuan import util as bc_util  # noqa: PLC0415
 
+        _LOGGER.warning("CMD3 v2.9.21b: _send_preview_request entered")
+
         # Preview XML body — request subStream (lower bandwidth, still has audio)
         preview_xml = (
             '<?xml version="1.0" encoding="UTF-8" ?>\n'
@@ -1224,13 +1226,26 @@ class ReolinkAudioHandler:
             "</body>\n"
         )
 
-        # Encrypt the body (pass string — HA's reolink_aio _aes_encrypt expects str)
+        # Encrypt the body
+        # reolink_aio's _aes_encrypt may expect str OR bytes depending on version.
+        # Inspect to determine the correct type to pass.
         enc_type = self._talk_enc_type or bc_util.EncType.AES
 
+        _LOGGER.warning(
+            "CMD3: enc_type=%s, aes_key=%s, preview_xml type=%s",
+            enc_type, "set" if getattr(bc, "_aes_key", None) else "NONE",
+            type(preview_xml).__name__,
+        )
+
         if enc_type == bc_util.EncType.BC:
-            enc_body = bc_util.encrypt_baichuan(preview_xml, 0)  # ch_id=0 for channel 0
+            enc_body = bc_util.encrypt_baichuan(preview_xml, 0)
         else:
-            enc_body = bc._aes_encrypt(preview_xml)
+            # Try string first (HA's version), fall back to bytes
+            try:
+                enc_body = bc._aes_encrypt(preview_xml)
+            except (AttributeError, TypeError):
+                _LOGGER.warning("CMD3: _aes_encrypt(str) failed, trying bytes")
+                enc_body = bc._aes_encrypt(preview_xml.encode("utf-8"))
 
         body_len = len(enc_body)
 
