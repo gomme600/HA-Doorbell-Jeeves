@@ -1110,6 +1110,11 @@ class ReolinkAudioHandler:
         if go2rtc_url and go2rtc_url not in urls_to_try:
             urls_to_try.append(go2rtc_url)
 
+        # Priority 6: HA's internal HLS stream (higher latency but always works)
+        hls_url = await self._get_ha_hls_stream_url()
+        if hls_url and hls_url not in urls_to_try:
+            urls_to_try.append(hls_url)
+
         if not urls_to_try:
             _LOGGER.warning("No audio input source available — mic input disabled")
             self._listen_active = False
@@ -1869,6 +1874,56 @@ class ReolinkAudioHandler:
             _LOGGER.debug("Could not get stream_source from camera entity", exc_info=True)
         return None
 
+    async def _get_ha_hls_stream_url(self) -> str | None:
+        """Get an HLS stream URL from HA's internal camera/stream service.
+
+        This uses HA's own stream infrastructure which handles camera auth
+        internally. The resulting HLS URL is token-authenticated and accessible
+        from localhost without additional credentials.
+
+        Higher latency (~2-4s) but reliable when direct RTSP/RTMP fail.
+        """
+        camera_entity = self._camera_entity_id or ""
+        if not camera_entity:
+            return None
+        try:
+            from homeassistant.helpers.entity_component import EntityComponent
+            camera_comp: EntityComponent | None = self._hass.data.get("camera")
+            if not camera_comp or not hasattr(camera_comp, "get_entity"):
+                return None
+            entity = camera_comp.get_entity(camera_entity)
+            if not entity:
+                return None
+
+            # Use the camera entity's create_stream method
+            if hasattr(entity, "async_create_stream"):
+                stream = await entity.async_create_stream()
+                if stream:
+                    # Start the stream and get HLS endpoint
+                    await stream.async_add_provider("hls")
+                    await stream.start()
+                    hls_path = stream.endpoint_url("hls")
+                    if hls_path:
+                        # Construct full internal URL (accessible from localhost)
+                        ha_port = self._hass.config.api.port if self._hass.config.api else 8123
+                        url = f"http://127.0.0.1:{ha_port}{hls_path}"
+                        _LOGGER.warning("Audio input: using HA HLS stream: %s", hls_path)
+                        return url
+
+            # Fallback: use the camera/stream WebSocket-style call
+            from homeassistant.components.camera import async_get_stream
+            stream = await async_get_stream(self._hass, camera_entity)
+            if stream:
+                hls_path = stream.endpoint_url("hls")
+                if hls_path:
+                    ha_port = self._hass.config.api.port if self._hass.config.api else 8123
+                    url = f"http://127.0.0.1:{ha_port}{hls_path}"
+                    _LOGGER.warning("Audio input: using HA HLS stream (fallback): %s", hls_path)
+                    return url
+        except Exception as exc:
+            _LOGGER.debug("Could not get HLS stream URL: %s", exc, exc_info=True)
+        return None
+
     async def _audio_input_loop(self, urls_to_try: list[str]) -> None:
         """Read audio from the best available source via ffmpeg.
 
@@ -1893,6 +1948,12 @@ class ReolinkAudioHandler:
             elif url.startswith("rtmp://"):
                 # RTMP: use live stream mode with low latency
                 ffmpeg_args.extend(["-live_start_index", "-1"])
+            elif "m3u8" in url or "/hls/" in url:
+                # HLS: start from the live edge for lowest latency
+                ffmpeg_args.extend(["-live_start_index", "-1"])
+            elif url.startswith("https://"):
+                # HTTPS FLV: allow self-signed certs (Reolink cameras)
+                ffmpeg_args.extend(["-tls_verify", "0"])
             ffmpeg_args.extend([
                 "-i", url,
                 "-vn",  # No video — audio only
