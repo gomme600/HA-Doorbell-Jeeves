@@ -265,6 +265,9 @@ class ReolinkAudioHandler:
         self._listen_active = False
         self._input_processor_task: asyncio.Task[None] | None = None
         self._baichuan_audio_input_active = False
+        # AAC decoder state (for FDX stream AAC audio)
+        self._aac_queue: asyncio.Queue[bytes] | None = None
+        self._aac_decoder_task: asyncio.Task[None] | None = None
         # IMA ADPCM decoder state for incoming audio
         self._decode_predictor: int = 0
         self._decode_step_index: int = 0
@@ -419,6 +422,16 @@ class ReolinkAudioHandler:
             except (asyncio.CancelledError, Exception):
                 pass
         self._input_processor_task = None
+
+        # Cancel AAC decoder task
+        if self._aac_decoder_task and not self._aac_decoder_task.done():
+            self._aac_decoder_task.cancel()
+            try:
+                await self._aac_decoder_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._aac_decoder_task = None
+        self._aac_queue = None
 
         # Logout dedicated talk connection
         if hasattr(self, "_talk_host") and self._talk_host:
@@ -656,14 +669,19 @@ class ReolinkAudioHandler:
             sample_rate, block_size,
         )
 
-        # Install Baichuan FDX audio intercept (diagnostic only — CMD 202
-        # actually carries video frames, not mic audio. Mic comes via RTMP/RTSP)
+        # Install Baichuan FDX audio intercept — captures mic audio from
+        # the camera's media stream sent back via CMD 202 during full-duplex talk.
+        # Audio may arrive as ADPCM or AAC frames interleaved with video.
         if ability.get("duplex") == "FDX" and not self._baichuan_audio_input_active:
+            # Start AAC decoder task before installing intercept
+            self._aac_queue = asyncio.Queue(maxsize=200)
+            self._aac_decoder_task = asyncio.create_task(self._aac_decode_loop())
+
             success = self._install_baichuan_audio_intercept()
             if success:
                 self._baichuan_audio_input_active = True
-                _LOGGER.debug(
-                    "Baichuan FDX intercept installed (diagnostic only — mic via RTMP)"
+                _LOGGER.warning(
+                    "Baichuan FDX audio intercept active — listening for ADPCM/AAC mic audio"
                 )
 
         # Pure Python resampler: 24kHz mono s16le → camera sample_rate mono s16le
@@ -1456,6 +1474,7 @@ class ReolinkAudioHandler:
         offset = 0
         frame_count = 0
         audio_frames = 0
+        aac_frames = 0
         video_frames = 0
 
         if not payload or len(payload) < 4:
@@ -1497,11 +1516,35 @@ class ReolinkAudioHandler:
                 offset += pad
 
             elif magic == MAGIC_AAC:
-                # AAC audio — skip (we only handle ADPCM)
+                # AAC audio frame — buffer for async decoding
                 if offset + 4 > len(payload):
                     break
                 plen1, plen2 = struct_mod.unpack_from("<HH", payload, offset)
                 offset += 4
+
+                if plen1 <= 0 or offset + plen1 > len(payload):
+                    break
+
+                aac_data = payload[offset:offset + plen1]
+                aac_frames += 1
+
+                # Log first AAC frame discovery
+                if aac_frames == 1 and not hasattr(self, "_aac_frames_logged"):
+                    self._aac_frames_logged = True
+                    _LOGGER.warning(
+                        "✓ AAC audio frame found in Baichuan FDX stream! "
+                        "(%d bytes, first 8 hex: %s)",
+                        len(aac_data), aac_data[:8].hex(),
+                    )
+
+                # Queue for async AAC decoder (runs in background task)
+                if hasattr(self, "_aac_queue") and self._aac_queue is not None:
+                    try:
+                        self._aac_queue.put_nowait(aac_data)
+                    except asyncio.QueueFull:
+                        pass  # Drop frame if queue full
+                    audio_frames += 1
+
                 offset += plen1
                 pad = (-plen1) % PAD_SIZE
                 offset += pad
@@ -1554,9 +1597,10 @@ class ReolinkAudioHandler:
         if audio_frames > 0 and not hasattr(self, "_bcmedia_parse_logged"):
             self._bcmedia_parse_logged = True
             _LOGGER.warning(
-                "✓ BcMedia stream parsed: %d audio frames, %d video frames "
-                "(%d total) → %d bytes PCM",
-                audio_frames, video_frames, frame_count, len(pcm_out),
+                "✓ BcMedia stream parsed: %d audio frames (%d ADPCM + %d AAC), "
+                "%d video frames (%d total) → %d bytes PCM",
+                audio_frames, audio_frames - aac_frames, aac_frames,
+                video_frames, frame_count, len(pcm_out),
             )
 
         if pcm_out:
@@ -1570,6 +1614,91 @@ class ReolinkAudioHandler:
         if frame_count == 0:
             return self._try_raw_adpcm_decode(payload)
         return None
+
+    async def _aac_decode_loop(self) -> None:
+        """Background task: decode AAC frames from FDX stream to PCM via ffmpeg.
+
+        Maintains a persistent ffmpeg process that accepts raw AAC on stdin
+        and outputs 16kHz mono PCM s16le on stdout. This avoids spawning
+        a new process for each AAC frame.
+        """
+        proc: asyncio.subprocess.Process | None = None
+        frames_decoded = 0
+        first_pcm_logged = False
+
+        try:
+            while self._active and self._listen_active:
+                # Get next AAC frame from queue
+                try:
+                    aac_data = await asyncio.wait_for(
+                        self._aac_queue.get(), timeout=5.0
+                    )
+                except asyncio.TimeoutError:
+                    continue
+
+                # Start ffmpeg if not running
+                if proc is None or proc.returncode is not None:
+                    proc = await asyncio.create_subprocess_exec(
+                        "ffmpeg", "-hide_banner", "-loglevel", "error",
+                        "-f", "aac", "-i", "pipe:0",
+                        "-acodec", "pcm_s16le",
+                        "-ar", str(AUDIO_INPUT_SAMPLE_RATE),
+                        "-ac", "1",
+                        "-f", "s16le",
+                        "pipe:1",
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    _LOGGER.warning(
+                        "AAC decoder ffmpeg started (PID=%d)", proc.pid
+                    )
+
+                # Write AAC frame to ffmpeg
+                try:
+                    proc.stdin.write(aac_data)
+                    await proc.stdin.drain()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    # ffmpeg died — will restart on next iteration
+                    proc = None
+                    continue
+
+                # Read available PCM output (non-blocking)
+                try:
+                    pcm_data = await asyncio.wait_for(
+                        proc.stdout.read(4096), timeout=0.1
+                    )
+                except asyncio.TimeoutError:
+                    pcm_data = b""
+
+                if pcm_data:
+                    frames_decoded += 1
+                    if not first_pcm_logged:
+                        first_pcm_logged = True
+                        _LOGGER.warning(
+                            "✓ First PCM from AAC decode (%d bytes)", len(pcm_data)
+                        )
+                    if frames_decoded % 500 == 0:
+                        _LOGGER.info(
+                            "AAC decoder: %d frames decoded", frames_decoded
+                        )
+                    # Forward to AI
+                    await self._on_audio_received(pcm_data)
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            _LOGGER.warning("AAC decode loop error: %s", exc)
+        finally:
+            if proc and proc.returncode is None:
+                try:
+                    proc.stdin.close()
+                    proc.terminate()
+                except Exception:
+                    pass
+            _LOGGER.info(
+                "AAC decode loop ended (decoded %d frames)", frames_decoded
+            )
 
     def _try_raw_adpcm_decode(self, payload: bytes) -> bytes | None:
         """Fallback: try decoding payload as ADPCM or G.711.
