@@ -256,7 +256,7 @@ def _register_services(hass: HomeAssistant) -> None:
             entity = ManagedEntity(
                 entity_id=GLOBAL_ACTIONS_ENTITY_ID,
                 name=GLOBAL_ACTIONS_ENTITY_NAME,
-                description="Standalone actions not tied to a single entity.",
+                description="Automation triggers available to the AI.",
             )
         if not entity:
             _LOGGER.error("Entity %s not managed — add it first", entity_id)

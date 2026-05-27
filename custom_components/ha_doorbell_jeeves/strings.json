@@ -125,9 +125,8 @@
           "add_calendar": "\ud83d\udcc5 Add Calendar (schedule access)",
           "add_entity": "\ud83c\udfe0 Add Other Entity",
           "edit_entity": "\u270f\ufe0f Edit Entity",
-          "add_action": "\u26a1 Add Action to Entity",
+          "add_action": "\u26a1 Add Action",
           "edit_action": "\ud83d\udee0\ufe0f Edit Action",
-          "add_standalone_action": "\ud83e\udde9 Add Standalone Action",
           "add_notification": "\ud83d\udd14 Add Notification Target",
           "remove_entity": "\u2796 Remove Entity",
           "remove_action": "\ud83d\uddd1\ufe0f Remove Action",
@@ -174,9 +173,11 @@
       },
       "add_action": {
         "title": "Add Action",
-        "description": "Create a custom action the AI can perform. Use the main action plus up to four optional follow-up steps.",
+        "description": "Create a custom action the AI can perform. Choose either a managed entity action or an existing automation trigger.",
         "data": {
+          "action_target_type": "Action Target Type",
           "target_entity": "Target Entity",
+          "target_automation": "Automation to Trigger",
           "action_id": "Action ID (e.g., unlock_gate)",
           "action_name": "Action Name (e.g., Unlock the gate)",
           "action_description": "Description (tells AI when to use this)",
@@ -292,7 +293,9 @@
         "description": "Select any configured action, then update its current definition and optional extra steps.",
         "data": {
           "action_ref": "Action",
+          "action_target_type": "Action Target Type",
           "target_entity": "Target Entity",
+          "target_automation": "Automation to Trigger",
           "action_id": "Action ID",
           "action_name": "Action Name",
           "action_description": "Description",

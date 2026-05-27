@@ -44,7 +44,7 @@ CONF_SYSTEM_PROMPT = "system_prompt"
 CONF_MANAGED_ENTITIES = "managed_entities"
 CONF_NOTIFICATION_TARGETS = "notification_targets"
 GLOBAL_ACTIONS_ENTITY_ID = "_global_actions_"
-GLOBAL_ACTIONS_ENTITY_NAME = "Standalone Actions"
+GLOBAL_ACTIONS_ENTITY_NAME = "Automation Actions"
 
 # Identity
 CONF_IDENTITY_MODE = "identity_mode"

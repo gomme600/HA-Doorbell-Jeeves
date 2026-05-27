@@ -50,7 +50,7 @@ def build_system_context(store: DataStore, hass: HomeAssistant) -> str:
 
     readable_entities = _readable_entities(store)
 
-    # Readable entities (all managed entities except the standalone-actions pseudo entity)
+    # Readable entities (all managed entities except the automation-actions pseudo entity)
     if readable_entities:
         lines.append("\n--- AVAILABLE ENTITIES (you can read their state) ---")
         for entity in readable_entities:

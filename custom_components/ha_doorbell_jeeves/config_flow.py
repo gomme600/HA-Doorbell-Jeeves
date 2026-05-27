@@ -483,7 +483,7 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
         cameras = [entity for entity in readable if entity.entity_id.startswith("camera.")]
         calendars = [entity for entity in readable if entity.entity_id.startswith("calendar.")]
         others = [entity for entity in readable if not entity.entity_id.startswith(("camera.", "calendar."))]
-        standalone = store.get_entity(GLOBAL_ACTIONS_ENTITY_ID)
+        automation_actions = store.get_entity(GLOBAL_ACTIONS_ENTITY_ID)
         desc_parts: list[str] = []
         if cameras:
             desc_parts.append("**📷 Cameras (AI can view on demand):**\n" + "\n".join(f"• {entity.name}" for entity in cameras))
@@ -493,13 +493,20 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
             desc_parts.append(
                 "**🏠 Other Entities:**\n" + "\n".join(f"• {entity.name} - {len(entity.actions)} action(s)" for entity in others)
             )
-        if standalone and standalone.actions:
-            desc_parts.append("**🧩 Standalone Actions:**\n" + "\n".join(f"• {action.name}" for action in standalone.actions))
+        if automation_actions and automation_actions.actions:
+            desc_parts.append(
+                "**🤖 Automation Actions:**\n"
+                + "\n".join(f"• {action.name}" for action in automation_actions.actions)
+            )
         if store.notification_targets:
             desc_parts.append(
                 "**🔔 Notifications:**\n" + "\n".join(f"• {target.name} ({target.service})" for target in store.notification_targets)
             )
-        desc = "\n\n".join(desc_parts) if desc_parts else "No entities configured yet. Add cameras, calendars, devices, or standalone actions below."
+        desc = (
+            "\n\n".join(desc_parts)
+            if desc_parts
+            else "No entities configured yet. Add cameras, calendars, devices, or automation actions below."
+        )
         return self.async_show_menu(
             step_id="entities",
             menu_options=[
@@ -509,7 +516,6 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                 "edit_entity",
                 "add_action",
                 "edit_action",
-                "add_standalone_action",
                 "add_notification",
                 "remove_entity",
                 "remove_action",
@@ -645,36 +651,57 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
     async def async_step_add_action(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         store = await self._async_get_store()
         entity_options = self._managed_entity_options(store)
-        if not entity_options:
+        has_automations = bool(self.hass.states.async_all("automation"))
+        if not entity_options and not has_automations:
             return await self.async_step_entities()
+        errors: dict[str, str] = {}
         if user_input is not None:
-            entity = store.get_entity(user_input["target_entity"])
-            if entity:
-                new_action = self._build_action_from_input(user_input)
-                entity.actions = [action for action in entity.actions if action.id != new_action.id]
-                entity.actions.append(new_action)
-                await store.async_add_entity(entity)
-            return await self.async_step_entities()
+            target_type = user_input.get("action_target_type", "entity")
+            action_input = dict(user_input)
+
+            if target_type == "automation":
+                automation_id = user_input.get("target_automation", "")
+                if not automation_id:
+                    errors["target_automation"] = "required"
+                else:
+                    action_input["target_entity"] = GLOBAL_ACTIONS_ENTITY_ID
+                    action_input["action_config"] = {
+                        "action": "automation.trigger",
+                        "target": {"entity_id": automation_id},
+                    }
+            else:
+                target_entity = user_input.get("target_entity", "")
+                if not target_entity:
+                    errors["target_entity"] = "required"
+
+            if not errors:
+                target_entity_id = action_input.get("target_entity", "")
+                entity = store.get_entity(target_entity_id)
+                if entity is None and target_entity_id == GLOBAL_ACTIONS_ENTITY_ID:
+                    entity = await self._ensure_global_actions_entity(store)
+                if entity is None:
+                    errors["target_entity"] = "required"
+                else:
+                    new_action = self._build_action_from_input(action_input)
+                    entity.actions = [action for action in entity.actions if action.id != new_action.id]
+                    entity.actions.append(new_action)
+                    await store.async_add_entity(entity)
+                    return await self.async_step_entities()
         return self.async_show_form(
             step_id="add_action",
-            data_schema=vol.Schema(self._action_form_schema(entity_options=entity_options)),
+            data_schema=vol.Schema(
+                self._action_form_schema(
+                    entity_options=entity_options,
+                    include_target_entity=bool(entity_options),
+                    include_target_automation=has_automations,
+                )
+            ),
+            errors=errors,
         )
 
     async def async_step_add_standalone_action(self, user_input: dict[str, Any] | None = None) -> FlowResult:
-        store = await self._async_get_store()
-        if user_input is not None:
-            global_entity = await self._ensure_global_actions_entity(store)
-            new_action = self._build_action_from_input(user_input)
-            global_entity.actions = [
-                action for action in global_entity.actions if action.id != new_action.id
-            ]
-            global_entity.actions.append(new_action)
-            await store.async_add_entity(global_entity)
-            return await self.async_step_entities()
-        return self.async_show_form(
-            step_id="add_standalone_action",
-            data_schema=vol.Schema(self._action_form_schema(include_target_entity=False)),
-        )
+        # Legacy step kept for backward compatibility with in-progress flows.
+        return await self.async_step_add_action(user_input)
 
     async def async_step_edit_action(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         store = await self._async_get_store()
@@ -702,11 +729,30 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
             self._action_edit = {}
             return await self.async_step_entities()
         if user_input is not None and "action_name" in user_input:
-            updated_action = self._build_action_from_input(user_input)
-            target_entity_id = user_input.get("target_entity", entity.entity_id)
-            target_entity = store.get_entity(target_entity_id) or entity
+            action_input = dict(user_input)
+            target_type = user_input.get("action_target_type", "entity")
+            if target_type == "automation":
+                automation_id = user_input.get("target_automation", "")
+                if automation_id:
+                    action_input["target_entity"] = GLOBAL_ACTIONS_ENTITY_ID
+                    action_input["action_config"] = {
+                        "action": "automation.trigger",
+                        "target": {"entity_id": automation_id},
+                    }
+
+            updated_action = self._build_action_from_input(action_input)
+            target_entity_id = action_input.get("target_entity", entity.entity_id)
+            target_entity = store.get_entity(target_entity_id)
+            if target_entity is None and target_entity_id == GLOBAL_ACTIONS_ENTITY_ID:
+                target_entity = await self._ensure_global_actions_entity(store)
+            if target_entity is None:
+                target_entity = entity
+
             entity.actions = [item for item in entity.actions if item.id != action.id]
             await store.async_add_entity(entity)
+            target_entity.actions = [
+                item for item in target_entity.actions if item.id != updated_action.id
+            ]
             target_entity.actions.append(updated_action)
             await store.async_add_entity(target_entity)
             self._action_edit = {}
@@ -719,6 +765,7 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                     defaults=self._action_defaults(action, entity.entity_id),
                     entity_options=self._managed_entity_options(store) if include_target else None,
                     include_target_entity=include_target,
+                    include_target_automation=True,
                 )
             ),
         )
@@ -1076,12 +1123,29 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
         defaults: dict[str, Any] | None = None,
         entity_options: list[dict[str, str]] | None = None,
         include_target_entity: bool = True,
+        include_target_automation: bool = True,
     ) -> dict[Any, Any]:
         defaults = defaults or {}
         schema: dict[Any, Any] = {}
+        target_type_options: list[dict[str, str]] = []
         if include_target_entity:
-            schema[vol.Required("target_entity", default=defaults.get("target_entity", ""))] = SelectSelector(
+            target_type_options.append({"value": "entity", "label": "Managed Entity"})
+        if include_target_automation:
+            target_type_options.append({"value": "automation", "label": "Automation Trigger"})
+        default_target_type = defaults.get(
+            "action_target_type",
+            "entity" if include_target_entity else "automation",
+        )
+        schema[vol.Required("action_target_type", default=default_target_type)] = SelectSelector(
+            SelectSelectorConfig(options=target_type_options, mode=SelectSelectorMode.DROPDOWN)
+        )
+        if include_target_entity:
+            schema[vol.Optional("target_entity", default=defaults.get("target_entity", ""))] = SelectSelector(
                 SelectSelectorConfig(options=entity_options or [], mode=SelectSelectorMode.DROPDOWN)
+            )
+        if include_target_automation:
+            schema[vol.Optional("target_automation", default=defaults.get("target_automation", ""))] = EntitySelector(
+                EntitySelectorConfig(domain="automation")
             )
         schema[vol.Required("action_id", default=defaults.get("action_id", ""))] = TextSelector()
         schema[vol.Required("action_name", default=defaults.get("action_name", ""))] = TextSelector()
@@ -1128,8 +1192,20 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
 
     def _action_defaults(self, action: EntityAction, entity_id: str) -> dict[str, Any]:
         step_configs = [deepcopy(config) for config in (action.steps or [self._selector_config_from_action(action, entity_id)]) if config]
+        target_type = "entity"
+        target_automation = ""
+        if step_configs:
+            first = step_configs[0]
+            if first.get("action") == "automation.trigger":
+                target = first.get("target") or {}
+                automation_id = target.get("entity_id")
+                if isinstance(automation_id, str) and automation_id.startswith("automation."):
+                    target_type = "automation"
+                    target_automation = automation_id
         defaults: dict[str, Any] = {
+            "action_target_type": target_type,
             "target_entity": entity_id,
+            "target_automation": target_automation,
             "action_id": action.id,
             "action_name": action.name,
             "action_description": action.description,
@@ -1206,7 +1282,7 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
             entity = ManagedEntity(
                 entity_id=GLOBAL_ACTIONS_ENTITY_ID,
                 name=GLOBAL_ACTIONS_ENTITY_NAME,
-                description="Standalone actions not tied to a single entity.",
+                description="Automation triggers available to the AI.",
             )
             await store.async_add_entity(entity)
         return entity

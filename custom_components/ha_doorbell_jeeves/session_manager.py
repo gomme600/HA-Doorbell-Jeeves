@@ -110,6 +110,10 @@ class JeevesSessionManager:
         # Audio interrupt detector (energy-based takeover detection)
         self._interrupt_detector: Any = None  # AudioInterruptDetector or None
 
+        # Mic forwarder queue/task (decouples ffmpeg reads from API send latency)
+        self._mic_queue: asyncio.Queue[bytes] | None = None
+        self._mic_forward_task: asyncio.Task[None] | None = None
+
         # Tool router (dual-model mode)
         self._tool_router: Any = None  # ToolRouter or None
 
@@ -222,6 +226,19 @@ class JeevesSessionManager:
                 model = DEFAULT_MODEL_GEMINI
                 _LOGGER.warning("Replaced invalid model %s → %s", config.get(CONF_MODEL), model)
             dual_model = config.get(CONF_DUAL_MODEL_ENABLED, False)
+            model_lacks_native_tools = (
+                provider == PROVIDER_GEMINI
+                and (
+                    model.startswith("gemini-2.5-flash-native-audio")
+                    or model == "gemini-2.5-flash-native-audio-dialog"
+                )
+            )
+            if model_lacks_native_tools and not dual_model:
+                _LOGGER.warning(
+                    "Model %s does not support native tool calling; enabling dual-model routing",
+                    model,
+                )
+                dual_model = True
 
             _LOGGER.warning(
                 "Session config: provider=%s, model=%s, audio_mode=%s, camera=%s",
@@ -361,6 +378,8 @@ class JeevesSessionManager:
             await self._audio_handler.stop()
             self._audio_handler = None
 
+        await self._stop_mic_forwarder()
+
         for task in (
             self._vision_task,
             self._timeout_task,
@@ -426,13 +445,38 @@ class JeevesSessionManager:
             await self.async_stop_session("human takeover")
 
         # Audio handler (always needed for Reolink mode)
+        self._mic_queue = asyncio.Queue(maxsize=256)
+        self._mic_forward_task = self.hass.async_create_task(self._mic_forward_loop())
+        mic_rx_count = 0
+        dropped_count = 0
+
         async def _on_doorbell_audio(audio_bytes: bytes) -> None:
             """Forward audio from doorbell mic to AI client."""
+            nonlocal mic_rx_count, dropped_count
+            mic_rx_count += 1
             self._touch_audio_activity()
             if self._interrupt_detector:
                 self._interrupt_detector.process_audio_frame(audio_bytes)
-            if self._client and self._active:
-                await self._client.send_audio(audio_bytes)
+            if mic_rx_count == 1:
+                _LOGGER.warning("✓ First microphone chunk received from doorbell (%d bytes)", len(audio_bytes))
+            elif mic_rx_count % 500 == 0:
+                _LOGGER.info("Microphone input received: %d chunks", mic_rx_count)
+
+            if self._mic_queue is None:
+                return
+
+            try:
+                self._mic_queue.put_nowait(audio_bytes)
+            except asyncio.QueueFull:
+                # Keep stream real-time by dropping oldest queued audio.
+                try:
+                    _ = self._mic_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                self._mic_queue.put_nowait(audio_bytes)
+                dropped_count += 1
+                if dropped_count <= 3 or dropped_count % 100 == 0:
+                    _LOGGER.warning("Mic queue overflow: dropped %d chunk(s)", dropped_count)
 
         camera_entity = config.get(CONF_CAMERA_ENTITY, "")
         self._audio_handler = ReolinkAudioHandler(
@@ -877,6 +921,7 @@ class JeevesSessionManager:
             if self._audio_handler:
                 await self._audio_handler.stop()
                 self._audio_handler = None
+            await self._stop_mic_forwarder()
             for task in (
                 self._vision_task,
                 self._timeout_task,
@@ -904,6 +949,45 @@ class JeevesSessionManager:
             )
         finally:
             self._starting = False
+
+    async def _mic_forward_loop(self) -> None:
+        """Forward queued microphone PCM chunks to the active realtime client."""
+        forwarded = 0
+        try:
+            while self._active:
+                if self._mic_queue is None:
+                    await asyncio.sleep(0.05)
+                    continue
+
+                audio_bytes = await self._mic_queue.get()
+                if not audio_bytes:
+                    continue
+
+                if self._client and self._active:
+                    try:
+                        await self._client.send_audio(audio_bytes)
+                        forwarded += 1
+                        if forwarded == 1:
+                            _LOGGER.warning("✓ First microphone chunk forwarded to AI session")
+                        elif forwarded % 500 == 0:
+                            _LOGGER.info("Microphone chunks forwarded to AI: %d", forwarded)
+                    except Exception:
+                        _LOGGER.exception("Failed to forward microphone chunk to AI")
+        except asyncio.CancelledError:
+            pass
+        finally:
+            _LOGGER.info("Mic forward loop stopped (forwarded=%d)", forwarded)
+
+    async def _stop_mic_forwarder(self) -> None:
+        """Stop mic queue forwarder task and clear pending chunks."""
+        if self._mic_forward_task and not self._mic_forward_task.done():
+            self._mic_forward_task.cancel()
+            try:
+                await self._mic_forward_task
+            except asyncio.CancelledError:
+                pass
+        self._mic_forward_task = None
+        self._mic_queue = None
 
     def _handle_transcript(self, role: str, text: str) -> None:
         self._security.log_event("transcript", f"{role}_speech", {"text": text[:500]})

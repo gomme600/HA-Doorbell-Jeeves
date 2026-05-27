@@ -26,6 +26,7 @@ _LOGGER = logging.getLogger(__name__)
 # User/addon go2rtc typically runs on port 1984
 GO2RTC_PORTS = [11984, 1984]
 GO2RTC_BASE: str | None = None  # Resolved at runtime
+MAX_AI_PCM_BUFFER_BYTES = 240_000  # ~5s of 24kHz mono 16-bit PCM
 
 # Reolink RTSP URL patterns
 REOLINK_RTSP_MAIN = "rtsp://{user}:{password}@{host}:554/h264Preview_01_main"
@@ -144,7 +145,7 @@ def get_reolink_config(hass: HomeAssistant, config_entry_id: str) -> dict[str, A
     data = dict(entry.data)
     return {
         "host": data.get("host", ""),
-        "username": data.get("username", "admin"),
+        "username": data.get("username", ""),
         "password": data.get("password", ""),
         "port": data.get("port", 443),
     }
@@ -252,6 +253,8 @@ class ReolinkAudioHandler:
         self._talk_ability: dict | None = None
         self._talk_enc_type: Any = None
         self._pcm_buffer: bytearray = bytearray()
+        self._pcm_lock = asyncio.Lock()
+        self._pcm_overflow_warned = False
         self._ffmpeg_proc: asyncio.subprocess.Process | None = None
         self._chime_delay: float = DEFAULT_CHIME_DELAY
         # Audio input state (RTSP mic via ffmpeg)
@@ -386,6 +389,10 @@ class ReolinkAudioHandler:
                 pass
         self._output_reader_task = None
 
+        async with self._pcm_lock:
+            self._pcm_buffer.clear()
+            self._pcm_overflow_warned = False
+
         self._baichuan = None
         self._talk_ability = None
         _LOGGER.warning("Reolink audio handler stopped (sent %d audio chunks)", self._send_count)
@@ -398,7 +405,17 @@ class ReolinkAudioHandler:
         """
         if not self._active:
             return
-        self._pcm_buffer.extend(pcm_bytes)
+        async with self._pcm_lock:
+            self._pcm_buffer.extend(pcm_bytes)
+            overflow = len(self._pcm_buffer) - MAX_AI_PCM_BUFFER_BYTES
+            if overflow > 0:
+                del self._pcm_buffer[:overflow]
+                if not self._pcm_overflow_warned:
+                    self._pcm_overflow_warned = True
+                    _LOGGER.warning(
+                        "AI audio backlog exceeded %d bytes; trimming oldest buffered audio",
+                        MAX_AI_PCM_BUFFER_BYTES,
+                    )
         self._send_count += 1
         if self._send_count == 1:
             _LOGGER.warning("First audio data received from AI (%d bytes)", len(pcm_bytes))
@@ -457,7 +474,7 @@ class ReolinkAudioHandler:
         # Get credentials and connection details from the Reolink config entry
         data = entry.data
         host = data.get("host", "")
-        username = data.get("username", "admin")
+        username = data.get("username", "")
         password = data.get("password", "")
         http_port = data.get("port")
         use_https = data.get("use_https")
@@ -616,16 +633,15 @@ class ReolinkAudioHandler:
         # to prevent drift and ensure smooth playback
         import time as time_mod  # noqa: PLC0415
         expected_stream_end = time_mod.monotonic()
-
-        # Use 2 blocks per payload for smoother playback with less timing sensitivity
-        BLOCKS_PER_PAYLOAD = 2
+        resampled_pcm_buffer = bytearray()
 
         try:
             while self._active:
                 # Feed buffered PCM to ffmpeg for resampling
-                if self._pcm_buffer:
+                async with self._pcm_lock:
                     chunk = bytes(self._pcm_buffer)
                     self._pcm_buffer.clear()
+                if chunk:
                     try:
                         self._ffmpeg_proc.stdin.write(chunk)
                         await self._ffmpeg_proc.stdin.drain()
@@ -633,36 +649,40 @@ class ReolinkAudioHandler:
                         _LOGGER.warning("ffmpeg stdin write failed")
                         break
 
-                # Read exactly one block's worth of resampled PCM
-                read_size = pcm_bytes_per_block * BLOCKS_PER_PAYLOAD
+                # Read resampled PCM and keep leftovers between iterations to avoid
+                # repeatedly zero-padding partial ADPCM blocks (causes choppy speech).
+                read_size = pcm_bytes_per_block * 4
                 try:
                     resampled = await asyncio.wait_for(
                         self._ffmpeg_proc.stdout.read(read_size),
-                        timeout=0.15,
+                        timeout=0.08,
                     )
                 except asyncio.TimeoutError:
-                    # No data ready yet — small delay and retry
-                    await asyncio.sleep(0.01)
-                    continue
+                    resampled = b""
                 except Exception:
                     break
 
-                if not resampled:
+                if resampled:
+                    resampled_pcm_buffer.extend(resampled)
+                elif not chunk:
+                    await asyncio.sleep(0.005)
                     continue
 
-                # Encode PCM to IMA ADPCM blocks
-                adpcm_data, predictor, step_index = self._encode_ima_adpcm(
-                    resampled, block_size, predictor, step_index
-                )
+                # Encode and send exactly one complete ADPCM block at a time.
+                # This preserves block boundaries and improves playback smoothness.
+                while len(resampled_pcm_buffer) >= pcm_bytes_per_block:
+                    pcm_block = bytes(resampled_pcm_buffer[:pcm_bytes_per_block])
+                    del resampled_pcm_buffer[:pcm_bytes_per_block]
 
-                if not adpcm_data:
-                    continue
+                    adpcm_data, predictor, step_index = self._encode_ima_adpcm(
+                        pcm_block, block_size, predictor, step_index
+                    )
+                    if not adpcm_data:
+                        continue
 
-                # Send each block individually for smooth streaming
-                for offset in range(0, len(adpcm_data), block_size):
-                    adpcm_block = adpcm_data[offset:offset + block_size]
+                    adpcm_block = adpcm_data[:block_size]
                     if len(adpcm_block) < block_size:
-                        break
+                        continue
 
                     payload = self._build_bcmedia_payload(adpcm_block, block_size)
                     if not payload:
@@ -687,9 +707,8 @@ class ReolinkAudioHandler:
                             _LOGGER.warning("Baichuan talk send error: %s", exc)
                         continue
 
-                    # Neolink-style pacing: track expected end time to avoid drift
+                    # Neolink-style pacing: track expected end time to avoid drift.
                     if now > expected_stream_end:
-                        # We're behind — reset timing (gap in audio source)
                         expected_stream_end = now + play_duration
                     else:
                         expected_stream_end += play_duration
@@ -712,6 +731,12 @@ class ReolinkAudioHandler:
                 except Exception:
                     pass
             self._ffmpeg_proc = None
+
+            # Let the last queued payload finish playback before stopping talk,
+            # otherwise the tail of speech can get clipped.
+            remaining = expected_stream_end - time_mod.monotonic()
+            if remaining > 0:
+                await asyncio.sleep(min(remaining + 0.1, 1.5))
 
             # Stop talk session on camera
             await self._stop_baichuan_talk(channel)
@@ -1050,7 +1075,7 @@ class ReolinkAudioHandler:
             )
 
             # Build ffmpeg args — add RTSP-specific options only for rtsp:// URLs
-            ffmpeg_args = ["ffmpeg", "-hide_banner", "-loglevel", "warning"]
+            ffmpeg_args = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats"]
             if url.startswith("rtsp://"):
                 ffmpeg_args.extend(["-rtsp_transport", "tcp"])
             ffmpeg_args.extend([
@@ -1115,16 +1140,19 @@ class ReolinkAudioHandler:
             self._listen_active = False
             return
 
-        # Read PCM in 20ms chunks: 16000 Hz * 2 bytes * 0.02s = 640 bytes
+        # Read PCM in strict 20ms chunks: 16000 Hz * 2 bytes * 0.02s = 640 bytes
         CHUNK_SIZE = 640
         chunks_sent = 0
         first_logged = False
 
         try:
             while self._active and self._listen_active and proc.returncode is None:
-                pcm_data = await proc.stdout.read(CHUNK_SIZE)
-                if not pcm_data:
-                    break  # EOF or process died
+                try:
+                    pcm_data = await proc.stdout.readexactly(CHUNK_SIZE)
+                except asyncio.IncompleteReadError as err:
+                    pcm_data = err.partial
+                    if not pcm_data:
+                        break
 
                 if not first_logged:
                     first_logged = True
