@@ -548,6 +548,13 @@ class JeevesSessionManager:
                 if mic_rx_count == 100:
                     self._save_debug_wav(bytes(self._debug_pcm_buf))
 
+            # At chunk 10 (~5s in), run an async audio diagnostic:
+            # send captured PCM to Gemini non-live API to verify speech is intelligible
+            if mic_rx_count == 10:
+                pcm_sample = bytes(self._debug_pcm_buf) if hasattr(self, "_debug_pcm_buf") else b""
+                if pcm_sample:
+                    self.hass.async_create_task(self._run_audio_diagnostic(pcm_sample))
+
             if self._mic_queue is None:
                 return
 
@@ -864,6 +871,112 @@ class JeevesSessionManager:
             )
         except Exception:
             _LOGGER.exception("Failed to save debug WAV")
+
+    async def _run_audio_diagnostic(self, pcm_data: bytes) -> None:
+        """Send captured PCM audio to Gemini Live API and check if model responds.
+
+        This diagnostic validates that the doorbell mic audio is intelligible
+        to the model by sending it directly via send_realtime_input and checking
+        for an audio response.
+        """
+        import struct as struct_mod  # noqa: PLC0415
+
+        try:
+            from google import genai  # noqa: PLC0415
+            from google.genai import types  # noqa: PLC0415
+        except ImportError:
+            _LOGGER.warning("Audio diagnostic: google-genai not available")
+            return
+
+        api_key = self._config.get("gemini_api_key", "")
+        if not api_key:
+            _LOGGER.warning("Audio diagnostic: no API key configured")
+            return
+
+        # Log audio stats
+        n_samples = len(pcm_data) // 2
+        samples = struct_mod.unpack(f"<{n_samples}h", pcm_data)
+        rms = (sum(s * s for s in samples) / n_samples) ** 0.5
+        peak = max(abs(s) for s in samples)
+        _LOGGER.warning(
+            "🔊 Audio diagnostic: testing %d bytes (%.1fs) of mic audio — RMS=%.0f peak=%d",
+            len(pcm_data), len(pcm_data) / 32000, rms, peak,
+        )
+
+        try:
+            client = genai.Client(api_key=api_key)
+            config = types.LiveConnectConfig(
+                response_modalities=["AUDIO"],
+                realtime_input_config=types.RealtimeInputConfig(
+                    automatic_activity_detection=types.AutomaticActivityDetection(
+                        disabled=False,
+                        start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
+                        end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
+                        silence_duration_ms=700,
+                        prefix_padding_ms=300,
+                    )
+                ),
+                output_audio_transcription=types.AudioTranscriptionConfig(),
+                system_instruction=types.Content(
+                    parts=[types.Part(text="Repeat exactly what you hear. If you hear speech, repeat the words. If you hear noise or nothing intelligible, say 'no speech detected'.")]
+                ),
+            )
+
+            model = self._config.get("gemini_model", "gemini-2.5-flash-native-audio-latest")
+            async with client.aio.live.connect(model=model, config=config) as session:
+                # Send audio at real-time rate
+                CHUNK = 4096
+                for off in range(0, len(pcm_data), CHUNK):
+                    segment = pcm_data[off:off + CHUNK]
+                    await session.send_realtime_input(
+                        audio=types.Blob(data=segment, mime_type="audio/pcm;rate=16000")
+                    )
+                    await asyncio.sleep(0.128)
+
+                # Send 1.5s silence to signal end of speech
+                import random
+                silence = struct_mod.pack(
+                    f"<{24000}h", *[random.randint(-5, 5) for _ in range(24000)]
+                )
+                for off in range(0, len(silence), CHUNK):
+                    await session.send_realtime_input(
+                        audio=types.Blob(data=silence[off:off + CHUNK], mime_type="audio/pcm;rate=16000")
+                    )
+
+                # Wait for response
+                audio_chunks = 0
+                transcription_parts: list[str] = []
+
+                async def _receive():
+                    nonlocal audio_chunks
+                    async for resp in session.receive():
+                        sc = getattr(resp, "server_content", None)
+                        if sc and sc.model_turn:
+                            for part in sc.model_turn.parts:
+                                if part.inline_data and "audio" in (part.inline_data.mime_type or ""):
+                                    audio_chunks += 1
+                        if sc and hasattr(sc, "output_transcription"):
+                            t = getattr(sc, "output_transcription", None)
+                            if t and hasattr(t, "text") and t.text:
+                                transcription_parts.append(t.text)
+                        if sc and getattr(sc, "turn_complete", False):
+                            return
+
+                await asyncio.wait_for(_receive(), timeout=15.0)
+                transcript = "".join(transcription_parts)
+                _LOGGER.warning(
+                    "🔊 Audio diagnostic RESULT: Gemini responded with %d audio chunks. "
+                    "Transcription: '%s'",
+                    audio_chunks, transcript[:300],
+                )
+
+        except asyncio.TimeoutError:
+            _LOGGER.warning(
+                "🔊 Audio diagnostic RESULT: TIMEOUT — Gemini did NOT respond to mic audio! "
+                "This means either the audio is not intelligible speech or VAD cannot detect it."
+            )
+        except Exception:
+            _LOGGER.exception("🔊 Audio diagnostic failed")
 
     # ─── Identity Context ─────────────────────────────────────────────────────
 

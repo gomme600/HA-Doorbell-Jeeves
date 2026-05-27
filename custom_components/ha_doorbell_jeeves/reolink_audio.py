@@ -1218,6 +1218,23 @@ class ReolinkAudioHandler:
                 elif input_count[0] % 500 == 0:
                     _LOGGER.warning("Baichuan audio input: %d packets received", input_count[0])
 
+                # Save first 20 raw payloads for codec analysis
+                if input_count[0] <= 20:
+                    if not hasattr(self, "_raw_audio_payloads"):
+                        self._raw_audio_payloads = bytearray()
+                    self._raw_audio_payloads.extend(payload)
+                    if input_count[0] == 20:
+                        raw_path = "/config/debug_raw_audio_payloads.bin"
+                        try:
+                            with open(raw_path, "wb") as f:
+                                f.write(self._raw_audio_payloads)
+                            _LOGGER.warning(
+                                "Saved %d raw audio payloads (%d bytes) to %s",
+                                20, len(self._raw_audio_payloads), raw_path,
+                            )
+                        except Exception:
+                            _LOGGER.exception("Failed to save raw audio payloads")
+
                 # Parse BcMedia and decode ADPCM → PCM
                 pcm_data = self._parse_bcmedia_to_pcm(payload)
                 if pcm_data and self._listen_active:
