@@ -330,8 +330,13 @@ class JeevesSessionManager:
 
             if provider == PROVIDER_GEMINI:
                 voice = config.get(CONF_VOICE, DEFAULT_VOICE_GEMINI)
+                # TEMP DEBUG: disable tools to test if they're blocking audio response
+                _LOGGER.warning(
+                    "Tools configured: %d gemini tools (TEMPORARILY DISABLED FOR DEBUGGING)",
+                    len(voice_tools_gemini),
+                )
                 self._client = await self._create_gemini_client(
-                    api_key, model, voice_prompt, voice, voice_tools_gemini, reference_images
+                    api_key, model, voice_prompt, voice, [], reference_images
                 )
             else:
                 voice = config.get(CONF_VOICE, DEFAULT_VOICE_OPENAI)
@@ -938,8 +943,12 @@ class JeevesSessionManager:
             "If you can see them in the camera feed, describe or acknowledge them naturally."
         )
         try:
+            # Pre-close echo gate with generous initial hold: AI will start
+            # speaking after this message. The hold time will be naturally
+            # extended by _handle_audio_output as actual audio chunks arrive.
+            self._ai_last_output_time = time.time() + 8.0  # Gate closed for at least 10s total
             await self._client.inject_context(trigger_msg)
-            _LOGGER.warning("Sent initial greeting trigger to AI model")
+            _LOGGER.warning("Sent initial greeting trigger to AI model (echo gate pre-armed)")
         except Exception:
             _LOGGER.exception("Failed to send initial greeting trigger")
 
