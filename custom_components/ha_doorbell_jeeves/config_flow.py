@@ -30,6 +30,8 @@ from homeassistant.helpers.selector import (
 )
 
 from .const import (
+    AUDIO_MANUAL_EXTERNAL_GO2RTC,
+    AUDIO_MANUAL_HA_ENTITIES,
     AUDIO_MODE_MANUAL,
     AUDIO_MODE_REOLINK,
     AUDIO_OUTPUT_EVENT,
@@ -37,6 +39,7 @@ from .const import (
     AUDIO_OUTPUT_MEDIA_PLAYER,
     CONF_API_BASE_URL,
     CONF_API_KEY,
+    CONF_AUDIO_MANUAL_MODE,
     CONF_AUDIO_MODE,
     CONF_AUDIO_OUTPUT_MODE,
     CONF_CAMERA_ENTITY,
@@ -46,6 +49,7 @@ from .const import (
     CONF_FRAME_MAX_HEIGHT,
     CONF_FRAME_MAX_WIDTH,
     CONF_FRAME_QUALITY,
+    CONF_GO2RTC_STREAM_NAME,
     CONF_IDENTITY_MODE,
     CONF_LLMVISION_CAMERAS,
     CONF_LLMVISION_CATEGORIES,
@@ -55,6 +59,7 @@ from .const import (
     CONF_LLMVISION_TIMELINE_ENABLED,
     CONF_MEDIA_PLAYER_ENTITY,
     CONF_MEMORY_RETENTION_DAYS,
+    CONF_MICROPHONE_ENTITY,
     CONF_MODEL,
     CONF_PIN_CODE,
     CONF_PROVIDER,
@@ -69,6 +74,7 @@ from .const import (
     CONF_VALIDATOR_MODEL,
     CONF_VISION_FPS,
     CONF_VOICE,
+    DEFAULT_AUDIO_MANUAL_MODE,
     DEFAULT_FRAME_MAX_HEIGHT,
     DEFAULT_FRAME_MAX_WIDTH,
     DEFAULT_FRAME_QUALITY,
@@ -105,6 +111,64 @@ _LOGGER = logging.getLogger(__name__)
 _ACTION_STEP_FIELDS = ["action_config", "step_2_config", "step_3_config", "step_4_config", "step_5_config"]
 
 
+def _loaded_reolink_entries(hass: Any) -> list[ConfigEntry]:
+    """Return loaded Reolink config entries."""
+    return [
+        entry
+        for entry in hass.config_entries.async_entries("reolink")
+        if entry.state == config_entries.ConfigEntryState.LOADED
+    ]
+
+
+def _reolink_entry_selector_options(hass: Any) -> list[dict[str, str]]:
+    """Build selector options for available Reolink integrations."""
+    registry = er.async_get(hass)
+    options: list[dict[str, str]] = []
+    for entry in _loaded_reolink_entries(hass):
+        camera_count = sum(
+            1
+            for entity in er.async_entries_for_config_entry(registry, entry.entry_id)
+            if entity.domain == "camera" and not entity.disabled
+        )
+        options.append(
+            {
+                "value": entry.entry_id,
+                "label": f"{entry.title} ({camera_count} camera{'s' if camera_count != 1 else ''})",
+            }
+        )
+    return options
+
+
+def _auto_detect_reolink_trigger_entity(hass: Any, reolink_entry_id: str) -> str | None:
+    """Pick the best trigger entity for a Reolink config entry."""
+    registry = er.async_get(hass)
+    best_match: tuple[int, str] | None = None
+    for entity in er.async_entries_for_config_entry(registry, reolink_entry_id):
+        entity_id = entity.entity_id or ""
+        if not entity_id or entity.disabled:
+            continue
+        score = 0
+        lower = entity_id.lower()
+        if "visitor" in lower:
+            score += 4
+        if "doorbell" in lower:
+            score += 3
+        if entity.domain == "button":
+            score += 2
+        if "button" in lower:
+            score += 1
+        if score == 0:
+            continue
+        if best_match is None or score > best_match[0]:
+            best_match = (score, entity_id)
+    return best_match[1] if best_match else None
+
+
+def _clean_text(value: Any) -> str:
+    """Return a stripped string or empty string."""
+    return value.strip() if isinstance(value, str) else ""
+
+
 class DoorbellJeevesConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle initial setup of Doorbell Jeeves."""
 
@@ -123,7 +187,7 @@ class DoorbellJeevesConfigFlow(ConfigFlow, domain=DOMAIN):
             self._data[CONF_AUDIO_MODE] = user_input[CONF_AUDIO_MODE]
             if user_input[CONF_AUDIO_MODE] == AUDIO_MODE_REOLINK:
                 return await self.async_step_reolink()
-            return await self.async_step_provider()
+            return await self.async_step_manual_audio()
 
         return self.async_show_form(
             step_id="user",
@@ -144,50 +208,117 @@ class DoorbellJeevesConfigFlow(ConfigFlow, domain=DOMAIN):
 
     async def async_step_reolink(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         errors: dict[str, str] = {}
-        reolink_entries = [
-            entry
-            for entry in self.hass.config_entries.async_entries("reolink")
-            if entry.state == config_entries.ConfigEntryState.LOADED
-        ]
-        if not reolink_entries:
+        reolink_options = _reolink_entry_selector_options(self.hass)
+        if not reolink_options:
             errors["base"] = "no_reolink_found"
             return self.async_show_form(step_id="reolink", data_schema=vol.Schema({}), errors=errors)
 
-        registry = er.async_get(self.hass)
-        reolink_cameras: list[dict[str, str]] = []
-        for entry in reolink_entries:
-            for entity in er.async_entries_for_config_entry(registry, entry.entry_id):
-                if entity.domain == "camera" and not entity.disabled:
-                    reolink_cameras.append(
-                        {
-                            "value": entity.entity_id,
-                            "label": f"{entity.original_name or entity.entity_id} ({entry.title})",
-                        }
-                    )
-
         if user_input is not None:
-            camera_id = user_input[CONF_CAMERA_ENTITY]
-            entity_entry = registry.async_get(camera_id)
-            if entity_entry:
-                self._data[CONF_CAMERA_ENTITY] = camera_id
-                self._data[CONF_REOLINK_ENTRY_ID] = entity_entry.config_entry_id
+            reolink_entry_id = user_input.get(CONF_REOLINK_ENTRY_ID)
+            if not reolink_entry_id:
+                errors[CONF_REOLINK_ENTRY_ID] = "required"
+            else:
+                self._data[CONF_REOLINK_ENTRY_ID] = str(reolink_entry_id)
                 self._data[CONF_AUDIO_OUTPUT_MODE] = AUDIO_OUTPUT_GO2RTC
-                for trigger in er.async_entries_for_config_entry(registry, entity_entry.config_entry_id):
-                    trigger_id = trigger.entity_id or ""
-                    if "visitor" in trigger_id or "button" in trigger_id:
-                        self._data["doorbell_trigger_entity"] = trigger_id
-                        break
-            return await self.async_step_provider()
+                self._data.pop(CONF_AUDIO_MANUAL_MODE, None)
+                self._data.pop(CONF_GO2RTC_STREAM_NAME, None)
+                self._data.pop(CONF_MEDIA_PLAYER_ENTITY, None)
+                self._data.pop(CONF_MICROPHONE_ENTITY, None)
+
+                trigger_entity = _auto_detect_reolink_trigger_entity(self.hass, str(reolink_entry_id))
+                if trigger_entity:
+                    self._data["doorbell_trigger_entity"] = trigger_entity
+                return await self.async_step_provider()
 
         return self.async_show_form(
             step_id="reolink",
             data_schema=vol.Schema(
                 {
-                    vol.Required(CONF_CAMERA_ENTITY): SelectSelector(
-                        SelectSelectorConfig(options=reolink_cameras, mode=SelectSelectorMode.DROPDOWN)
+                    vol.Required(
+                        CONF_REOLINK_ENTRY_ID,
+                        default=self._data.get(CONF_REOLINK_ENTRY_ID, ""),
+                    ): SelectSelector(
+                        SelectSelectorConfig(options=reolink_options, mode=SelectSelectorMode.DROPDOWN)
                     )
                 }
             ),
+            errors=errors,
+        )
+
+    async def async_step_manual_audio(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        errors: dict[str, str] = {}
+        manual_mode = self._data.get(CONF_AUDIO_MANUAL_MODE, DEFAULT_AUDIO_MANUAL_MODE)
+
+        if user_input is not None:
+            manual_mode = user_input.get(CONF_AUDIO_MANUAL_MODE, DEFAULT_AUDIO_MANUAL_MODE)
+            if manual_mode == AUDIO_MANUAL_EXTERNAL_GO2RTC:
+                if not _clean_text(user_input.get(CONF_GO2RTC_STREAM_NAME, "")):
+                    errors[CONF_GO2RTC_STREAM_NAME] = "required"
+            elif manual_mode == AUDIO_MANUAL_HA_ENTITIES:
+                if not user_input.get(CONF_MEDIA_PLAYER_ENTITY):
+                    errors[CONF_MEDIA_PLAYER_ENTITY] = "required"
+                if not user_input.get(CONF_MICROPHONE_ENTITY):
+                    errors[CONF_MICROPHONE_ENTITY] = "required"
+
+            if not errors:
+                self._data[CONF_AUDIO_MANUAL_MODE] = str(manual_mode)
+                self._data.pop(CONF_REOLINK_ENTRY_ID, None)
+                self._data.pop("doorbell_trigger_entity", None)
+                if manual_mode == AUDIO_MANUAL_EXTERNAL_GO2RTC:
+                    self._data[CONF_GO2RTC_STREAM_NAME] = _clean_text(
+                        user_input.get(CONF_GO2RTC_STREAM_NAME, "")
+                    )
+                    self._data[CONF_AUDIO_OUTPUT_MODE] = AUDIO_OUTPUT_EVENT
+                    self._data.pop(CONF_MEDIA_PLAYER_ENTITY, None)
+                    self._data.pop(CONF_MICROPHONE_ENTITY, None)
+                else:
+                    self._data[CONF_MEDIA_PLAYER_ENTITY] = _clean_text(
+                        user_input.get(CONF_MEDIA_PLAYER_ENTITY, "")
+                    )
+                    self._data[CONF_MICROPHONE_ENTITY] = _clean_text(
+                        user_input.get(CONF_MICROPHONE_ENTITY, "")
+                    )
+                    self._data[CONF_AUDIO_OUTPUT_MODE] = AUDIO_OUTPUT_MEDIA_PLAYER
+                    self._data.pop(CONF_GO2RTC_STREAM_NAME, None)
+                return await self.async_step_provider()
+
+        return self.async_show_form(
+            step_id="manual_audio",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_AUDIO_MANUAL_MODE,
+                        default=manual_mode,
+                    ): SelectSelector(
+                        SelectSelectorConfig(
+                            options=[
+                                {
+                                    "value": AUDIO_MANUAL_EXTERNAL_GO2RTC,
+                                    "label": "External go2rtc stream",
+                                },
+                                {
+                                    "value": AUDIO_MANUAL_HA_ENTITIES,
+                                    "label": "Home Assistant entities (speaker + microphone)",
+                                },
+                            ],
+                            mode=SelectSelectorMode.DROPDOWN,
+                        )
+                    ),
+                    vol.Optional(
+                        CONF_GO2RTC_STREAM_NAME,
+                        default=self._data.get(CONF_GO2RTC_STREAM_NAME, ""),
+                    ): TextSelector(),
+                    vol.Optional(
+                        CONF_MEDIA_PLAYER_ENTITY,
+                        default=self._data.get(CONF_MEDIA_PLAYER_ENTITY, ""),
+                    ): EntitySelector(EntitySelectorConfig(domain="media_player")),
+                    vol.Optional(
+                        CONF_MICROPHONE_ENTITY,
+                        default=self._data.get(CONF_MICROPHONE_ENTITY, ""),
+                    ): EntitySelector(EntitySelectorConfig()),
+                }
+            ),
+            errors=errors,
         )
 
     async def async_step_provider(self, user_input: dict[str, Any] | None = None) -> FlowResult:
@@ -236,22 +367,12 @@ class DoorbellJeevesConfigFlow(ConfigFlow, domain=DOMAIN):
             self._data.update(user_input)
             return await self.async_step_prompt()
 
-        has_camera = bool(self._data.get(CONF_CAMERA_ENTITY))
-        schema: dict[Any, Any] = {}
-        if not has_camera:
-            schema[vol.Required(CONF_CAMERA_ENTITY, default="")] = EntitySelector(EntitySelectorConfig(domain="camera"))
-            schema[vol.Required(CONF_AUDIO_OUTPUT_MODE, default=AUDIO_OUTPUT_EVENT)] = SelectSelector(
-                SelectSelectorConfig(
-                    options=[
-                        {"value": AUDIO_OUTPUT_MEDIA_PLAYER, "label": "Media Player (HA speaker)"},
-                        {"value": AUDIO_OUTPUT_EVENT, "label": "Event (custom handling)"},
-                    ],
-                    mode=SelectSelectorMode.DROPDOWN,
-                )
-            )
-            schema[vol.Optional(CONF_MEDIA_PLAYER_ENTITY, default="")] = EntitySelector(
-                EntitySelectorConfig(domain="media_player")
-            )
+        schema: dict[Any, Any] = {
+            vol.Required(
+                CONF_CAMERA_ENTITY,
+                default=self._data.get(CONF_CAMERA_ENTITY, ""),
+            ): EntitySelector(EntitySelectorConfig(domain="camera"))
+        }
 
         schema[vol.Required(CONF_VISION_FPS, default=self._data.get(CONF_VISION_FPS, DEFAULT_VISION_FPS))] = NumberSelector(
             NumberSelectorConfig(min=0.1, max=10.0, step=0.1, mode=NumberSelectorMode.SLIDER)
@@ -385,6 +506,7 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                 "general",
                 "dual_model",
                 "vision",
+                "audio",
                 "timeline",
                 "entities",
                 "security",
@@ -496,6 +618,133 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                     ): NumberSelector(NumberSelectorConfig(min=10, max=100, step=5, mode=NumberSelectorMode.SLIDER)),
                 }
             ),
+        )
+
+    async def async_step_audio(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        errors: dict[str, str] = {}
+        audio_mode = self._data.get(CONF_AUDIO_MODE, AUDIO_MODE_REOLINK)
+        manual_mode = self._data.get(CONF_AUDIO_MANUAL_MODE, DEFAULT_AUDIO_MANUAL_MODE)
+        reolink_options = _reolink_entry_selector_options(self.hass)
+
+        if user_input is not None:
+            audio_mode = user_input.get(CONF_AUDIO_MODE, AUDIO_MODE_REOLINK)
+            self._data[CONF_AUDIO_MODE] = audio_mode
+
+            if audio_mode == AUDIO_MODE_REOLINK:
+                reolink_entry_id = _clean_text(user_input.get(CONF_REOLINK_ENTRY_ID, ""))
+                if not reolink_entry_id:
+                    errors[CONF_REOLINK_ENTRY_ID] = "required"
+                elif not any(option["value"] == reolink_entry_id for option in reolink_options):
+                    errors["base"] = "no_reolink_found"
+                else:
+                    self._data[CONF_REOLINK_ENTRY_ID] = reolink_entry_id
+                    self._data[CONF_AUDIO_OUTPUT_MODE] = AUDIO_OUTPUT_GO2RTC
+                    self._data.pop(CONF_AUDIO_MANUAL_MODE, None)
+                    self._data.pop(CONF_GO2RTC_STREAM_NAME, None)
+                    self._data.pop(CONF_MEDIA_PLAYER_ENTITY, None)
+                    self._data.pop(CONF_MICROPHONE_ENTITY, None)
+                    trigger_entity = _auto_detect_reolink_trigger_entity(self.hass, reolink_entry_id)
+                    if trigger_entity:
+                        self._data["doorbell_trigger_entity"] = trigger_entity
+                    return self._save_options()
+            else:
+                manual_mode = user_input.get(CONF_AUDIO_MANUAL_MODE, DEFAULT_AUDIO_MANUAL_MODE)
+                if manual_mode == AUDIO_MANUAL_EXTERNAL_GO2RTC:
+                    if not _clean_text(user_input.get(CONF_GO2RTC_STREAM_NAME, "")):
+                        errors[CONF_GO2RTC_STREAM_NAME] = "required"
+                elif manual_mode == AUDIO_MANUAL_HA_ENTITIES:
+                    if not user_input.get(CONF_MEDIA_PLAYER_ENTITY):
+                        errors[CONF_MEDIA_PLAYER_ENTITY] = "required"
+                    if not user_input.get(CONF_MICROPHONE_ENTITY):
+                        errors[CONF_MICROPHONE_ENTITY] = "required"
+
+                if not errors:
+                    self._data[CONF_AUDIO_MANUAL_MODE] = str(manual_mode)
+                    self._data.pop(CONF_REOLINK_ENTRY_ID, None)
+                    self._data.pop("doorbell_trigger_entity", None)
+                    if manual_mode == AUDIO_MANUAL_EXTERNAL_GO2RTC:
+                        self._data[CONF_GO2RTC_STREAM_NAME] = _clean_text(
+                            user_input.get(CONF_GO2RTC_STREAM_NAME, "")
+                        )
+                        self._data[CONF_AUDIO_OUTPUT_MODE] = AUDIO_OUTPUT_EVENT
+                        self._data.pop(CONF_MEDIA_PLAYER_ENTITY, None)
+                        self._data.pop(CONF_MICROPHONE_ENTITY, None)
+                    else:
+                        self._data[CONF_MEDIA_PLAYER_ENTITY] = _clean_text(
+                            user_input.get(CONF_MEDIA_PLAYER_ENTITY, "")
+                        )
+                        self._data[CONF_MICROPHONE_ENTITY] = _clean_text(
+                            user_input.get(CONF_MICROPHONE_ENTITY, "")
+                        )
+                        self._data[CONF_AUDIO_OUTPUT_MODE] = AUDIO_OUTPUT_MEDIA_PLAYER
+                        self._data.pop(CONF_GO2RTC_STREAM_NAME, None)
+                    return self._save_options()
+
+        schema: dict[Any, Any] = {
+            vol.Required(CONF_AUDIO_MODE, default=audio_mode): SelectSelector(
+                SelectSelectorConfig(
+                    options=[
+                        {"value": AUDIO_MODE_REOLINK, "label": "Reolink native (auto)"},
+                        {"value": AUDIO_MODE_MANUAL, "label": "Manual setup"},
+                    ],
+                    mode=SelectSelectorMode.DROPDOWN,
+                )
+            )
+        }
+
+        if audio_mode == AUDIO_MODE_REOLINK:
+            if reolink_options:
+                schema[
+                    vol.Required(
+                        CONF_REOLINK_ENTRY_ID,
+                        default=self._data.get(CONF_REOLINK_ENTRY_ID, ""),
+                    )
+                ] = SelectSelector(
+                    SelectSelectorConfig(options=reolink_options, mode=SelectSelectorMode.DROPDOWN)
+                )
+            else:
+                errors["base"] = "no_reolink_found"
+        else:
+            schema[
+                vol.Required(
+                    CONF_AUDIO_MANUAL_MODE,
+                    default=manual_mode,
+                )
+            ] = SelectSelector(
+                SelectSelectorConfig(
+                    options=[
+                        {"value": AUDIO_MANUAL_EXTERNAL_GO2RTC, "label": "External go2rtc stream"},
+                        {
+                            "value": AUDIO_MANUAL_HA_ENTITIES,
+                            "label": "Home Assistant entities (speaker + microphone)",
+                        },
+                    ],
+                    mode=SelectSelectorMode.DROPDOWN,
+                )
+            )
+            schema[
+                vol.Optional(
+                    CONF_GO2RTC_STREAM_NAME,
+                    default=self._data.get(CONF_GO2RTC_STREAM_NAME, ""),
+                )
+            ] = TextSelector()
+            schema[
+                vol.Optional(
+                    CONF_MEDIA_PLAYER_ENTITY,
+                    default=self._data.get(CONF_MEDIA_PLAYER_ENTITY, ""),
+                )
+            ] = EntitySelector(EntitySelectorConfig(domain="media_player"))
+            schema[
+                vol.Optional(
+                    CONF_MICROPHONE_ENTITY,
+                    default=self._data.get(CONF_MICROPHONE_ENTITY, ""),
+                )
+            ] = EntitySelector(EntitySelectorConfig())
+
+        return self.async_show_form(
+            step_id="audio",
+            data_schema=vol.Schema(schema),
+            errors=errors,
         )
 
     async def async_step_timeline(self, user_input: dict[str, Any] | None = None) -> FlowResult:

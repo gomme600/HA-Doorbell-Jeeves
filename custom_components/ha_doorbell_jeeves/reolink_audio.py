@@ -247,6 +247,7 @@ class ReolinkAudioHandler:
         self._reolink_rtsp_port: int = 554
         self._reolink_rtsp_url: str = ""
         self._camera_entity_id: str | None = None
+        self._reolink_entry_id: str | None = None
         # Baichuan talk state (output — speaker)
         self._baichuan: Any = None
         self._talk_host: Any = None  # Dedicated Host object for talk connection
@@ -292,12 +293,14 @@ class ReolinkAudioHandler:
         Accesses the runtime Host object to get the actual RTSP port and credentials.
         """
         # First try to get from the camera entity's config entry
-        camera_entity = self._camera_entity_id or self._stream_name
-        # Clean up entity ID format
-        if camera_entity.startswith("jeeves_"):
-            camera_entity = camera_entity.replace("jeeves_", "").replace("_", ".", 1)
+        reolink_entry_id = self._reolink_entry_id
+        if not reolink_entry_id:
+            camera_entity = self._camera_entity_id or self._stream_name
+            # Clean up entity ID format
+            if camera_entity.startswith("jeeves_"):
+                camera_entity = camera_entity.replace("jeeves_", "").replace("_", ".", 1)
+            reolink_entry_id = find_reolink_entry_for_camera(self._hass, camera_entity)
 
-        reolink_entry_id = find_reolink_entry_for_camera(self._hass, camera_entity)
         if reolink_entry_id:
             reolink_config = get_reolink_config(self._hass, reolink_entry_id)
             if reolink_config:
@@ -462,9 +465,14 @@ class ReolinkAudioHandler:
         our audio streaming and the integration's normal command flow.
         """
         camera_entity = self._camera_entity_id or ""
-        reolink_entry_id = find_reolink_entry_for_camera(self._hass, camera_entity)
+        reolink_entry_id = self._reolink_entry_id
         if not reolink_entry_id:
-            _LOGGER.warning("No Reolink entry found for camera %s", camera_entity)
+            reolink_entry_id = find_reolink_entry_for_camera(self._hass, camera_entity)
+        if not reolink_entry_id:
+            _LOGGER.warning(
+                "No Reolink entry found for camera %s",
+                camera_entity or "<unset>",
+            )
             return None
 
         entry = self._hass.config_entries.async_get_entry(reolink_entry_id)
@@ -1195,18 +1203,24 @@ class ReolinkAudioHandler:
 
 async def auto_configure_reolink(
     hass: HomeAssistant,
-    camera_entity_id: str,
+    camera_entity_id: str = "",
+    reolink_entry_id: str | None = None,
 ) -> dict[str, str] | None:
     """Auto-configure go2rtc for a Reolink doorbell.
 
     Returns a dict with the stream_name and status, or None on failure.
     This is called during integration setup to prepare the audio pipeline.
+    It can resolve the Reolink device from either camera entity or entry ID.
     """
     # Find the Reolink config entry
-    reolink_entry_id = find_reolink_entry_for_camera(hass, camera_entity_id)
     if not reolink_entry_id:
-        _LOGGER.warning("Could not find Reolink config entry for %s", camera_entity_id)
-        return None
+        if not camera_entity_id:
+            _LOGGER.warning("Could not auto-configure Reolink audio: no camera or entry provided")
+            return None
+        reolink_entry_id = find_reolink_entry_for_camera(hass, camera_entity_id)
+        if not reolink_entry_id:
+            _LOGGER.warning("Could not find Reolink config entry for %s", camera_entity_id)
+            return None
 
     # Get connection details
     reolink_config = get_reolink_config(hass, reolink_entry_id)
@@ -1221,8 +1235,8 @@ async def auto_configure_reolink(
     encoded_password = quote(password, safe="")
     rtsp_url = REOLINK_RTSP_SUB.format(host=host, user=user, password=encoded_password)
 
-    # Create a unique stream name
-    stream_name = f"jeeves_{camera_entity_id.replace('.', '_')}"
+    # Create a deterministic stream name from the selected Reolink config entry
+    stream_name = f"jeeves_reolink_{reolink_entry_id.replace('-', '_')[:12]}"
 
     # Register in go2rtc
     success = await setup_go2rtc_stream(hass, stream_name, rtsp_url)

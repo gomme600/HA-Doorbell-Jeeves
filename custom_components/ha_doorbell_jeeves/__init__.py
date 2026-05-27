@@ -27,6 +27,7 @@ from .const import (
     CONF_AUDIO_MODE,
     CONF_AUDIO_OUTPUT_MODE,
     CONF_CAMERA_ENTITY,
+    CONF_GO2RTC_STREAM_NAME,
     CONF_MODEL,
     CONF_REOLINK_ENTRY_ID,
     DEFAULT_MODEL_GEMINI,
@@ -170,11 +171,16 @@ async def _setup_reolink(hass: HomeAssistant, entry: ConfigEntry, config: dict[s
     """Configure go2rtc for Reolink doorbell 2-way audio."""
     from .reolink_audio import auto_configure_reolink  # noqa: PLC0415
 
+    reolink_entry_id = config.get(CONF_REOLINK_ENTRY_ID, "")
     camera_entity = config.get(CONF_CAMERA_ENTITY, "")
-    if not camera_entity:
+    if not reolink_entry_id and not camera_entity:
         return
 
-    result = await auto_configure_reolink(hass, camera_entity)
+    result = await auto_configure_reolink(
+        hass,
+        camera_entity_id=camera_entity,
+        reolink_entry_id=reolink_entry_id or None,
+    )
     if result:
         _LOGGER.info(
             "Reolink go2rtc configured: stream=%s, host=%s",
@@ -183,7 +189,7 @@ async def _setup_reolink(hass: HomeAssistant, entry: ConfigEntry, config: dict[s
         )
         # Store the stream name in options for session use
         new_options = dict(entry.options)
-        new_options["go2rtc_stream_name"] = result["stream_name"]
+        new_options[CONF_GO2RTC_STREAM_NAME] = result["stream_name"]
         hass.config_entries.async_update_entry(entry, options=new_options)
     else:
         _LOGGER.warning(

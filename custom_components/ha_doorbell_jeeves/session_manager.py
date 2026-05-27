@@ -15,10 +15,13 @@ from homeassistant.helpers.event import async_track_state_change_event
 
 from .client_base import BaseRealtimeClient
 from .const import (
+    AUDIO_MODE_MANUAL,
     AUDIO_MODE_REOLINK,
     CONF_API_BASE_URL,
     CONF_API_KEY,
+    CONF_AUDIO_MANUAL_MODE,
     CONF_AUDIO_MODE,
+    CONF_AUDIO_OUTPUT_MODE,
     CONF_CAMERA_ENTITY,
     CONF_CHIME_DELAY,
     CONF_DUAL_MODEL_ENABLED,
@@ -30,6 +33,7 @@ from .const import (
     CONF_IDENTITY_MODE,
     CONF_MEDIA_PLAYER_ENTITY,
     CONF_MEMORY_RETENTION_DAYS,
+    CONF_MICROPHONE_ENTITY,
     CONF_MODEL,
     CONF_PROVIDER,
     CONF_REOLINK_ENTRY_ID,
@@ -205,15 +209,21 @@ class JeevesSessionManager:
         from .reolink_audio import auto_configure_reolink  # noqa: PLC0415
 
         config = self._config
+        reolink_entry_id = config.get(CONF_REOLINK_ENTRY_ID, "")
         camera_entity = config.get(CONF_CAMERA_ENTITY, "")
-        if not camera_entity:
+        if not reolink_entry_id and not camera_entity:
             return
-        result = await auto_configure_reolink(self.hass, camera_entity)
+        result = await auto_configure_reolink(
+            self.hass,
+            camera_entity_id=camera_entity,
+            reolink_entry_id=reolink_entry_id or None,
+        )
         if result:
             _LOGGER.info("Reolink go2rtc configured: stream=%s", result.get("stream_name"))
             new_options = dict(self.entry.options)
-            new_options["go2rtc_stream_name"] = result["stream_name"]
+            new_options[CONF_GO2RTC_STREAM_NAME] = result["stream_name"]
             self.hass.config_entries.async_update_entry(self.entry, options=new_options)
+            self._config[CONF_GO2RTC_STREAM_NAME] = result["stream_name"]
         else:
             _LOGGER.warning("go2rtc not available — 2-way audio may not work")
 
@@ -452,8 +462,15 @@ class JeevesSessionManager:
 
         stream_name = config.get(CONF_GO2RTC_STREAM_NAME, "")
         if not stream_name:
-            # Fallback: Use camera entity ID as stream name
-            # The Reolink integration registers streams using the entity ID
+            reolink_entry_id = config.get(CONF_REOLINK_ENTRY_ID, "")
+            if reolink_entry_id:
+                stream_name = f"jeeves_reolink_{reolink_entry_id.replace('-', '_')[:12]}"
+                _LOGGER.warning(
+                    "No explicit go2rtc stream — using Reolink entry stream: %s",
+                    stream_name,
+                )
+
+        if not stream_name:
             camera = config.get(CONF_CAMERA_ENTITY, "")
             if camera:
                 stream_name = camera
@@ -507,6 +524,7 @@ class JeevesSessionManager:
             self.hass, stream_name, on_audio_received=_on_doorbell_audio
         )
         self._audio_handler._camera_entity_id = camera_entity
+        self._audio_handler._reolink_entry_id = config.get(CONF_REOLINK_ENTRY_ID, "")
         self._audio_handler._chime_delay = float(
             config.get(CONF_CHIME_DELAY, DEFAULT_CHIME_DELAY)
         )
@@ -822,12 +840,19 @@ class JeevesSessionManager:
             self.hass.async_create_task(self._audio_handler.send_audio(audio_bytes))
         else:
             audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
+            speaker_entity = self._config.get(CONF_MEDIA_PLAYER_ENTITY, "")
             self.hass.bus.async_fire(
                 EVENT_AUDIO_OUTPUT,
                 {
                     "entry_id": self.entry.entry_id,
                     "audio_base64": audio_b64,
-                    "media_player": self._config.get(CONF_MEDIA_PLAYER_ENTITY, ""),
+                    "media_player": speaker_entity,
+                    "speaker_entity": speaker_entity,
+                    "microphone_entity": self._config.get(CONF_MICROPHONE_ENTITY, ""),
+                    "audio_mode": self._config.get(CONF_AUDIO_MODE, AUDIO_MODE_MANUAL),
+                    "manual_audio_mode": self._config.get(CONF_AUDIO_MANUAL_MODE, ""),
+                    "audio_output_mode": self._config.get(CONF_AUDIO_OUTPUT_MODE, ""),
+                    "go2rtc_stream_name": self._config.get(CONF_GO2RTC_STREAM_NAME, ""),
                 },
             )
 

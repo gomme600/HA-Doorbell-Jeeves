@@ -3,16 +3,26 @@
     "step": {
       "user": {
         "title": "Setup Mode",
-        "description": "Choose how to set up your doorbell audio. **Reolink** mode auto-detects your doorbell and configures 2-way audio via go2rtc. **Manual** mode lets you configure any camera and speaker.",
+        "description": "Choose your audio setup mode. Camera feed selection is configured separately in the next steps.",
         "data": {
           "audio_mode": "Setup Mode"
         }
       },
       "reolink": {
-        "title": "Reolink Doorbell",
-        "description": "Select your Reolink doorbell camera. The integration will automatically configure 2-way audio using go2rtc and the existing Reolink integration.",
+        "title": "Reolink Audio Device",
+        "description": "Select which Reolink integration should provide two-way audio. This does not need to match your camera feed entity.",
         "data": {
-          "camera_entity": "Doorbell Camera"
+          "reolink_entry_id": "Reolink Device"
+        }
+      },
+      "manual_audio": {
+        "title": "Manual Audio Setup",
+        "description": "Choose manual audio wiring: either an external go2rtc stream or Home Assistant speaker/microphone entities.",
+        "data": {
+          "audio_manual_mode": "Manual Audio Method",
+          "go2rtc_stream_name": "External go2rtc Stream Name",
+          "media_player_entity": "Speaker Entity",
+          "microphone_entity": "Microphone Entity"
         }
       },
       "provider": {
@@ -28,11 +38,9 @@
       },
       "camera": {
         "title": "Camera & Vision",
-        "description": "Configure the camera feed and how often video frames are sent to the AI model. Higher FPS gives better situational awareness but costs more tokens.",
+        "description": "Configure the camera feed and how often video frames are sent to the AI model. This camera is independent from the audio device.",
         "data": {
           "camera_entity": "Camera Entity",
-          "audio_output_mode": "Audio Output Mode",
-          "media_player_entity": "Media Player (for speaker output)",
           "vision_fps": "Vision Frame Rate (FPS)",
           "frame_max_width": "Max Frame Width (px)",
           "frame_max_height": "Max Frame Height (px)",
@@ -74,6 +82,7 @@
           "general": "General (AI model, voice, timeout)",
           "dual_model": "Dual Model (separate tool-calling model)",
           "vision": "Camera & Vision (FPS, resolution)",
+          "audio": "Audio Setup (Reolink/manual wiring)",
           "timeline": "Timeline Integration (LLM Vision events)",
           "entities": "Entities & Actions (devices the AI controls)",
           "security": "Security (PIN, validation policies)",
@@ -116,6 +125,18 @@
           "frame_max_width": "Max Width (px)",
           "frame_max_height": "Max Height (px)",
           "frame_quality": "JPEG Quality (%)"
+        }
+      },
+      "audio": {
+        "title": "Audio Setup",
+        "description": "Configure how Jeeves receives microphone audio and sends spoken responses.",
+        "data": {
+          "audio_mode": "Audio Mode",
+          "reolink_entry_id": "Reolink Device",
+          "audio_manual_mode": "Manual Audio Method",
+          "go2rtc_stream_name": "External go2rtc Stream Name",
+          "media_player_entity": "Speaker Entity",
+          "microphone_entity": "Microphone Entity"
         }
       },
       "timeline": {

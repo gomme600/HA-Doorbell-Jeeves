@@ -81,7 +81,7 @@ For local models, select "OpenAI / Compatible" and set the base URL to your serv
 
 The integration includes a dedicated **Reolink Quick Setup** mode that:
 
-1. **Auto-detects** your Reolink doorbell from the existing HA Reolink integration
+1. Lets you choose **any loaded Reolink integration** as the audio device
 2. **Auto-configures** a go2rtc stream with backchannel support for 2-way audio
 3. **Auto-discovers** the doorbell button sensor for start triggers
 4. **Zero manual RTSP configuration** — credentials are read from the Reolink config entry
@@ -94,12 +94,16 @@ The integration includes a dedicated **Reolink Quick Setup** mode that:
 ### Prerequisites for Reolink mode
 - Reolink integration already set up and loaded in HA
 - go2rtc available (built into HA Core since 2023.7)
-- Camera entity visible (e.g., `camera.reolink_video_doorbell_poe_fluent`)
+- At least one camera entity for the separate **Camera & Vision** step
 
 ### Manual Setup (non-Reolink)
-For other doorbells, choose "Manual Setup" and configure:
-- Camera entity (any HA camera)
-- Audio output: Media Player (HA speaker) or Event (custom handling)
+For other doorbells, choose "Manual Setup" and pick one method:
+- **External go2rtc stream** (provide stream name)
+- **Home Assistant entities** (choose speaker + microphone entities)
+
+Camera feed selection remains separate and can be any HA camera.
+In manual modes, inbound mic chunks are supplied through `ha_doorbell_jeeves.send_audio`, and
+AI output is emitted on `ha_doorbell_jeeves_audio_output` with your selected routing metadata.
 
 ---
 
@@ -128,12 +132,13 @@ You can configure any HA entity as a stop trigger (e.g., `binary_sensor.front_do
 
 ## ⚙️ Setup Wizard
 
-### Initial Setup (5 steps)
+### Initial Setup (6 steps)
 1. **Setup Mode** — Reolink Quick Setup or Manual
-2. **Reolink** *(if selected)* — Select your doorbell camera
+2. **Audio Setup** — Reolink device *(if selected)* or Manual audio method
 3. **AI Provider** — Gemini/OpenAI/local, API key, model, voice
 4. **Camera & Vision** — FPS, frame resolution, JPEG quality
 5. **System Prompt** — Define AI personality and rules
+6. **Triggers** — Start/stop entity triggers
 
 ### Post-Setup (Options Flow Menu)
 After initial setup, configure via **Settings → Integrations → Configure**:
@@ -142,6 +147,7 @@ After initial setup, configure via **Settings → Integrations → Configure**:
 |---------|-------------------|
 | **General** | AI provider, model, voice, timeout, validator model |
 | **Vision** | Camera entity, FPS, resolution, quality |
+| **Audio** | Reolink device or manual audio wiring (go2rtc / HA entities) |
 | **Timeline Integration** | LLM Vision event tool settings (lookback, filters, limits) |
 | **Entities & Actions** | Add/remove managed entities, custom actions, notifications |
 | **Security** | Default security mode, PIN code, validator model |
@@ -283,7 +289,7 @@ automation:
 |-------|-----------|
 | `ha_doorbell_jeeves_session_started` | AI session begins |
 | `ha_doorbell_jeeves_session_ended` | AI session ends |
-| `ha_doorbell_jeeves_audio_output` | AI generates speech (contains audio_base64) |
+| `ha_doorbell_jeeves_audio_output` | AI generates speech (contains `audio_base64` + configured audio routing fields) |
 | `ha_doorbell_jeeves_tool_call` | AI attempts any action |
 | `ha_doorbell_jeeves_action_blocked` | Action rejected by security |
 | `ha_doorbell_jeeves_security_alert` | Threat indicators detected |
