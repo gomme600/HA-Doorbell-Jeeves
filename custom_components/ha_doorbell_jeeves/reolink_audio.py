@@ -578,16 +578,51 @@ class ReolinkAudioHandler:
         at the camera's native sample rate (typically 16kHz AAC or G.711).
         ffmpeg decodes this to raw 16kHz mono PCM which is forwarded to Gemini.
 
+        Tries multiple RTSP URL patterns since different camera models/firmware
+        versions use different path formats (h264Preview, h265Preview, Preview).
+
         Returns True if ffmpeg successfully connected to the RTSP stream.
         """
-        rtsp_url = getattr(self, "_reolink_rtsp_url", None)
-        if not rtsp_url:
-            _LOGGER.info("No RTSP URL available — skipping RTSP audio input")
+        if not self._reolink_host or not self._reolink_user or not self._reolink_pass:
+            _LOGGER.info("No RTSP credentials — skipping RTSP audio input")
             return False
 
-        _LOGGER.warning("Audio input: trying RTSP → %s", _mask_stream_url(rtsp_url))
+        # Build multiple RTSP URLs to try (different path formats)
+        encoded_pass = quote(self._reolink_pass, safe="")
+        port = getattr(self, "_reolink_rtsp_port", 554) or 554
+        base = f"rtsp://{self._reolink_user}:{encoded_pass}@{self._reolink_host}:{port}"
 
-        # Build ffmpeg command for low-latency audio extraction
+        # Try sub stream first (lower bandwidth, same audio quality)
+        # Then main stream as fallback
+        urls_to_try = [
+            f"{base}/h264Preview_01_sub",
+            f"{base}/Preview_01_sub",
+            f"{base}/h264Preview_01_main",
+            f"{base}/h265Preview_01_sub",
+        ]
+
+        # Also include the API-discovered URL if different
+        api_url = getattr(self, "_reolink_rtsp_url", None)
+        if api_url and api_url not in urls_to_try:
+            urls_to_try.insert(0, api_url)
+
+        for rtsp_url in urls_to_try:
+            _LOGGER.warning("Audio input: trying RTSP → %s", _mask_stream_url(rtsp_url))
+
+            proc = await self._try_ffmpeg_rtsp(rtsp_url)
+            if proc:
+                _LOGGER.warning("✓ RTSP audio input connected (ffmpeg PID=%d)", proc.pid)
+                self._listen_active = True
+                self._input_processor_task = asyncio.create_task(
+                    self._ffmpeg_audio_read_loop(proc, "RTSP")
+                )
+                return True
+
+        _LOGGER.warning("RTSP audio: all URL variants failed")
+        return False
+
+    async def _try_ffmpeg_rtsp(self, rtsp_url: str) -> asyncio.subprocess.Process | None:
+        """Attempt to connect ffmpeg to an RTSP URL. Returns process if successful."""
         ffmpeg_args = [
             "ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostats",
             "-rtsp_transport", "tcp",
@@ -611,43 +646,37 @@ class ReolinkAudioHandler:
             stderr=asyncio.subprocess.PIPE,
         )
 
-        # Wait briefly to see if connection succeeds
-        await asyncio.sleep(1.0)
-        if proc.returncode is not None:
-            stderr_data = b""
-            try:
-                stderr_data = await asyncio.wait_for(proc.stderr.read(2000), timeout=2.0)
-            except Exception:
-                pass
-            _LOGGER.warning(
-                "RTSP audio: ffmpeg failed (rc=%d): %s",
-                proc.returncode,
-                stderr_data.decode(errors="replace").strip()[:300] if stderr_data else "no stderr",
-            )
-            return False
-
-        # Wait a bit more to confirm data is flowing
+        # Wait briefly to see if connection succeeds (RTSP DESCRIBE + SETUP)
         await asyncio.sleep(2.0)
         if proc.returncode is not None:
             stderr_data = b""
             try:
-                stderr_data = await asyncio.wait_for(proc.stderr.read(2000), timeout=2.0)
+                stderr_data = await asyncio.wait_for(proc.stderr.read(2000), timeout=1.0)
             except Exception:
                 pass
             _LOGGER.warning(
-                "RTSP audio: ffmpeg died after connect (rc=%d): %s",
-                proc.returncode,
-                stderr_data.decode(errors="replace").strip()[:300] if stderr_data else "no stderr",
+                "RTSP audio: ffmpeg failed for %s (rc=%d): %s",
+                _mask_stream_url(rtsp_url), proc.returncode,
+                stderr_data.decode(errors="replace").strip()[:200] if stderr_data else "",
             )
-            return False
+            return None
 
-        # ffmpeg is running and reading from RTSP — start the read loop
-        _LOGGER.warning("✓ RTSP audio input connected (ffmpeg PID=%d)", proc.pid)
-        self._listen_active = True
-        self._input_processor_task = asyncio.create_task(
-            self._ffmpeg_audio_read_loop(proc, "RTSP")
-        )
-        return True
+        # Wait more to confirm data is actually flowing
+        await asyncio.sleep(2.0)
+        if proc.returncode is not None:
+            stderr_data = b""
+            try:
+                stderr_data = await asyncio.wait_for(proc.stderr.read(2000), timeout=1.0)
+            except Exception:
+                pass
+            _LOGGER.warning(
+                "RTSP audio: ffmpeg died after connect for %s (rc=%d): %s",
+                _mask_stream_url(rtsp_url), proc.returncode,
+                stderr_data.decode(errors="replace").strip()[:200] if stderr_data else "",
+            )
+            return None
+
+        return proc
 
     async def _start_ffmpeg_fallback_input(self) -> bool:
         """Try FLV and RTMP URLs via ffmpeg as fallback for audio input.
@@ -660,9 +689,20 @@ class ReolinkAudioHandler:
         urls_to_try: list[tuple[str, str]] = []
 
         # HTTP-FLV (tunnels RTMP over HTTP — high likelihood of working)
+        # Try both HTTP and HTTPS variants
+        if self._reolink_host and self._reolink_user and self._reolink_pass:
+            encoded_pass = quote(self._reolink_pass, safe="")
+            # Plain HTTP FLV (port 80) — most reliable when TLS cert is self-signed
+            http_flv = (
+                f"http://{self._reolink_host}/flv?port=1935&app=bcs"
+                f"&stream=channel0_sub.bcs&user={self._reolink_user}"
+                f"&password={encoded_pass}"
+            )
+            urls_to_try.append((http_flv, "HTTP-FLV"))
+
         flv_url = getattr(self, "_reolink_flv_url", None)
         if flv_url:
-            urls_to_try.append((flv_url, "FLV"))
+            urls_to_try.append((flv_url, "HTTPS-FLV"))
 
         # Direct RTMP (often port 1935 is blocked)
         rtmp_url = getattr(self, "_reolink_rtmp_url", None)
