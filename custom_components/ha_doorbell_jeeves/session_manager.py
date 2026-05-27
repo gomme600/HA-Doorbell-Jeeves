@@ -407,6 +407,7 @@ class JeevesSessionManager:
         if not self._active and not self._starting:
             return
 
+        _LOGGER.warning("⏹ SESSION ENDING — reason: %s", reason)
         self._active = False
         self._starting = False
         self._session_end_reason = reason
@@ -1204,6 +1205,10 @@ class JeevesSessionManager:
                         if forwarded == 1:
                             _LOGGER.warning("✓ First microphone chunk forwarded to AI session (%d bytes, split into %d segments)",
                                             len(audio_bytes), (len(audio_bytes) + CHUNK_SIZE - 1) // CHUNK_SIZE)
+                        elif forwarded == 10:
+                            _LOGGER.warning("Mic forward: 10 chunks sent to AI (audio flowing)")
+                        elif forwarded == 50:
+                            _LOGGER.warning("Mic forward: 50 chunks sent to AI")
                         elif forwarded % 500 == 0:
                             _LOGGER.info("Microphone chunks forwarded to AI: %d", forwarded)
                     except Exception:

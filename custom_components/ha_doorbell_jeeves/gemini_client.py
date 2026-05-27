@@ -248,7 +248,7 @@ class GeminiLiveClient(BaseRealtimeClient):
                 if saw_message:
                     turns_completed += 1
                     consecutive_empty_iters = 0
-                    _LOGGER.debug("Gemini turn %d completed, re-entering receive()", turns_completed)
+                    _LOGGER.warning("Gemini turn %d completed, re-entering receive() — waiting for speech", turns_completed)
                     continue
 
                 consecutive_empty_iters += 1
