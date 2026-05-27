@@ -249,7 +249,9 @@ class ReolinkAudioHandler:
         self._stream_name = stream_name
         self._on_audio_received_raw = on_audio_received
         # Wrap callback with gain amplification for low-level doorbell mics
-        self._mic_gain: float = 16.0  # Amplification factor for doorbell mic
+        # Reolink doorbells produce very low PCM levels (~RMS 20-50 raw).
+        # Gemini VAD needs RMS ~3000-5000. With 128x gain: 20*128=2560, 50*128=6400.
+        self._mic_gain: float = 128.0  # Amplification factor for doorbell mic
         self._on_audio_received = self._amplify_and_forward
         self._output_reader_task: asyncio.Task[None] | None = None
         self._active = False
@@ -744,22 +746,32 @@ class ReolinkAudioHandler:
             sample_rate, block_size,
         )
 
-        # Install Baichuan FDX audio intercept on the TALK connection.
-        # In FDX mode, the camera sends continuous mic audio back via CMD 202
-        # on the same talk connection — this provides much better audio than the
-        # sparse Preview stream (~1 frame/sec vs ~50 frames/sec in FDX).
+        # Install FDX audio intercept on the TALK connection.
+        # In FDX mode the camera sends mic audio back as CMD 202 packets on the
+        # same TCP connection used for talk output. We hook data_received at the
+        # asyncio protocol level to intercept these before reolink_aio drops them
+        # (it discards unsolicited CMD 202 with status!=200).
         if ability.get("duplex") == "FDX" and not self._baichuan_audio_input_active:
-            # Start AAC decoder task if not already running
+            # Ensure AAC decoder is running
             if not self._aac_queue:
                 self._aac_queue = asyncio.Queue(maxsize=200)
             if not self._aac_decoder_task or self._aac_decoder_task.done():
                 self._aac_decoder_task = asyncio.create_task(self._aac_decode_loop())
 
-            success = self._install_baichuan_audio_intercept()
+            try:
+                success = self._install_talk_data_received_hook()
+            except Exception as exc:
+                _LOGGER.warning("FDX hook install exception: %s", exc, exc_info=True)
+                success = False
             if success:
                 self._baichuan_audio_input_active = True
                 _LOGGER.warning(
-                    "✓ Baichuan FDX audio intercept active on TALK connection — continuous mic audio"
+                    "✓ FDX audio hook active on TALK connection — "
+                    "intercepting CMD 202 mic audio at transport level"
+                )
+            else:
+                _LOGGER.warning(
+                    "FDX hook failed — mic audio limited to Preview stream (~1 fps)"
                 )
 
         # Pure Python resampler: 24kHz mono s16le → camera sample_rate mono s16le
@@ -2024,6 +2036,196 @@ class ReolinkAudioHandler:
             _LOGGER.warning(
                 "go2rtc proxy: stopped (sent %d chunks to AI)", chunks_sent
             )
+
+    def _install_talk_data_received_hook(self) -> bool:
+        """Hook data_received on the talk connection to intercept CMD 202 mic audio.
+
+        This is the most reliable approach: we wrap the asyncio protocol's
+        data_received method which is called for ALL incoming TCP bytes.
+        We scan the raw stream for CMD 202 headers and extract audio payloads
+        before reolink_aio's parser can drop them (it drops unsolicited
+        CMD 202 with status != 200/201/300).
+
+        Works at the transport level, bypassing all reolink_aio internals.
+        """
+        bc = getattr(self, "_talk_baichuan", None)
+        if not bc:
+            _LOGGER.warning("FDX hook: no _talk_baichuan object")
+            return False
+
+        # Navigate: Baichuan → _connection → _protocol
+        connection = getattr(bc, "_connection", None)
+        _LOGGER.warning(
+            "FDX hook: bc=%s, bc._connection=%s (type=%s)",
+            type(bc).__name__,
+            connection is not None,
+            type(connection).__name__ if connection else "None",
+        )
+        if not connection:
+            _LOGGER.warning("FDX hook: bc._connection is None, cannot hook")
+            return False
+
+        protocol = getattr(connection, "_protocol", None)
+        _LOGGER.warning(
+            "FDX hook: connection._protocol=%s (type=%s)",
+            protocol is not None,
+            type(protocol).__name__ if protocol else "None",
+        )
+        if not protocol:
+            _LOGGER.warning("FDX hook: protocol is None, cannot hook")
+            return False
+
+        if not hasattr(protocol, "data_received"):
+            _LOGGER.warning("FDX hook: protocol has no data_received method")
+            return False
+
+        # State for our stream parser
+        _buf = bytearray()
+        _pkt_count = [0]
+        _audio_count = [0]
+        HEADER_MAGIC_BYTES = bytes.fromhex("f0debc0a")
+
+        original_data_received = protocol.data_received
+
+        def _hooked_data_received(data: bytes) -> None:
+            """Intercept all TCP data, extract CMD 202 audio, then pass through."""
+            _buf.extend(data)
+
+            # Scan buffer for complete Baichuan messages with CMD 202
+            while len(_buf) >= 20:
+                # Find magic header
+                magic_pos = _buf.find(HEADER_MAGIC_BYTES)
+                if magic_pos < 0:
+                    # No header found, keep last 3 bytes (partial magic)
+                    if len(_buf) > 3:
+                        del _buf[:-3]
+                    break
+                if magic_pos > 0:
+                    # Discard data before magic
+                    del _buf[:magic_pos]
+
+                # Parse header
+                if len(_buf) < 20:
+                    break
+
+                cmd_id = int.from_bytes(_buf[4:8], byteorder="little")
+                body_len = int.from_bytes(_buf[8:12], byteorder="little")
+                mess_class = _buf[18:20].hex()
+
+                if mess_class in ["1464", "0000"]:
+                    header_len = 24
+                elif mess_class == "1466":
+                    header_len = 20
+                else:
+                    # Unknown class, skip this magic and search for next
+                    del _buf[:4]
+                    continue
+
+                if len(_buf) < header_len:
+                    break
+
+                payload_offset = 0
+                if header_len == 24:
+                    payload_offset = int.from_bytes(_buf[20:24], byteorder="little")
+
+                total_len = header_len + body_len
+                if len(_buf) < total_len:
+                    # Incomplete message, wait for more data
+                    break
+
+                # We have a complete message
+                if cmd_id == 202:
+                    _pkt_count[0] += 1
+                    # Extract binary payload (after extension XML)
+                    if payload_offset == 0:
+                        payload_offset = body_len
+                    payload_start = header_len + payload_offset
+                    if payload_start < total_len:
+                        raw_payload = bytes(_buf[payload_start:total_len])
+                        if raw_payload:
+                            self._process_fdx_audio_payload(
+                                raw_payload, _pkt_count, _audio_count
+                            )
+
+                # Remove this message from buffer
+                del _buf[:total_len]
+
+            # Always pass ALL original data to reolink_aio (don't consume it)
+            original_data_received(data)
+
+        protocol.data_received = _hooked_data_received
+        _LOGGER.warning(
+            "FDX hook: wrapped %s.data_received successfully",
+            type(protocol).__name__,
+        )
+        return True
+
+    def _process_fdx_audio_payload(
+        self, raw_payload: bytes, pkt_count: list, audio_count: list
+    ) -> None:
+        """Process a single CMD 202 audio payload from the talk connection.
+
+        Decrypts if needed, then tries to decode as ADPCM or BcMedia audio.
+        """
+        # Decrypt the payload (Baichuan uses AES-128-CFB for talk data)
+        payload = self._decrypt_talk_payload(raw_payload)
+
+        if pkt_count[0] <= 5:
+            import struct as _st
+            magic_val = _st.unpack_from("<I", payload, 0)[0] if len(payload) >= 4 else 0
+            _LOGGER.warning(
+                "FDX pkt #%d: %d bytes, magic=0x%08x, first16=%s",
+                pkt_count[0], len(payload), magic_val, payload[:16].hex(),
+            )
+
+        if pkt_count[0] == 1:
+            _LOGGER.warning(
+                "✓ First CMD 202 from camera (FDX mic audio) — %d bytes", len(payload)
+            )
+
+        # Try parsing as BcMedia (may contain ADPCM audio frames)
+        pcm_data = self._parse_bcmedia_to_pcm(payload)
+        if pcm_data and self._listen_active:
+            audio_count[0] += 1
+            asyncio.ensure_future(self._on_audio_received(pcm_data))
+            return
+
+        # Fallback: try raw ADPCM decode on the entire payload
+        if len(payload) >= 8 and self._listen_active:
+            pcm_data = self._try_raw_adpcm_decode(payload)
+            if pcm_data:
+                audio_count[0] += 1
+                asyncio.ensure_future(self._on_audio_received(pcm_data))
+
+        if pkt_count[0] == 50:
+            _LOGGER.warning(
+                "FDX: 50 packets, %d decoded as audio", audio_count[0]
+            )
+        elif pkt_count[0] % 500 == 0:
+            _LOGGER.warning(
+                "FDX: %d packets total, %d audio", pkt_count[0], audio_count[0]
+            )
+
+    def _decrypt_talk_payload(self, raw_payload: bytes) -> bytes:
+        """Decrypt a Baichuan talk payload using AES-128-CFB."""
+        bc = getattr(self, "_talk_baichuan", None)
+        if not bc:
+            return raw_payload
+
+        aes_key = getattr(bc, "_aes_key", None)
+        if aes_key is None:
+            return raw_payload
+
+        try:
+            try:
+                from Cryptodome.Cipher import AES as _AES
+            except ImportError:
+                from Crypto.Cipher import AES as _AES
+            AES_IV = b"0123456789abcdef"
+            cipher = _AES.new(key=aes_key, mode=_AES.MODE_CFB, iv=AES_IV, segment_size=128)
+            return cipher.decrypt(raw_payload)
+        except Exception:
+            return raw_payload
 
     def _install_baichuan_audio_intercept(self) -> bool:
         """Hook into the Baichuan protocol to intercept incoming CMD 202 audio.
