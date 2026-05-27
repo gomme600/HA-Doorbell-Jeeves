@@ -717,25 +717,93 @@ class JeevesSessionManager:
     # ─── Vision Loop ──────────────────────────────────────────────────────────
 
     async def _vision_loop(self, camera_entity: str, fps: float) -> None:
+        """Send video frames to the AI at the configured FPS.
+
+        Uses HA's camera snapshot API (HTTP-based, independent of RTSP/Baichuan).
+        Falls back to go2rtc JPEG endpoint if the camera entity becomes unavailable
+        (some Reolink firmwares throttle snapshots during 2-way audio).
+        """
         interval = 1.0 / max(fps, 0.1)
         max_w = self._config.get(CONF_FRAME_MAX_WIDTH, DEFAULT_FRAME_MAX_WIDTH)
         max_h = self._config.get(CONF_FRAME_MAX_HEIGHT, DEFAULT_FRAME_MAX_HEIGHT)
         quality = self._config.get(CONF_FRAME_QUALITY, DEFAULT_FRAME_QUALITY)
+        consecutive_failures = 0
+        frames_sent = 0
+        go2rtc_stream = self._config.get(CONF_GO2RTC_STREAM_NAME, "")
 
         while self._active:
             try:
-                image = await self.hass.components.camera.async_get_image(camera_entity, timeout=5)
-                if image and self._client:
+                image_bytes: bytes | None = None
+                # Primary: HA camera snapshot API (HTTP API, independent of RTSP)
+                try:
+                    image = await self.hass.components.camera.async_get_image(
+                        camera_entity, timeout=5
+                    )
+                    if image and image.content:
+                        image_bytes = image.content
+                except Exception as cam_err:
+                    # Fallback: try go2rtc JPEG snapshot if stream is configured
+                    if go2rtc_stream:
+                        image_bytes = await self._go2rtc_snapshot(go2rtc_stream)
+                    if not image_bytes:
+                        raise cam_err  # noqa: TRY301
+
+                if image_bytes and self._client:
                     processed = await self.hass.async_add_executor_job(
-                        process_frame, image.content, max_w, max_h, quality,
+                        process_frame, image_bytes, max_w, max_h, quality,
                     )
                     frame_b64 = base64.b64encode(processed).decode("ascii")
                     await self._client.send_image(frame_b64, mime_type="image/jpeg")
+                    frames_sent += 1
+                    if consecutive_failures > 0:
+                        _LOGGER.info(
+                            "Vision recovered after %d failures (%d frames sent total)",
+                            consecutive_failures, frames_sent,
+                        )
+                    consecutive_failures = 0
+                    if frames_sent == 1:
+                        _LOGGER.warning("Vision loop: first frame sent to AI")
             except asyncio.CancelledError:
                 break
             except Exception:
-                _LOGGER.debug("Vision frame failed", exc_info=True)
+                consecutive_failures += 1
+                if consecutive_failures == 1:
+                    _LOGGER.warning("Vision frame capture failed", exc_info=True)
+                elif consecutive_failures == 5:
+                    _LOGGER.warning(
+                        "Vision: 5 consecutive failures — camera may be unavailable during audio"
+                    )
+                elif consecutive_failures % 30 == 0:
+                    _LOGGER.warning("Vision: %d consecutive failures", consecutive_failures)
             await asyncio.sleep(interval)
+
+        _LOGGER.info("Vision loop ended: %d frames sent, %d final failures", frames_sent, consecutive_failures)
+
+    async def _go2rtc_snapshot(self, stream_name: str) -> bytes | None:
+        """Get a JPEG snapshot from go2rtc as fallback when camera entity is unavailable."""
+        import aiohttp  # noqa: PLC0415
+
+        from .reolink_audio import _discover_go2rtc_url, _get_go2rtc_session  # noqa: PLC0415
+
+        base_url = await _discover_go2rtc_url(self.hass)
+        if not base_url:
+            return None
+        url = f"{base_url}/api/frame.jpeg?src={stream_name}"
+        session = _get_go2rtc_session(self.hass)
+        own_session = None
+        if not session:
+            own_session = aiohttp.ClientSession()
+            session = own_session
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    return await resp.read()
+        except Exception:
+            pass
+        finally:
+            if own_session:
+                await own_session.close()
+        return None
 
     async def _session_timeout(self, timeout_seconds: int) -> None:
         try:
