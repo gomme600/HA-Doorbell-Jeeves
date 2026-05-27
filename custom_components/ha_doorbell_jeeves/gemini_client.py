@@ -80,8 +80,9 @@ class GeminiLiveClient(BaseRealtimeClient):
             ),
             system_instruction=types.Content(parts=[types.Part(text=self._system_prompt)]),
             tools=self._tools if self._tools else None,
-            input_audio_transcription=types.AudioTranscriptionConfig(),
-            output_audio_transcription=types.AudioTranscriptionConfig(),
+            # NOTE: input/output_audio_transcription omitted — causes 1008 policy
+            # violation on some model versions ("Operation is not implemented").
+            # Transcriptions will be captured when model supports them natively.
         )
 
         self._session_cm = self._client.aio.live.connect(
