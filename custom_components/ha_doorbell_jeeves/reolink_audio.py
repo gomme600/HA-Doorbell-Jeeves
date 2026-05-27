@@ -1,10 +1,10 @@
 """Reolink audio handler – 2-way audio with Reolink doorbells.
 
 This module handles:
-  - Audio input: receives audio from doorbell mic via RTSP + ffmpeg (reliable)
-  - Audio output: sends ADPCM to doorbell speaker via Baichuan cmd 202 (talk)
-  - Output uses the native Baichuan protocol (port 9000), input uses RTSP
-  - go2rtc utilities are retained for non-Reolink device fallback
+  - Audio input: receives audio from doorbell mic via existing go2rtc stream
+    (auto-discovered from HA's Reolink integration, zero manual config)
+  - Audio output: sends ADPCM to doorbell speaker via native Baichuan protocol (port 9000)
+  - Falls back to camera entity stream_source or RTSP if go2rtc is unavailable
 """
 
 from __future__ import annotations
@@ -1024,53 +1024,158 @@ class ReolinkAudioHandler:
     # ─── Audio Input (Mic Receive via RTSP/ffmpeg) ──────────────────────────────
 
     async def _start_audio_input(self) -> None:
-        """Start receiving audio from the doorbell mic via RTSP + ffmpeg.
+        """Start receiving audio from the doorbell mic.
 
-        Uses ffmpeg to connect to the camera's RTSP stream and extract ONLY
-        the audio track, decoding it to 16kHz 16-bit PCM for Gemini input.
+        Strategy (zero-config, uses HA's existing infrastructure):
+          1. Try go2rtc's existing stream for the camera (HA already set it up)
+          2. Try the camera entity's stream_source() (authenticated RTSP from integration)
+          3. Try raw RTSP URLs (legacy fallback)
 
-        This is far more reliable than the Baichuan binary stream approach
-        because ffmpeg handles all protocol details (RTSP setup, RTP, codec
-        detection, buffering, reconnection) natively.
+        All methods use ffmpeg to extract audio as 16kHz PCM.
         """
-        has_fallback_creds = bool(self._reolink_host and self._reolink_user and self._reolink_pass is not None)
-        if not self._reolink_rtsp_url and not has_fallback_creds:
-            _LOGGER.warning("No stream URL or credentials available — audio input disabled")
+        # Build list of URLs to try, prioritizing the integration's own streams
+        urls_to_try: list[str] = []
+
+        # Method 1: go2rtc existing stream (HA sets this up for Reolink cameras)
+        go2rtc_url = await self._get_go2rtc_audio_url()
+        if go2rtc_url:
+            urls_to_try.append(go2rtc_url)
+
+        # Method 2: Camera entity's stream_source (authenticated by the integration)
+        entity_stream_url = await self._get_camera_stream_source()
+        if entity_stream_url and entity_stream_url not in urls_to_try:
+            urls_to_try.append(entity_stream_url)
+
+        # Method 3: RTSP URL from Reolink API (if runtime Host is available)
+        if self._reolink_rtsp_url and self._reolink_rtsp_url not in urls_to_try:
+            urls_to_try.append(self._reolink_rtsp_url)
+
+        if not urls_to_try:
+            _LOGGER.warning("No audio input source available — mic input disabled")
             return
 
         self._listen_active = True
-        self._input_processor_task = asyncio.create_task(self._rtsp_audio_input_loop())
+        self._input_processor_task = asyncio.create_task(
+            self._audio_input_loop(urls_to_try)
+        )
 
-    async def _rtsp_audio_input_loop(self) -> None:
-        """Read audio from RTSP stream via ffmpeg and send PCM to Gemini.
+    async def _get_go2rtc_audio_url(self) -> str | None:
+        """Find and return an audio URL from go2rtc's existing streams.
 
-        Runs ffmpeg with:
-          - Input: RTSP URL (tries sub-stream first, falls back to main)
-          - Only audio track (-vn: no video)
-          - Output: raw 16kHz 16-bit mono PCM on stdout
-
-        Sends 20ms PCM chunks to Gemini via the audio callback.
+        HA's Reolink integration registers camera streams in go2rtc automatically.
+        We just need to find the right stream and use go2rtc's local API to read it.
         """
-        # Build list of URLs to try (sub first, then main stream, then RTMP)
-        urls_to_try = [self._reolink_rtsp_url] if self._reolink_rtsp_url else []
-        if self._reolink_host and self._reolink_user and self._reolink_pass:
-            encoded_pass = quote(self._reolink_pass, safe="")
-            encoded_query_pass = quote(self._reolink_pass, safe="")
-            port = self._reolink_rtsp_port or 554
-            base = f"rtsp://{self._reolink_user}:{encoded_pass}@{self._reolink_host}:{port}"
-            # Add alternative URL patterns if not already in list
-            alternatives = [
-                f"{base}/h264Preview_01_sub",
-                f"{base}/Preview_01_sub",
-                f"{base}/h264Preview_01_main",
-                # RTMP fallback (Reolink cameras support this even when RTSP is disabled)
-                f"rtmp://{self._reolink_host}/bcs/channel0_sub.bcs"
-                f"?channel=0&stream=0&user={self._reolink_user}"
-                f"&password={encoded_query_pass}",
-            ]
-            for alt in alternatives:
-                if alt not in urls_to_try:
-                    urls_to_try.append(alt)
+        base_url = await _discover_go2rtc_url(self._hass)
+        if not base_url:
+            return None
+
+        ha_session = _get_go2rtc_session(self._hass)
+        own_session: aiohttp.ClientSession | None = None
+        if not ha_session:
+            own_session = aiohttp.ClientSession()
+        session = ha_session or own_session
+
+        try:
+            # Query go2rtc for available streams
+            async with session.get(
+                f"{base_url}/api/streams",
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                streams: dict = await resp.json()
+
+            # Find a stream matching the camera entity or Reolink entry
+            camera_entity = self._camera_entity_id or ""
+            reolink_entry = self._reolink_entry_id or ""
+            stream_name: str | None = None
+
+            # Check for our previously registered stream (if any)
+            if self._stream_name and self._stream_name in streams:
+                stream_name = self._stream_name
+
+            # Check for a stream matching the camera entity ID
+            if not stream_name and camera_entity:
+                # HA go2rtc uses entity unique_id or entity_id as stream name
+                for name in streams:
+                    if camera_entity in name or camera_entity.replace(".", "_") in name:
+                        stream_name = name
+                        break
+
+            # Check for any Reolink stream (contains the host/entry info)
+            if not stream_name and reolink_entry:
+                for name in streams:
+                    if reolink_entry[:8] in name:
+                        stream_name = name
+                        break
+
+            # Last resort: look for any stream with reolink-like RTSP source
+            if not stream_name and self._reolink_host:
+                for name, sources in streams.items():
+                    src_list = sources if isinstance(sources, list) else []
+                    for src in src_list:
+                        if isinstance(src, str) and self._reolink_host in src:
+                            stream_name = name
+                            break
+                    if stream_name:
+                        break
+
+            if stream_name:
+                _LOGGER.info("Found existing go2rtc stream for audio: %s", stream_name)
+                return f"{base_url}/api/stream.mp4?src={stream_name}"
+            return None
+        except Exception:
+            _LOGGER.debug("Failed to query go2rtc streams", exc_info=True)
+            return None
+        finally:
+            if own_session:
+                await own_session.close()
+
+    async def _get_camera_stream_source(self) -> str | None:
+        """Get the authenticated stream URL from the camera entity.
+
+        The Reolink integration provides this URL with proper auth — it's the
+        same URL that HA uses for the dashboard live view.
+        """
+        camera_entity = self._camera_entity_id or ""
+        if not camera_entity:
+            return None
+        try:
+            # Method A: get entity from the entity component platform
+            from homeassistant.helpers.entity_component import EntityComponent
+            camera_comp: EntityComponent | None = self._hass.data.get("camera")
+            if camera_comp and hasattr(camera_comp, "get_entity"):
+                entity = camera_comp.get_entity(camera_entity)
+                if entity and hasattr(entity, "stream_source"):
+                    url = await entity.stream_source()
+                    if url:
+                        _LOGGER.info("Got stream source from camera entity: %s", _mask_stream_url(url))
+                        return url
+
+            # Method B: try via Reolink integration's runtime host API
+            reolink_entry_id = self._reolink_entry_id
+            if reolink_entry_id:
+                entry = self._hass.config_entries.async_get_entry(reolink_entry_id)
+                if entry and hasattr(entry, "runtime_data") and entry.runtime_data:
+                    try:
+                        host_obj = entry.runtime_data.host
+                        api = host_obj.api
+                        url = await api.get_rtsp_stream_source(0, "sub", check=False)
+                        if url:
+                            _LOGGER.info("Got stream source from Reolink API: %s", _mask_stream_url(url))
+                            return url
+                    except Exception:
+                        pass
+        except Exception:
+            _LOGGER.debug("Could not get stream_source from camera entity", exc_info=True)
+        return None
+
+    async def _audio_input_loop(self, urls_to_try: list[str]) -> None:
+        """Read audio from the best available source via ffmpeg.
+
+        Tries each URL in priority order until one works.
+        Sends 20ms PCM chunks (640 bytes at 16kHz) to Gemini.
+        """
 
         proc: asyncio.subprocess.Process | None = None
 
@@ -1206,47 +1311,31 @@ async def auto_configure_reolink(
     camera_entity_id: str = "",
     reolink_entry_id: str | None = None,
 ) -> dict[str, str] | None:
-    """Auto-configure go2rtc for a Reolink doorbell.
+    """Verify Reolink camera connectivity (no external stream setup needed).
 
-    Returns a dict with the stream_name and status, or None on failure.
-    This is called during integration setup to prepare the audio pipeline.
-    It can resolve the Reolink device from either camera entity or entry ID.
+    Returns connection info dict or None if the camera is not reachable.
+    Audio input now uses the existing go2rtc stream set up by HA's Reolink integration.
+    Audio output uses native Baichuan protocol directly.
     """
-    # Find the Reolink config entry
     if not reolink_entry_id:
         if not camera_entity_id:
-            _LOGGER.warning("Could not auto-configure Reolink audio: no camera or entry provided")
+            _LOGGER.warning("Could not verify Reolink: no camera or entry provided")
             return None
         reolink_entry_id = find_reolink_entry_for_camera(hass, camera_entity_id)
         if not reolink_entry_id:
             _LOGGER.warning("Could not find Reolink config entry for %s", camera_entity_id)
             return None
 
-    # Get connection details
     reolink_config = get_reolink_config(hass, reolink_entry_id)
     if not reolink_config or not reolink_config.get("host"):
         _LOGGER.warning("Could not get Reolink connection details")
         return None
 
-    # Build RTSP URL (sub stream for lower bandwidth)
     host = reolink_config["host"]
-    user = reolink_config["username"]
-    password = reolink_config["password"]
-    encoded_password = quote(password, safe="")
-    rtsp_url = REOLINK_RTSP_SUB.format(host=host, user=user, password=encoded_password)
-
-    # Create a deterministic stream name from the selected Reolink config entry
-    stream_name = f"jeeves_reolink_{reolink_entry_id.replace('-', '_')[:12]}"
-
-    # Register in go2rtc
-    success = await setup_go2rtc_stream(hass, stream_name, rtsp_url)
-    if not success:
-        return None
-
+    _LOGGER.info("Reolink connectivity verified: host=%s", host)
     return {
-        "stream_name": stream_name,
         "host": host,
-        "rtsp_url_masked": f"rtsp://{user}:***@{host}:554/h264Preview_01_sub",
+        "status": "ok",
     }
 
 

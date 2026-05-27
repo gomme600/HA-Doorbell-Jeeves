@@ -156,35 +156,20 @@ async def _register_frontend_resources(hass: HomeAssistant) -> None:
 
 
 async def _setup_reolink(hass: HomeAssistant, entry: ConfigEntry, config: dict[str, Any]) -> None:
-    """Configure go2rtc for Reolink doorbell 2-way audio."""
-    from .reolink_audio import auto_configure_reolink  # noqa: PLC0415
+    """Verify Reolink configuration is present (no external setup needed).
 
+    Audio input now discovers the existing go2rtc stream at session start.
+    Audio output uses native Baichuan protocol directly.
+    No RTSP URL construction or go2rtc stream registration is required.
+    """
     reolink_entry_id = config.get(CONF_REOLINK_ENTRY_ID, "")
     camera_entity = config.get(CONF_CAMERA_ENTITY, "")
-    if not reolink_entry_id and not camera_entity:
-        return
-
-    result = await auto_configure_reolink(
-        hass,
-        camera_entity_id=camera_entity,
-        reolink_entry_id=reolink_entry_id or None,
-    )
-    if result:
+    if reolink_entry_id or camera_entity:
         _LOGGER.info(
-            "Reolink go2rtc configured: stream=%s, host=%s",
-            result.get("stream_name"),
-            result.get("host"),
-        )
-        # Store the stream name in options for session use
-        new_options = dict(entry.options)
-        new_options[CONF_GO2RTC_STREAM_NAME] = result["stream_name"]
-        new_options[CONF_GO2RTC_INPUT_STREAM_NAME] = result["stream_name"]
-        new_options[CONF_GO2RTC_OUTPUT_STREAM_NAME] = result["stream_name"]
-        hass.config_entries.async_update_entry(entry, options=new_options)
-    else:
-        _LOGGER.warning(
-            "Could not auto-configure Reolink go2rtc. 2-way audio may not work. "
-            "Ensure the Reolink integration is loaded and the camera has valid credentials."
+            "Reolink mode configured: entry=%s, camera=%s "
+            "(audio uses native Baichuan + existing go2rtc stream)",
+            reolink_entry_id[:8] if reolink_entry_id else "none",
+            camera_entity or "none",
         )
 
 

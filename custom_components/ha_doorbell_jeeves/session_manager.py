@@ -227,31 +227,21 @@ class JeevesSessionManager:
         )
 
     async def _lazy_setup_reolink(self) -> None:
-        """Set up go2rtc stream for Reolink (deferred from boot for timing)."""
-        from .reolink_audio import auto_configure_reolink  # noqa: PLC0415
+        """Verify Reolink connectivity (deferred from boot for timing).
 
+        No longer registers its own go2rtc stream — the audio input pipeline
+        now discovers the existing go2rtc stream set up by HA's Reolink integration.
+        """
         config = self._config
         reolink_entry_id = config.get(CONF_REOLINK_ENTRY_ID, "")
         camera_entity = config.get(CONF_CAMERA_ENTITY, "")
         if not reolink_entry_id and not camera_entity:
             return
-        result = await auto_configure_reolink(
-            self.hass,
-            camera_entity_id=camera_entity,
-            reolink_entry_id=reolink_entry_id or None,
+        _LOGGER.info(
+            "Reolink mode: entry=%s, camera=%s (audio input uses existing go2rtc stream)",
+            reolink_entry_id[:8] if reolink_entry_id else "none",
+            camera_entity or "none",
         )
-        if result:
-            _LOGGER.info("Reolink go2rtc configured: stream=%s", result.get("stream_name"))
-            new_options = dict(self.entry.options)
-            new_options[CONF_GO2RTC_STREAM_NAME] = result["stream_name"]
-            new_options[CONF_GO2RTC_INPUT_STREAM_NAME] = result["stream_name"]
-            new_options[CONF_GO2RTC_OUTPUT_STREAM_NAME] = result["stream_name"]
-            self.hass.config_entries.async_update_entry(self.entry, options=new_options)
-            self._config[CONF_GO2RTC_STREAM_NAME] = result["stream_name"]
-            self._config[CONF_GO2RTC_INPUT_STREAM_NAME] = result["stream_name"]
-            self._config[CONF_GO2RTC_OUTPUT_STREAM_NAME] = result["stream_name"]
-        else:
-            _LOGGER.warning("go2rtc not available — 2-way audio may not work")
 
     async def _safe_start_session(self) -> None:
         """Wrapper for async_start_session that catches and logs all errors."""
