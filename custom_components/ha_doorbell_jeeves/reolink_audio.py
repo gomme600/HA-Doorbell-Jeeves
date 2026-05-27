@@ -1164,6 +1164,13 @@ class ReolinkAudioHandler:
         if not bc:
             return False
 
+        # Start AAC decoder task BEFORE installing the hook (so queued frames get decoded)
+        if not self._aac_queue:
+            self._aac_queue = asyncio.Queue(maxsize=200)
+        if not self._aac_decoder_task or self._aac_decoder_task.done():
+            self._aac_decoder_task = asyncio.create_task(self._aac_decode_loop())
+            _LOGGER.warning("Preview stream: AAC decoder task started")
+
         # Install the enhanced parse hook that handles BOTH CMD 3 and CMD 202
         if not self._install_preview_audio_intercept():
             _LOGGER.warning("Preview stream: failed to install protocol hook")
@@ -1507,8 +1514,14 @@ class ReolinkAudioHandler:
                 original_parse()
                 return
 
-            if rec_payload_offset == 0:
-                rec_payload_offset = rec_len_body
+            # For CMD 3 stream data: payload_offset=0 means the ENTIRE body is
+            # binary payload (no extension XML). Don't apply the library's
+            # default of "treat as all-extension" for stream data.
+            if rec_payload_offset == 0 and rec_cmd_id == 3:
+                # Binary stream: entire body is payload
+                rec_payload_offset = 0  # payload starts at offset 0
+            elif rec_payload_offset == 0:
+                rec_payload_offset = rec_len_body  # normal: all extension, no payload
 
             # Extract binary payload (after extension/XML offset)
             len_chunk = rec_len_body + len_header
@@ -1523,7 +1536,7 @@ class ReolinkAudioHandler:
                 self._preview_active = True
 
                 # Log first packets for debugging
-                if input_count[0] <= 10:
+                if input_count[0] <= 15:
                     import struct as _st2
                     magic_val = _st2.unpack_from("<I", payload, 0)[0] if len(payload) >= 4 else 0
                     magic_names = {
@@ -1539,8 +1552,9 @@ class ReolinkAudioHandler:
                         else:
                             name = f"Unknown(0x{magic_val:08x})"
                     _LOGGER.warning(
-                        "Preview pkt #%d (CMD %d): %d bytes, type=%s",
+                        "Preview pkt #%d (CMD %d): %d bytes, type=%s, payload_offset=%d, first16=%s",
                         input_count[0], rec_cmd_id, len(payload), name,
+                        rec_payload_offset, payload[:16].hex() if len(payload) >= 16 else payload.hex(),
                     )
                 elif input_count[0] == 50:
                     _LOGGER.warning(
@@ -1559,6 +1573,15 @@ class ReolinkAudioHandler:
                     self._preview_audio_frames += 1
                     if self._listen_active:
                         asyncio.ensure_future(self._on_audio_received(pcm_data))
+            else:
+                # Empty payload — might be an ACK or status-only response
+                input_count[0] += 1
+                self._preview_active = True
+                if input_count[0] <= 3:
+                    _LOGGER.warning(
+                        "Preview pkt #%d (CMD %d): empty payload (offset=%d, body_len=%d)",
+                        input_count[0], rec_cmd_id, rec_payload_offset, rec_len_body,
+                    )
 
             # Consume this message from the buffer
             if len_body > rec_len_body:
