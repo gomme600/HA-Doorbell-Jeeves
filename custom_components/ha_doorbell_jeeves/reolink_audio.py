@@ -263,6 +263,7 @@ class ReolinkAudioHandler:
         self._camera_unique_id: str | None = None  # go2rtc stream name
         # Baichuan talk state (output — speaker)
         self._baichuan: Any = None
+        self._talk_baichuan: Any = None  # Separate connection for talk (CMD 201/202)
         self._talk_host: Any = None  # Dedicated Host object for talk connection
         self._talk_ability: dict | None = None
         self._talk_enc_type: Any = None
@@ -526,23 +527,22 @@ class ReolinkAudioHandler:
     async def _start_output_pipeline(self) -> None:
         """Start the Baichuan talk session and audio output loop.
 
-        Uses the Reolink integration's existing Baichuan connection (port 9000)
+        Uses a DEDICATED Baichuan connection (separate from Preview stream)
         to send ADPCM audio directly to the camera speaker.
-        This bypasses RTSP entirely — works even when port 554 is blocked.
+        This avoids interference between the Preview CMD 3 stream data
+        and Talk CMD 201/202 commands.
         """
-        # Reuse existing Baichuan connection if available (created in start())
-        bc = self._baichuan
+        # ALWAYS create a dedicated connection for talk — Preview uses self._baichuan
+        # and installs a hook on it that would interfere with talk commands.
+        bc = await self._get_baichuan_object()
         if not bc:
-            # Fallback: create dedicated connection
-            bc = await self._get_baichuan_object()
-            if not bc:
-                _LOGGER.error(
-                    "Cannot establish Baichuan talk connection. "
-                    "Audio output to doorbell speaker will not work."
-                )
-                return
-            self._baichuan = bc
-            _LOGGER.warning("Got Baichuan connection to %s for talk", self._reolink_host)
+            _LOGGER.error(
+                "Cannot establish Baichuan talk connection. "
+                "Audio output to doorbell speaker will not work."
+            )
+            return
+        # Store as the talk Baichuan object (separate from self._baichuan used for Preview)
+        self._talk_baichuan = bc
 
         # Query TalkAbility to get audio parameters
         ability = await self._query_talk_ability()
@@ -621,12 +621,12 @@ class ReolinkAudioHandler:
         """Query the camera's TalkAbility via Baichuan command 10."""
         import xml.etree.ElementTree as ET  # noqa: PLC0415
 
-        if not self._baichuan:
+        if not self._talk_baichuan:
             return None
 
         try:
             # Command 10 queries the camera's two-way audio capabilities
-            response = await self._baichuan.send(cmd_id=10, channel=0)
+            response = await self._talk_baichuan.send(cmd_id=10, channel=0)
             if not response:
                 _LOGGER.warning("Empty TalkAbility response from camera")
                 return None
@@ -682,7 +682,7 @@ class ReolinkAudioHandler:
         """
         import struct as struct_mod  # noqa: PLC0415
 
-        if not self._baichuan or not self._talk_ability:
+        if not self._talk_baichuan or not self._talk_ability:
             return
 
         ability = self._talk_ability
@@ -901,7 +901,7 @@ class ReolinkAudioHandler:
         # Try AES encryption first (most common), then BC encryption
         for enc in (bc_util.EncType.AES, bc_util.EncType.BC):
             try:
-                await self._baichuan.send(cmd_id=201, channel=channel, body=talk_config, enc_type=enc)
+                await self._talk_baichuan.send(cmd_id=201, channel=channel, body=talk_config, enc_type=enc)
                 self._talk_enc_type = enc
                 _LOGGER.warning("TalkConfig accepted (enc=%s)", enc)
                 return True
@@ -911,9 +911,9 @@ class ReolinkAudioHandler:
                     # Camera says talk already active — stop it first, then retry
                     _LOGGER.info("TalkConfig got rspCode=%s, stopping existing talk and retrying", rsp)
                     try:
-                        await self._baichuan.send(cmd_id=11, channel=channel, enc_type=enc)
+                        await self._talk_baichuan.send(cmd_id=11, channel=channel, enc_type=enc)
                         await asyncio.sleep(0.3)
-                        await self._baichuan.send(cmd_id=201, channel=channel, body=talk_config, enc_type=enc)
+                        await self._talk_baichuan.send(cmd_id=201, channel=channel, body=talk_config, enc_type=enc)
                         self._talk_enc_type = enc
                         _LOGGER.warning("TalkConfig accepted after stop+retry (enc=%s)", enc)
                         return True
@@ -931,12 +931,13 @@ class ReolinkAudioHandler:
 
     async def _stop_baichuan_talk(self, channel: int) -> None:
         """Send talk stop command (cmd 11) to end the session."""
-        if not self._baichuan:
+        bc = getattr(self, "_talk_baichuan", None) or self._baichuan
+        if not bc:
             return
         try:
             enc = self._talk_enc_type
             if enc:
-                await self._baichuan.send(cmd_id=11, channel=channel, enc_type=enc)
+                await bc.send(cmd_id=11, channel=channel, enc_type=enc)
                 _LOGGER.info("Baichuan talk session stopped")
         except Exception as exc:
             _LOGGER.debug("Talk stop (cmd 11) error (non-critical): %s", exc)
@@ -1089,7 +1090,7 @@ class ReolinkAudioHandler:
         from reolink_aio.baichuan import util as bc_util  # noqa: PLC0415
         from reolink_aio.baichuan import xmls  # noqa: PLC0415
 
-        bc = self._baichuan
+        bc = getattr(self, "_talk_baichuan", None) or self._baichuan
         if not bc:
             return
 
@@ -2450,6 +2451,7 @@ class ReolinkAudioHandler:
         proc: asyncio.subprocess.Process | None = None
         frames_decoded = 0
         first_pcm_logged = False
+        frames_written = 0
 
         try:
             while self._active and self._listen_active:
@@ -2464,51 +2466,80 @@ class ReolinkAudioHandler:
                 # Start ffmpeg if not running
                 if proc is None or proc.returncode is not None:
                     proc = await asyncio.create_subprocess_exec(
-                        "ffmpeg", "-hide_banner", "-loglevel", "error",
+                        "ffmpeg", "-hide_banner", "-loglevel", "warning",
+                        "-probesize", "32",
+                        "-analyzeduration", "0",
+                        "-fflags", "+nobuffer+flush_packets",
                         "-f", "aac", "-i", "pipe:0",
                         "-acodec", "pcm_s16le",
                         "-ar", str(AUDIO_INPUT_SAMPLE_RATE),
                         "-ac", "1",
                         "-f", "s16le",
+                        "-flush_packets", "1",
                         "pipe:1",
                         stdin=asyncio.subprocess.PIPE,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                     )
                     _LOGGER.warning(
-                        "AAC decoder ffmpeg started (PID=%d)", proc.pid
+                        "AAC decoder ffmpeg started (PID=%d) with low-latency flags", proc.pid
                     )
 
                 # Write AAC frame to ffmpeg
                 try:
                     proc.stdin.write(aac_data)
                     await proc.stdin.drain()
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    # ffmpeg died — will restart on next iteration
+                    frames_written += 1
+                except (BrokenPipeError, ConnectionResetError, OSError) as exc:
+                    if frames_written <= 3:
+                        _LOGGER.warning("AAC decoder ffmpeg pipe broke after %d frames: %s", frames_written, exc)
+                        # Read stderr for diagnostic
+                        try:
+                            stderr = await asyncio.wait_for(proc.stderr.read(1024), timeout=0.5)
+                            if stderr:
+                                _LOGGER.warning("ffmpeg stderr: %s", stderr.decode(errors="replace")[:200])
+                        except Exception:
+                            pass
                     proc = None
+                    frames_written = 0
                     continue
 
-                # Read available PCM output (non-blocking)
-                try:
-                    pcm_data = await asyncio.wait_for(
-                        proc.stdout.read(4096), timeout=0.1
-                    )
-                except asyncio.TimeoutError:
-                    pcm_data = b""
+                # Read PCM output — try multiple times with increasing delay
+                # (ffmpeg may need a moment after first frame to start outputting)
+                pcm_data = b""
+                for attempt in range(3):
+                    try:
+                        chunk = await asyncio.wait_for(
+                            proc.stdout.read(8192), timeout=0.2 if attempt == 0 else 0.5
+                        )
+                        if chunk:
+                            pcm_data += chunk
+                            break
+                    except asyncio.TimeoutError:
+                        if attempt == 0 and frames_written <= 3:
+                            # First few frames: ffmpeg might still be probing
+                            continue
+                        break
 
                 if pcm_data:
                     frames_decoded += 1
                     if not first_pcm_logged:
                         first_pcm_logged = True
                         _LOGGER.warning(
-                            "✓ First PCM from AAC decode (%d bytes)", len(pcm_data)
+                            "✓ First PCM from AAC decode (%d bytes, after %d frames written)",
+                            len(pcm_data), frames_written,
                         )
-                    if frames_decoded % 500 == 0:
+                    if frames_decoded % 100 == 0:
                         _LOGGER.info(
                             "AAC decoder: %d frames decoded", frames_decoded
                         )
                     # Forward to AI
                     await self._on_audio_received(pcm_data)
+                elif frames_written == 5 and not first_pcm_logged:
+                    # After 5 frames and still no output — log warning
+                    _LOGGER.warning(
+                        "AAC decoder: 5 frames written but no PCM output yet"
+                    )
 
         except asyncio.CancelledError:
             pass
