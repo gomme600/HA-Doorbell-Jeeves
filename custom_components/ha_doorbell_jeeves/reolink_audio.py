@@ -281,6 +281,7 @@ class ReolinkAudioHandler:
         self._listen_active = False
         self._input_processor_task: asyncio.Task[None] | None = None
         self._baichuan_audio_input_active = False
+        self._raw_mic_task: asyncio.Task[None] | None = None  # Raw TCP fallback
         # AAC decoder state (for FDX stream AAC audio)
         self._aac_queue: asyncio.Queue[bytes] | None = None
         self._aac_decoder_task: asyncio.Task[None] | None = None
@@ -297,30 +298,50 @@ class ReolinkAudioHandler:
         self._preview_stream_buffer: bytearray = bytearray()
 
     async def _amplify_and_forward(self, pcm_data: bytes) -> None:
-        """Apply gain amplification to PCM audio before forwarding to AI.
+        """Apply AGC (Automatic Gain Control) to PCM audio before forwarding.
 
-        Doorbell microphones typically produce very low-level signals via the
-        Baichuan protocol. We amplify by self._mic_gain to bring the signal
-        into a range where Gemini's VAD can detect speech (~RMS 3000-10000).
+        Doorbell microphones produce very low-level signals via Baichuan.
+        Instead of fixed gain (which clips), we use simple AGC that targets
+        a specific RMS level while avoiding hard clipping.
         """
         import struct as _struct  # noqa: PLC0415
 
-        if self._mic_gain == 1.0:
-            await self._on_audio_received_raw(pcm_data)
+        TARGET_RMS = 5000.0  # Target RMS for Gemini VAD (~5000 is reliable)
+        MAX_GAIN = 200.0     # Maximum gain to prevent noise amplification
+        MIN_GAIN = 1.0       # Minimum gain (never attenuate)
+
+        n_samples = len(pcm_data) // 2
+        if n_samples == 0:
             return
 
-        gain = self._mic_gain
-        n_samples = len(pcm_data) // 2
         samples = _struct.unpack(f"<{n_samples}h", pcm_data)
+
+        # Compute RMS of input
+        rms = (sum(s * s for s in samples) / n_samples) ** 0.5
+        if rms < 1.0:
+            rms = 1.0
+
+        # Calculate gain needed to reach target RMS
+        gain = TARGET_RMS / rms
+        gain = max(MIN_GAIN, min(MAX_GAIN, gain))
+
+        # Apply gain with soft clipping (tanh-like) to avoid hard distortion
         amplified = []
         for s in samples:
-            v = int(s * gain)
-            # Clamp to int16 range
-            if v > 32767:
-                v = 32767
-            elif v < -32768:
-                v = -32768
-            amplified.append(v)
+            v = s * gain
+            # Soft clip: if beyond 80% of range, compress
+            if v > 26000:
+                v = 26000 + (v - 26000) * 0.3
+            elif v < -26000:
+                v = -26000 + (v + 26000) * 0.3
+            # Hard clip at int16 range
+            iv = int(v)
+            if iv > 32767:
+                iv = 32767
+            elif iv < -32768:
+                iv = -32768
+            amplified.append(iv)
+
         amplified_pcm = _struct.pack(f"<{n_samples}h", *amplified)
         await self._on_audio_received_raw(amplified_pcm)
 
@@ -509,6 +530,15 @@ class ReolinkAudioHandler:
         self._aac_decoder_task = None
         self._aac_queue = None
 
+        # Cancel raw TCP mic task
+        if self._raw_mic_task and not self._raw_mic_task.done():
+            self._raw_mic_task.cancel()
+            try:
+                await self._raw_mic_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._raw_mic_task = None
+
         # Logout dedicated talk connection
         if hasattr(self, "_talk_host") and self._talk_host:
             try:
@@ -577,6 +607,19 @@ class ReolinkAudioHandler:
         # Store as the talk Baichuan object (separate from self._baichuan used for Preview)
         self._talk_baichuan = bc
 
+        # IMMEDIATELY install FDX hook while connection is still active from login.
+        # reolink_aio may clear _connection after commands complete, so we must
+        # grab it NOW before any further operations.
+        fdx_hooked = False
+        try:
+            fdx_hooked = self._install_talk_data_received_hook()
+            if fdx_hooked:
+                _LOGGER.warning("✓ FDX data_received hook installed (pre-talk)")
+            else:
+                _LOGGER.warning("FDX pre-talk hook failed — will retry after talk start")
+        except Exception as exc:
+            _LOGGER.warning("FDX pre-talk hook exception: %s", exc)
+
         # Query TalkAbility to get audio parameters
         ability = await self._query_talk_ability()
         if not ability:
@@ -588,6 +631,22 @@ class ReolinkAudioHandler:
             ability["audio_type"], ability["sample_rate"],
             ability["length_per_encoder"], ability["duplex"],
         )
+
+        # Mark FDX as active if hook succeeded and duplex is FDX
+        if fdx_hooked and ability.get("duplex") == "FDX":
+            if not self._aac_queue:
+                self._aac_queue = asyncio.Queue(maxsize=200)
+            if not self._aac_decoder_task or self._aac_decoder_task.done():
+                self._aac_decoder_task = asyncio.create_task(self._aac_decode_loop())
+            self._baichuan_audio_input_active = True
+            _LOGGER.warning("✓ FDX audio pipeline active — continuous mic audio enabled")
+
+        # If FDX hook failed, start raw TCP mic stream as ultimate fallback
+        if not self._baichuan_audio_input_active and ability.get("duplex") == "FDX":
+            _LOGGER.warning("Starting raw TCP mic stream (FDX hook unavailable)")
+            self._raw_mic_task = asyncio.create_task(
+                self._raw_tcp_mic_stream(ability)
+            )
 
         # Start the output processing loop
         self._output_reader_task = asyncio.create_task(self._baichuan_audio_output_loop())
@@ -746,32 +805,25 @@ class ReolinkAudioHandler:
             sample_rate, block_size,
         )
 
-        # Install FDX audio intercept on the TALK connection.
-        # In FDX mode the camera sends mic audio back as CMD 202 packets on the
-        # same TCP connection used for talk output. We hook data_received at the
-        # asyncio protocol level to intercept these before reolink_aio drops them
-        # (it discards unsolicited CMD 202 with status!=200).
+        # Install FDX audio intercept on the TALK connection (retry after talk start).
+        # The hook may have already been installed pre-talk in _start_output_pipeline.
+        # If not, try again now that the talk session is active.
         if ability.get("duplex") == "FDX" and not self._baichuan_audio_input_active:
-            # Ensure AAC decoder is running
             if not self._aac_queue:
                 self._aac_queue = asyncio.Queue(maxsize=200)
             if not self._aac_decoder_task or self._aac_decoder_task.done():
                 self._aac_decoder_task = asyncio.create_task(self._aac_decode_loop())
-
             try:
                 success = self._install_talk_data_received_hook()
             except Exception as exc:
-                _LOGGER.warning("FDX hook install exception: %s", exc, exc_info=True)
+                _LOGGER.warning("FDX post-talk hook exception: %s", exc)
                 success = False
             if success:
                 self._baichuan_audio_input_active = True
-                _LOGGER.warning(
-                    "✓ FDX audio hook active on TALK connection — "
-                    "intercepting CMD 202 mic audio at transport level"
-                )
+                _LOGGER.warning("✓ FDX hook active (post-talk retry)")
             else:
                 _LOGGER.warning(
-                    "FDX hook failed — mic audio limited to Preview stream (~1 fps)"
+                    "FDX hook failed after talk start — mic limited to Preview (~1fps)"
                 )
 
         # Pure Python resampler: 24kHz mono s16le → camera sample_rate mono s16le
@@ -2053,30 +2105,65 @@ class ReolinkAudioHandler:
             _LOGGER.warning("FDX hook: no _talk_baichuan object")
             return False
 
-        # Navigate: Baichuan → _connection → _protocol
-        connection = getattr(bc, "_connection", None)
-        _LOGGER.warning(
-            "FDX hook: bc=%s, bc._connection=%s (type=%s)",
-            type(bc).__name__,
-            connection is not None,
-            type(connection).__name__ if connection else "None",
-        )
-        if not connection:
-            _LOGGER.warning("FDX hook: bc._connection is None, cannot hook")
-            return False
+        # Try multiple paths to find the protocol object.
+        # reolink_aio stores it in different locations depending on version.
+        protocol = None
 
-        protocol = getattr(connection, "_protocol", None)
-        _LOGGER.warning(
-            "FDX hook: connection._protocol=%s (type=%s)",
-            protocol is not None,
-            type(protocol).__name__ if protocol else "None",
-        )
+        # Path 1: Baichuan._connection._protocol (standard path)
+        connection = getattr(bc, "_connection", None)
+        if connection:
+            protocol = getattr(connection, "_protocol", None)
+            if protocol:
+                _LOGGER.warning("FDX hook: found protocol via bc._connection._protocol")
+
+        # Path 2: Baichuan._protocol (direct, some versions)
         if not protocol:
-            _LOGGER.warning("FDX hook: protocol is None, cannot hook")
+            protocol = getattr(bc, "_protocol", None)
+            if protocol:
+                _LOGGER.warning("FDX hook: found protocol via bc._protocol")
+
+        # Path 3: Talk Host object may have it
+        if not protocol:
+            talk_host = getattr(self, "_talk_host", None)
+            if talk_host:
+                host_bc = getattr(talk_host, "_bc", None) or getattr(talk_host, "baichuan", None)
+                if host_bc and host_bc is not bc:
+                    conn2 = getattr(host_bc, "_connection", None)
+                    if conn2:
+                        protocol = getattr(conn2, "_protocol", None)
+                        if protocol:
+                            _LOGGER.warning("FDX hook: found protocol via talk_host.baichuan._connection")
+
+        # Path 4: Search ALL attributes of bc for something with data_received
+        if not protocol:
+            # Log the full object graph for debugging
+            bc_attrs = {k: type(getattr(bc, k, None)).__name__
+                       for k in dir(bc) if not k.startswith("__") and k.startswith("_")}
+            _LOGGER.warning(
+                "FDX hook: no protocol found. bc attrs: %s",
+                {k: v for k, v in bc_attrs.items() if "conn" in k.lower() or "proto" in k.lower() or "trans" in k.lower() or "sock" in k.lower()}
+            )
+            # Try to find protocol via transport
+            for attr_name in dir(bc):
+                if attr_name.startswith("__"):
+                    continue
+                obj = getattr(bc, attr_name, None)
+                if obj and hasattr(obj, "data_received"):
+                    protocol = obj
+                    _LOGGER.warning("FDX hook: found data_received on bc.%s", attr_name)
+                    break
+                if obj and hasattr(obj, "_protocol"):
+                    protocol = getattr(obj, "_protocol", None)
+                    if protocol:
+                        _LOGGER.warning("FDX hook: found protocol via bc.%s._protocol", attr_name)
+                        break
+
+        if not protocol:
+            _LOGGER.warning("FDX hook: FAILED — no protocol found anywhere")
             return False
 
         if not hasattr(protocol, "data_received"):
-            _LOGGER.warning("FDX hook: protocol has no data_received method")
+            _LOGGER.warning("FDX hook: protocol %s has no data_received", type(protocol).__name__)
             return False
 
         # State for our stream parser
@@ -2226,6 +2313,243 @@ class ReolinkAudioHandler:
             return cipher.decrypt(raw_payload)
         except Exception:
             return raw_payload
+
+    async def _raw_tcp_mic_stream(self, ability: dict) -> None:
+        """Raw TCP connection to camera for receiving FDX mic audio.
+
+        This is the nuclear fallback: we create our OWN TCP connection to port
+        9000, perform a minimal Baichuan login, start a talk session, and then
+        read ALL incoming bytes ourselves. This bypasses reolink_aio entirely.
+
+        The camera sends mic audio as CMD 202 packets in FDX mode once a talk
+        session is active. We parse these directly from the TCP stream.
+        """
+        import hashlib
+        import struct as _st
+
+        host = self._reolink_host
+        user = self._reolink_user or "admin"
+        password = self._reolink_pass or ""
+        port = 9000
+
+        if not host:
+            _LOGGER.warning("Raw TCP mic: no host configured")
+            return
+
+        MAGIC = bytes.fromhex("f0debc0a")
+        AES_IV = b"0123456789abcdef"
+        aes_key: bytes | None = None
+
+        def _build_header(cmd_id: int, body_len: int, mess_id: int = 0,
+                         payload_offset: int = 0) -> bytes:
+            return (
+                MAGIC
+                + cmd_id.to_bytes(4, "little")
+                + body_len.to_bytes(4, "little")
+                + (0).to_bytes(1, "little")  # ch_id
+                + mess_id.to_bytes(3, "little")
+                + (0).to_bytes(2, "little")  # status
+                + (0x1464).to_bytes(2, "little")  # class
+                + payload_offset.to_bytes(4, "little")
+            )
+
+        def _encrypt(data: bytes, key: bytes) -> bytes:
+            try:
+                try:
+                    from Cryptodome.Cipher import AES as _AES
+                except ImportError:
+                    from Crypto.Cipher import AES as _AES
+                cipher = _AES.new(key=key, mode=_AES.MODE_CFB, iv=AES_IV, segment_size=128)
+                return cipher.encrypt(data)
+            except Exception:
+                return data
+
+        def _decrypt(data: bytes, key: bytes) -> bytes:
+            try:
+                try:
+                    from Cryptodome.Cipher import AES as _AES
+                except ImportError:
+                    from Crypto.Cipher import AES as _AES
+                cipher = _AES.new(key=key, mode=_AES.MODE_CFB, iv=AES_IV, segment_size=128)
+                return cipher.decrypt(data)
+            except Exception:
+                return data
+
+        async def _read_exactly(reader: asyncio.StreamReader, n: int) -> bytes:
+            data = b""
+            while len(data) < n:
+                chunk = await asyncio.wait_for(reader.read(n - len(data)), timeout=10.0)
+                if not chunk:
+                    raise ConnectionError("Connection closed")
+                data += chunk
+            return data
+
+        async def _read_message(reader: asyncio.StreamReader) -> tuple[int, bytes, bytes]:
+            """Read one Baichuan message. Returns (cmd_id, extension, payload)."""
+            header = await _read_exactly(reader, 4)
+            if header != MAGIC:
+                raise ValueError(f"Bad magic: {header.hex()}")
+            rest = await _read_exactly(reader, 20)  # Read rest of 24-byte header
+            full_header = header + rest
+            cmd_id = int.from_bytes(full_header[4:8], "little")
+            body_len = int.from_bytes(full_header[8:12], "little")
+            mess_class = full_header[18:20].hex()
+
+            header_len = 24
+            payload_offset = int.from_bytes(full_header[20:24], "little")
+
+            if mess_class == "1466":
+                header_len = 20
+                payload_offset = body_len
+                # We already read 24 bytes, but header is only 20 for class 1466
+                # Need to adjust - the extra 4 bytes are part of body
+                body = full_header[20:24]
+                if body_len > 4:
+                    body += await _read_exactly(reader, body_len - 4)
+            else:
+                if payload_offset == 0:
+                    payload_offset = body_len
+                body = await _read_exactly(reader, body_len) if body_len > 0 else b""
+
+            extension = body[:payload_offset]
+            payload = body[payload_offset:]
+            return cmd_id, extension, payload
+
+        try:
+            _LOGGER.warning("Raw TCP mic: connecting to %s:%d...", host, port)
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=10.0
+            )
+            _LOGGER.warning("Raw TCP mic: connected, logging in...")
+
+            # Step 1: Login (CMD 1)
+            # Generate AES key from MD5(password) (nonce-less login)
+            md5_pass = hashlib.md5(password.encode()).digest()
+            aes_key = md5_pass
+
+            login_xml = (
+                f'<?xml version="1.0" encoding="UTF-8" ?>'
+                f'<body><LoginUser version="1.1">'
+                f'<userName>{user}</userName>'
+                f'<password>{password}</password>'
+                f'<userVer>1</userVer>'
+                f'</LoginUser></body>'
+            ).encode("utf-8")
+
+            enc_login = _encrypt(login_xml, aes_key)
+            login_header = _build_header(cmd_id=1, body_len=len(enc_login), mess_id=1)
+            writer.write(login_header + enc_login)
+            await writer.drain()
+
+            # Read login response
+            login_cmd, login_ext, login_payload = await _read_message(reader)
+            if login_cmd == 1:
+                # Decrypt and check
+                dec_ext = _decrypt(login_ext, aes_key) if login_ext else b""
+                _LOGGER.warning(
+                    "Raw TCP mic: login response cmd=%d, ext_len=%d, snippet=%s",
+                    login_cmd, len(login_ext),
+                    dec_ext[:100].decode("utf-8", errors="replace") if dec_ext else "(empty)",
+                )
+            else:
+                _LOGGER.warning("Raw TCP mic: unexpected response cmd=%d", login_cmd)
+
+            # Step 2: Start TalkConfig (CMD 201)
+            talk_xml = (
+                '<?xml version="1.0" encoding="UTF-8" ?>'
+                '<body><TalkConfig version="1.1">'
+                '<channelId>0</channelId>'
+                '<duplex>FDX</duplex>'
+                '<audioStreamMode>followVideoStream</audioStreamMode>'
+                '</TalkConfig></body>'
+            ).encode("utf-8")
+            enc_talk = _encrypt(talk_xml, aes_key)
+            talk_header = _build_header(cmd_id=201, body_len=len(enc_talk), mess_id=2)
+            writer.write(talk_header + enc_talk)
+            await writer.drain()
+
+            # Read TalkConfig response
+            talk_cmd, talk_ext, talk_payload = await _read_message(reader)
+            dec_talk_ext = _decrypt(talk_ext, aes_key) if talk_ext else b""
+            _LOGGER.warning(
+                "Raw TCP mic: talk response cmd=%d, snippet=%s",
+                talk_cmd,
+                dec_talk_ext[:100].decode("utf-8", errors="replace") if dec_talk_ext else "(empty)",
+            )
+
+            # Step 3: Start reading CMD 202 audio continuously
+            _LOGGER.warning("Raw TCP mic: ✓ talk session started, reading audio stream...")
+
+            # Ensure decoders are running
+            if not self._aac_queue:
+                self._aac_queue = asyncio.Queue(maxsize=200)
+            if not self._aac_decoder_task or self._aac_decoder_task.done():
+                self._aac_decoder_task = asyncio.create_task(self._aac_decode_loop())
+
+            self._baichuan_audio_input_active = True
+            self._listen_active = True
+
+            pkt_count = 0
+            audio_count = 0
+
+            while self._active and self._listen_active:
+                try:
+                    # Read next Baichuan message
+                    cmd_id, ext_data, payload = await _read_message(reader)
+                except asyncio.TimeoutError:
+                    continue
+                except (ConnectionError, ValueError) as exc:
+                    _LOGGER.warning("Raw TCP mic: connection error: %s", exc)
+                    break
+
+                if cmd_id == 202 and payload:
+                    pkt_count += 1
+                    # Decrypt payload
+                    dec_payload = _decrypt(payload, aes_key)
+
+                    if pkt_count <= 5:
+                        magic_val = _st.unpack_from("<I", dec_payload, 0)[0] if len(dec_payload) >= 4 else 0
+                        _LOGGER.warning(
+                            "Raw TCP mic pkt #%d: %d bytes, magic=0x%08x",
+                            pkt_count, len(dec_payload), magic_val,
+                        )
+
+                    # Parse as BcMedia audio
+                    pcm_data = self._parse_bcmedia_to_pcm(dec_payload)
+                    if pcm_data:
+                        audio_count += 1
+                        await self._on_audio_received(pcm_data)
+                    else:
+                        # Try raw ADPCM decode
+                        pcm_data = self._try_raw_adpcm_decode(dec_payload)
+                        if pcm_data:
+                            audio_count += 1
+                            await self._on_audio_received(pcm_data)
+
+                    if pkt_count == 50:
+                        _LOGGER.warning(
+                            "Raw TCP mic: 50 pkts, %d decoded as audio", audio_count
+                        )
+                    elif pkt_count % 500 == 0:
+                        _LOGGER.warning(
+                            "Raw TCP mic: %d pkts, %d audio", pkt_count, audio_count
+                        )
+
+                elif cmd_id == 2:
+                    # Heartbeat response — ignore
+                    pass
+
+        except asyncio.CancelledError:
+            _LOGGER.warning("Raw TCP mic: cancelled")
+        except Exception as exc:
+            _LOGGER.warning("Raw TCP mic: error: %s", exc, exc_info=True)
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+            _LOGGER.warning("Raw TCP mic: connection closed")
 
     def _install_baichuan_audio_intercept(self) -> bool:
         """Hook into the Baichuan protocol to intercept incoming CMD 202 audio.
