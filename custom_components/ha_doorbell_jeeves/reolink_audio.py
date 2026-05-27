@@ -1158,6 +1158,87 @@ class ReolinkAudioHandler:
         # Patch the parse method to intercept CMD 202 before status code filtering
         original_parse = getattr(protocol, parse_method_name)
         input_count = [0]  # mutable counter for closure
+        decrypt_mode = [None]  # will be set on first packet: "aes", "none", or "bc"
+
+        def _decrypt_payload(raw_payload: bytes) -> bytes:
+            """Decrypt the audio payload using the Baichuan AES key.
+
+            The Baichuan protocol encrypts CMD 202 audio with AES-128-CFB.
+            Each packet's payload is independently encrypted (fresh cipher per call).
+            """
+            if decrypt_mode[0] == "none":
+                return raw_payload
+
+            # Try AES decryption using the protocol's key
+            aes_key = getattr(bc, "_aes_key", None)
+            if aes_key is None:
+                # No key available — data might be unencrypted
+                if decrypt_mode[0] is None:
+                    decrypt_mode[0] = "none"
+                    _LOGGER.warning("Audio decrypt: no AES key available, assuming unencrypted")
+                return raw_payload
+
+            try:
+                try:
+                    from Cryptodome.Cipher import AES as _AES  # noqa: PLC0415
+                except ImportError:
+                    from Crypto.Cipher import AES as _AES  # noqa: PLC0415
+                AES_IV = b"0123456789abcdef"
+                cipher = _AES.new(key=aes_key, mode=_AES.MODE_CFB, iv=AES_IV, segment_size=128)
+                decrypted = cipher.decrypt(raw_payload)
+
+                # On first packet, verify decryption produced valid audio
+                if decrypt_mode[0] is None:
+                    # Check for BcMedia magic (0x62773130 = "bw10") in decrypted data
+                    import struct as _st
+                    if len(decrypted) >= 4:
+                        magic_val = _st.unpack_from("<I", decrypted, 0)[0]
+                        if magic_val == 0x62773130:
+                            decrypt_mode[0] = "aes"
+                            _LOGGER.warning(
+                                "✓ Audio decrypt: AES decryption CONFIRMED (BcMedia magic found)"
+                            )
+                            return decrypted
+                        # Check if decrypted data has valid ADPCM header (predictor + step_index)
+                        step_idx = decrypted[2]
+                        if step_idx <= 88:
+                            decrypt_mode[0] = "aes"
+                            _LOGGER.warning(
+                                "✓ Audio decrypt: AES decryption likely correct "
+                                "(step_index=%d, first 16 hex: %s)",
+                                step_idx, decrypted[:16].hex(),
+                            )
+                            return decrypted
+                        # Also check if raw (unencrypted) is valid
+                        raw_step_idx = raw_payload[2] if len(raw_payload) > 2 else 255
+                        if raw_step_idx <= 88:
+                            decrypt_mode[0] = "none"
+                            _LOGGER.warning(
+                                "Audio decrypt: raw payload has valid step_index=%d, "
+                                "skipping AES decryption",
+                                raw_step_idx,
+                            )
+                            return raw_payload
+                        # Default to AES since we negotiated with AES encryption
+                        decrypt_mode[0] = "aes"
+                        _LOGGER.warning(
+                            "Audio decrypt: using AES (negotiated enc=%s). "
+                            "Decrypted first 16 hex: %s | Raw first 16 hex: %s",
+                            self._talk_enc_type, decrypted[:16].hex(), raw_payload[:16].hex(),
+                        )
+                    else:
+                        decrypt_mode[0] = "aes"
+
+                return decrypted
+            except ImportError:
+                _LOGGER.error("Audio decrypt: pycryptodome/pycryptodomex not installed")
+                decrypt_mode[0] = "none"
+                return raw_payload
+            except Exception as exc:
+                if decrypt_mode[0] is None:
+                    decrypt_mode[0] = "none"
+                    _LOGGER.warning("Audio decrypt failed (%s), assuming unencrypted", exc)
+                return raw_payload
 
         def _patched_parse() -> None:
             """Patched parser that intercepts CMD 202 audio before normal processing."""
@@ -1203,37 +1284,22 @@ class ReolinkAudioHandler:
             # Extract the binary audio payload (after the Extension XML)
             len_chunk = rec_len_body + len_header
             payload_start = rec_payload_offset + len_header
-            payload = data[payload_start:len_chunk]
+            raw_payload = data[payload_start:len_chunk]
 
-            if payload:
+            if raw_payload:
+                # CRITICAL: Decrypt the payload (Baichuan AES-encrypts audio data)
+                payload = _decrypt_payload(raw_payload)
+
                 input_count[0] += 1
                 if input_count[0] == 1:
-                    import base64 as _b64
                     _LOGGER.warning(
-                        "✓ First audio from doorbell mic via Baichuan FDX (%d bytes payload). "
-                        "First 64 bytes hex: %s | base64(first 256 bytes): %s",
-                        len(payload), payload[:64].hex(),
-                        _b64.b64encode(payload[:256]).decode(),
+                        "✓ First audio from doorbell mic via Baichuan FDX "
+                        "(%d bytes, decrypt=%s). First 32 hex: %s",
+                        len(payload), decrypt_mode[0] or "auto",
+                        payload[:32].hex(),
                     )
                 elif input_count[0] % 500 == 0:
                     _LOGGER.warning("Baichuan audio input: %d packets received", input_count[0])
-
-                # Save first 20 raw payloads for codec analysis
-                if input_count[0] <= 20:
-                    if not hasattr(self, "_raw_audio_payloads"):
-                        self._raw_audio_payloads = bytearray()
-                    self._raw_audio_payloads.extend(payload)
-                    if input_count[0] == 20:
-                        raw_path = "/config/debug_raw_audio_payloads.bin"
-                        try:
-                            with open(raw_path, "wb") as f:
-                                f.write(self._raw_audio_payloads)
-                            _LOGGER.warning(
-                                "Saved %d raw audio payloads (%d bytes) to %s",
-                                20, len(self._raw_audio_payloads), raw_path,
-                            )
-                        except Exception:
-                            _LOGGER.exception("Failed to save raw audio payloads")
 
                 # Parse BcMedia and decode ADPCM → PCM
                 pcm_data = self._parse_bcmedia_to_pcm(payload)
@@ -1242,9 +1308,9 @@ class ReolinkAudioHandler:
                 elif not pcm_data and input_count[0] <= 3:
                     _LOGGER.warning(
                         "Audio input: pcm_data=None for packet #%d (payload=%d bytes, "
-                        "listen_active=%s). Raw hex[:64]: %s",
+                        "listen_active=%s). Hex[:32]: %s",
                         input_count[0], len(payload), self._listen_active,
-                        payload[:64].hex(),
+                        payload[:32].hex(),
                     )
 
             # Consume this message from the buffer
