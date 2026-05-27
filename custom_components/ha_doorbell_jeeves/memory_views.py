@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 from pathlib import Path
@@ -41,7 +42,8 @@ class JeevesCardJSView(HomeAssistantView):
     async def get(self, request: web.Request) -> web.Response:
         """Return the card JavaScript with correct content type."""
         if self._content is None:
-            self._content = _CARD_JS_PATH.read_bytes()
+            loop = asyncio.get_running_loop()
+            self._content = await loop.run_in_executor(None, _CARD_JS_PATH.read_bytes)
         return web.Response(
             body=self._content,
             content_type="application/javascript",

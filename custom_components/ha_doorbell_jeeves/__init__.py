@@ -151,13 +151,24 @@ async def _async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None
 
 async def _register_frontend_resources(hass: HomeAssistant) -> None:
     """Register frontend resources used by optional Lovelace cards."""
+    import hashlib  # noqa: PLC0415
+    from pathlib import Path  # noqa: PLC0415
+
     from .memory_views import card_js_url  # noqa: PLC0415
 
+    # Compute a short hash of the JS file for cache-busting
+    js_file = Path(__file__).parent / "frontend" / "jeeves-memory-timeline-card.js"
+    try:
+        content = js_file.read_bytes()
+        file_hash = hashlib.md5(content).hexdigest()[:8]  # noqa: S324
+    except OSError:
+        file_hash = "1"
+
     # The card JS is served via JeevesCardJSView at /api/ha_doorbell_jeeves/card_js
-    # Tell the HA frontend to load it on every page
+    # Tell the HA frontend to load it on every page with cache-busting
     from homeassistant.components.frontend import add_extra_js_url  # noqa: PLC0415
 
-    js_url = card_js_url()
+    js_url = f"{card_js_url()}?v={file_hash}"
     add_extra_js_url(hass, js_url)
     _LOGGER.debug("Registered memory timeline card resource: %s", js_url)
 
