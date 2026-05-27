@@ -310,11 +310,11 @@ class DoorbellJeevesConfigFlow(ConfigFlow, domain=DOMAIN):
                     ): TextSelector(),
                     vol.Optional(
                         CONF_MEDIA_PLAYER_ENTITY,
-                        default=self._data.get(CONF_MEDIA_PLAYER_ENTITY, ""),
+                        default=self._data.get(CONF_MEDIA_PLAYER_ENTITY) or None,
                     ): EntitySelector(EntitySelectorConfig(domain="media_player")),
                     vol.Optional(
                         CONF_MICROPHONE_ENTITY,
-                        default=self._data.get(CONF_MICROPHONE_ENTITY, ""),
+                        default=self._data.get(CONF_MICROPHONE_ENTITY) or None,
                     ): EntitySelector(EntitySelectorConfig()),
                 }
             ),
@@ -757,11 +757,11 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                     ): TextSelector(),
                     vol.Optional(
                         CONF_MEDIA_PLAYER_ENTITY,
-                        default=self._data.get(CONF_MEDIA_PLAYER_ENTITY, ""),
+                        default=self._data.get(CONF_MEDIA_PLAYER_ENTITY) or None,
                     ): EntitySelector(EntitySelectorConfig(domain="media_player")),
                     vol.Optional(
                         CONF_MICROPHONE_ENTITY,
-                        default=self._data.get(CONF_MICROPHONE_ENTITY, ""),
+                        default=self._data.get(CONF_MICROPHONE_ENTITY) or None,
                     ): EntitySelector(EntitySelectorConfig()),
                 }
             ),
@@ -1434,7 +1434,8 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
 
     async def async_step_identity_settings(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         if user_input is not None:
-            self._data.update(user_input)
+            self._data[CONF_IDENTITY_MODE] = user_input.get(CONF_IDENTITY_MODE, IDENTITY_MODE_NONE)
+            self._data[CONF_FACE_SENSOR_ENTITY] = _clean_text(user_input.get(CONF_FACE_SENSOR_ENTITY, ""))
             return self._save_options()
         return self.async_show_form(
             step_id="identity_settings",
@@ -1451,7 +1452,10 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                             mode=SelectSelectorMode.DROPDOWN,
                         )
                     ),
-                    vol.Optional(CONF_FACE_SENSOR_ENTITY, default=self._data.get(CONF_FACE_SENSOR_ENTITY, "")): EntitySelector(
+                    vol.Optional(
+                        CONF_FACE_SENSOR_ENTITY,
+                        default=self._data.get(CONF_FACE_SENSOR_ENTITY) or None,
+                    ): EntitySelector(
                         EntitySelectorConfig(domain="sensor")
                     ),
                 }
@@ -1533,7 +1537,9 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                 SelectSelectorConfig(options=entity_options or [], mode=SelectSelectorMode.DROPDOWN)
             )
         if include_target_automation:
-            schema[vol.Optional("target_automation", default=defaults.get("target_automation", ""))] = EntitySelector(
+            schema[
+                vol.Optional("target_automation", default=defaults.get("target_automation") or None)
+            ] = EntitySelector(
                 EntitySelectorConfig(domain="automation")
             )
         schema[vol.Required("action_id", default=defaults.get("action_id", ""))] = TextSelector()
