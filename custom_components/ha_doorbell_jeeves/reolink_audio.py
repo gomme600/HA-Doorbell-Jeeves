@@ -350,7 +350,15 @@ class ReolinkAudioHandler:
         return self._active
 
     async def start(self) -> None:
-        """Start 2-way audio: output via Baichuan, input via RTSP/stream."""
+        """Start 2-way audio: output via Baichuan, input via RTSP/ffmpeg.
+
+        Audio input priority:
+          1. ffmpeg with RTSP URL (continuous audio, best quality)
+          2. ffmpeg with FLV/RTMP URL (continuous, fallback)
+          3. Native Baichuan Preview CMD 3 (sparse ~1fps, last resort)
+
+        Audio output always uses Baichuan talk (CMD 201/202).
+        """
         if self._active:
             return
 
@@ -359,24 +367,33 @@ class ReolinkAudioHandler:
 
         self._active = True
 
-        # Create Baichuan connection FIRST — needed for both mic input (CMD 3
-        # Preview) and speaker output (CMD 201/202 Talk).
+        # Create Baichuan connection — needed for speaker output (CMD 201/202)
+        # and as fallback for mic input (CMD 3 Preview).
         bc = await self._get_baichuan_object()
         if bc:
             self._baichuan = bc
 
-            # Try native Baichuan CMD 3 Preview for mic audio input.
-            # This is the most reliable method — uses the camera's native
-            # media stream protocol and doesn't depend on RTSP being enabled.
-            preview_ok = await self._start_preview_stream()
-            if preview_ok:
-                _LOGGER.warning("Audio input: using native Baichuan Preview stream (CMD 3)")
-            else:
-                _LOGGER.warning("Audio input: CMD 3 Preview failed, trying external methods")
-
-        # If Preview didn't work, fall back to external streaming methods
-        if not self._listen_active:
-            await self._start_audio_input()
+        # --- Audio INPUT: prefer ffmpeg/RTSP for continuous audio ---
+        # The native Baichuan Preview stream only provides ~1 audio frame/second
+        # which is insufficient for speech recognition. RTSP gives continuous audio.
+        rtsp_started = await self._start_rtsp_audio_input()
+        if rtsp_started:
+            _LOGGER.warning("Audio input: using ffmpeg/RTSP (continuous audio)")
+        else:
+            # Fallback: try other ffmpeg sources (FLV, RTMP)
+            ffmpeg_started = await self._start_ffmpeg_fallback_input()
+            if ffmpeg_started:
+                _LOGGER.warning("Audio input: using ffmpeg fallback (FLV/RTMP)")
+            elif bc:
+                # Last resort: native Baichuan Preview (sparse but works)
+                preview_ok = await self._start_preview_stream()
+                if preview_ok:
+                    _LOGGER.warning(
+                        "Audio input: using Baichuan Preview (sparse ~1fps, "
+                        "speech recognition may be degraded)"
+                    )
+                else:
+                    _LOGGER.warning("Audio input: ALL methods failed — mic disabled")
 
         # Start Baichuan talk output pipeline (speaker)
         await self._start_output_pipeline()
@@ -441,19 +458,10 @@ class ReolinkAudioHandler:
                     host_obj = entry.runtime_data.host
                     api = host_obj.api
 
-                    # RTMP (preferred — password in query params, no URL-encoding issues)
-                    rtmp_url = api.get_rtmp_stream_source(0, "sub")
-                    if rtmp_url:
-                        self._reolink_rtmp_url = rtmp_url
-                        _LOGGER.warning("Reolink RTMP URL: %s", _mask_stream_url(rtmp_url))
+                    # --- Ensure RTSP is enabled (critical for continuous audio) ---
+                    await self._ensure_rtsp_enabled(api)
 
-                    # HTTP-FLV (second choice — also query-param auth)
-                    flv_url = api.get_flv_stream_source(0, "sub")
-                    if flv_url:
-                        self._reolink_flv_url = flv_url
-                        _LOGGER.warning("Reolink FLV URL: %s", _mask_stream_url(flv_url))
-
-                    # RTSP (last resort — password in URL userinfo, prone to encoding issues)
+                    # RTSP (preferred — continuous audio stream)
                     port = api.rtsp_port
                     if port:
                         self._reolink_rtsp_port = port
@@ -461,6 +469,18 @@ class ReolinkAudioHandler:
                     if rtsp_url:
                         self._reolink_rtsp_url = rtsp_url
                         _LOGGER.warning("Reolink RTSP URL: %s", _mask_stream_url(rtsp_url))
+
+                    # HTTP-FLV (fallback — also continuous audio over HTTP)
+                    flv_url = api.get_flv_stream_source(0, "sub")
+                    if flv_url:
+                        self._reolink_flv_url = flv_url
+                        _LOGGER.warning("Reolink FLV URL: %s", _mask_stream_url(flv_url))
+
+                    # RTMP (fallback — continuous if port 1935 is open)
+                    rtmp_url = api.get_rtmp_stream_source(0, "sub")
+                    if rtmp_url:
+                        self._reolink_rtmp_url = rtmp_url
+                        _LOGGER.warning("Reolink RTMP URL: %s", _mask_stream_url(rtmp_url))
                 except Exception as exc:
                     _LOGGER.warning("Could not get stream details from Reolink Host: %s", exc)
 
@@ -485,6 +505,293 @@ class ReolinkAudioHandler:
 
         if not self._reolink_host:
             _LOGGER.warning("Could not discover Reolink host — audio output may not work")
+
+    async def _ensure_rtsp_enabled(self, api: Any) -> None:
+        """Check if RTSP is enabled on the camera and enable it if not.
+
+        Many Reolink cameras (especially doorbells) ship with RTSP disabled.
+        The Baichuan protocol can enable it remotely via CMD 36 (SetNetPort).
+        RTSP provides continuous audio at full sample rate — essential for
+        speech recognition that the sparse Baichuan Preview stream cannot deliver.
+        """
+        try:
+            bc = api.baichuan if hasattr(api, "baichuan") else None
+            if not bc:
+                _LOGGER.info("Cannot check RTSP state — no Baichuan object on API")
+                return
+
+            # Check current RTSP state
+            rtsp_enabled = bc.rtsp_enabled
+            rtsp_port = bc.rtsp_port
+
+            if rtsp_enabled:
+                _LOGGER.warning(
+                    "✓ RTSP already enabled (port %s)", rtsp_port or 554
+                )
+                return
+
+            if rtsp_enabled is None:
+                # Port state unknown — try to query it
+                _LOGGER.warning("RTSP state unknown — attempting to query ports...")
+                try:
+                    from reolink_aio.baichuan import PortType  # noqa: PLC0415
+                    # get_ports() refreshes the _ports dict
+                    if hasattr(bc, "get_ports"):
+                        await bc.get_ports()
+                    rtsp_enabled = bc.rtsp_enabled
+                    if rtsp_enabled:
+                        _LOGGER.warning("✓ RTSP already enabled (after refresh)")
+                        return
+                except Exception as exc:
+                    _LOGGER.warning("Could not query port state: %s", exc)
+
+            # RTSP is disabled — enable it
+            _LOGGER.warning("RTSP is DISABLED — enabling via Baichuan CMD 36...")
+            try:
+                from reolink_aio.baichuan import PortType  # noqa: PLC0415
+                await bc.set_port_enabled(PortType.rtsp, True)
+                _LOGGER.warning("✓ RTSP enable command sent — waiting for port to come up...")
+                # Give the camera time to open the port
+                await asyncio.sleep(3)
+
+                # Verify it worked
+                if hasattr(bc, "get_ports"):
+                    await bc.get_ports()
+                if bc.rtsp_enabled:
+                    _LOGGER.warning(
+                        "✓ RTSP enabled successfully! (port %s)",
+                        bc.rtsp_port or 554,
+                    )
+                    if bc.rtsp_port:
+                        self._reolink_rtsp_port = bc.rtsp_port
+                else:
+                    _LOGGER.warning("RTSP enable sent but state still shows disabled")
+            except Exception as exc:
+                _LOGGER.warning("Failed to enable RTSP: %s", exc)
+        except Exception as exc:
+            _LOGGER.warning("Error checking/enabling RTSP: %s", exc)
+
+    async def _start_rtsp_audio_input(self) -> bool:
+        """Start continuous audio capture via ffmpeg reading from RTSP.
+
+        RTSP provides a proper media stream with continuous audio frames
+        at the camera's native sample rate (typically 16kHz AAC or G.711).
+        ffmpeg decodes this to raw 16kHz mono PCM which is forwarded to Gemini.
+
+        Returns True if ffmpeg successfully connected to the RTSP stream.
+        """
+        rtsp_url = getattr(self, "_reolink_rtsp_url", None)
+        if not rtsp_url:
+            _LOGGER.info("No RTSP URL available — skipping RTSP audio input")
+            return False
+
+        _LOGGER.warning("Audio input: trying RTSP → %s", _mask_stream_url(rtsp_url))
+
+        # Build ffmpeg command for low-latency audio extraction
+        ffmpeg_args = [
+            "ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostats",
+            "-rtsp_transport", "tcp",
+            "-fflags", "+nobuffer+flush_packets",
+            "-flags", "low_delay",
+            "-analyzeduration", "500000",  # 500ms — faster stream analysis
+            "-probesize", "500000",
+            "-i", rtsp_url,
+            "-vn",  # No video — audio only
+            "-acodec", "pcm_s16le",
+            "-ar", str(AUDIO_INPUT_SAMPLE_RATE),
+            "-ac", "1",
+            "-f", "s16le",
+            "pipe:1",
+        ]
+
+        proc = await asyncio.create_subprocess_exec(
+            *ffmpeg_args,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        # Wait briefly to see if connection succeeds
+        await asyncio.sleep(1.0)
+        if proc.returncode is not None:
+            stderr_data = b""
+            try:
+                stderr_data = await asyncio.wait_for(proc.stderr.read(2000), timeout=2.0)
+            except Exception:
+                pass
+            _LOGGER.warning(
+                "RTSP audio: ffmpeg failed (rc=%d): %s",
+                proc.returncode,
+                stderr_data.decode(errors="replace").strip()[:300] if stderr_data else "no stderr",
+            )
+            return False
+
+        # Wait a bit more to confirm data is flowing
+        await asyncio.sleep(2.0)
+        if proc.returncode is not None:
+            stderr_data = b""
+            try:
+                stderr_data = await asyncio.wait_for(proc.stderr.read(2000), timeout=2.0)
+            except Exception:
+                pass
+            _LOGGER.warning(
+                "RTSP audio: ffmpeg died after connect (rc=%d): %s",
+                proc.returncode,
+                stderr_data.decode(errors="replace").strip()[:300] if stderr_data else "no stderr",
+            )
+            return False
+
+        # ffmpeg is running and reading from RTSP — start the read loop
+        _LOGGER.warning("✓ RTSP audio input connected (ffmpeg PID=%d)", proc.pid)
+        self._listen_active = True
+        self._input_processor_task = asyncio.create_task(
+            self._ffmpeg_audio_read_loop(proc, "RTSP")
+        )
+        return True
+
+    async def _start_ffmpeg_fallback_input(self) -> bool:
+        """Try FLV and RTMP URLs via ffmpeg as fallback for audio input.
+
+        These are tried when RTSP is unavailable/failed. FLV tunnels RTMP
+        over HTTP (port 80) which is often open even when RTMP port 1935 is closed.
+
+        Returns True if any source connected successfully.
+        """
+        urls_to_try: list[tuple[str, str]] = []
+
+        # HTTP-FLV (tunnels RTMP over HTTP — high likelihood of working)
+        flv_url = getattr(self, "_reolink_flv_url", None)
+        if flv_url:
+            urls_to_try.append((flv_url, "FLV"))
+
+        # Direct RTMP (often port 1935 is blocked)
+        rtmp_url = getattr(self, "_reolink_rtmp_url", None)
+        if rtmp_url:
+            urls_to_try.append((rtmp_url, "RTMP"))
+
+        if not urls_to_try:
+            return False
+
+        for url, label in urls_to_try:
+            _LOGGER.warning("Audio input fallback: trying %s → %s", label, _mask_stream_url(url))
+
+            ffmpeg_args = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostats"]
+            if url.startswith("rtmp://"):
+                ffmpeg_args.extend(["-live_start_index", "-1"])
+            elif url.startswith("https://"):
+                ffmpeg_args.extend(["-tls_verify", "0"])
+            ffmpeg_args.extend([
+                "-fflags", "+nobuffer+flush_packets",
+                "-analyzeduration", "1000000",
+                "-probesize", "1000000",
+                "-i", url,
+                "-vn",
+                "-acodec", "pcm_s16le",
+                "-ar", str(AUDIO_INPUT_SAMPLE_RATE),
+                "-ac", "1",
+                "-f", "s16le",
+                "pipe:1",
+            ])
+
+            proc = await asyncio.create_subprocess_exec(
+                *ffmpeg_args,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            await asyncio.sleep(1.5)
+            if proc.returncode is not None:
+                stderr_data = b""
+                try:
+                    stderr_data = await asyncio.wait_for(proc.stderr.read(2000), timeout=1.0)
+                except Exception:
+                    pass
+                _LOGGER.warning(
+                    "%s audio: ffmpeg failed (rc=%d): %s",
+                    label, proc.returncode,
+                    stderr_data.decode(errors="replace").strip()[:200] if stderr_data else "",
+                )
+                continue
+
+            await asyncio.sleep(2.0)
+            if proc.returncode is not None:
+                continue
+
+            # Connected!
+            _LOGGER.warning("✓ %s audio input connected (ffmpeg PID=%d)", label, proc.pid)
+            self._listen_active = True
+            self._input_processor_task = asyncio.create_task(
+                self._ffmpeg_audio_read_loop(proc, label)
+            )
+            return True
+
+        return False
+
+    async def _ffmpeg_audio_read_loop(
+        self, proc: asyncio.subprocess.Process, source_label: str
+    ) -> None:
+        """Continuously read PCM from ffmpeg stdout and forward to Gemini.
+
+        Reads in 20ms chunks (640 bytes at 16kHz/16-bit/mono) for minimal latency.
+        Applies AGC amplification to compensate for low doorbell mic levels.
+        """
+        CHUNK_SIZE = 640  # 20ms @ 16kHz mono 16-bit
+        chunks_sent = 0
+
+        try:
+            while self._active and self._listen_active and proc.returncode is None:
+                try:
+                    pcm_data = await proc.stdout.readexactly(CHUNK_SIZE)
+                except asyncio.IncompleteReadError as err:
+                    pcm_data = err.partial
+                    if not pcm_data:
+                        break
+
+                if chunks_sent == 0:
+                    _LOGGER.warning(
+                        "✓ First continuous audio from doorbell mic via %s (%d bytes PCM @ %dHz)",
+                        source_label, len(pcm_data), AUDIO_INPUT_SAMPLE_RATE,
+                    )
+                elif chunks_sent == 50:
+                    _LOGGER.warning(
+                        "Audio input: %s streaming steadily (%d chunks = 1.0s)",
+                        source_label, chunks_sent,
+                    )
+
+                chunks_sent += 1
+                # Forward via AGC amplifier
+                await self._on_audio_received(pcm_data)
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            _LOGGER.warning("%s audio input error: %s", source_label, exc)
+        finally:
+            if proc and proc.returncode is None:
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=3.0)
+                except (asyncio.TimeoutError, Exception):
+                    proc.kill()
+            # Read any stderr for diagnostics
+            if proc and proc.stderr:
+                try:
+                    stderr_data = await asyncio.wait_for(proc.stderr.read(2000), timeout=1.0)
+                    if stderr_data:
+                        _LOGGER.warning(
+                            "%s ffmpeg stderr: %s",
+                            source_label,
+                            stderr_data.decode(errors="replace").strip()[:300],
+                        )
+                except Exception:
+                    pass
+            self._listen_active = False
+            _LOGGER.warning(
+                "Audio input: %s stream ended (sent %d chunks = %.1fs of audio)",
+                source_label, chunks_sent, chunks_sent * 0.02,
+            )
+
 
     async def stop(self) -> None:
         """Stop the audio handler and all subprocesses."""
