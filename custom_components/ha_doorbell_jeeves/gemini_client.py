@@ -154,12 +154,14 @@ class GeminiLiveClient(BaseRealtimeClient):
     async def request_recap(self, outcome: str, timeout: float = 8.0) -> dict[str, str] | None:
         """Ask the live model to generate a session recap as text before disconnecting.
 
-        The model already has full context of the conversation. We ask it to output
-        a structured JSON recap. This avoids a separate text-model API call and uses
-        the live session's unlimited quota.
-
-        Returns parsed recap dict or None on failure/timeout.
+        Returns parsed recap dict or None if the model doesn't support text output.
+        Currently, native audio dialog models only support AUDIO modality, so this
+        will return None immediately. Kept for future models that support mixed output.
         """
+        # Native audio models can only output audio — skip to avoid timeout delay
+        if "native-audio" in self._model:
+            return None
+
         if not self._session or not self._connected:
             return None
 
