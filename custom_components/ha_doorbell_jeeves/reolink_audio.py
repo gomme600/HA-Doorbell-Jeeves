@@ -1104,65 +1104,53 @@ class ReolinkAudioHandler:
         if not bc:
             return False
 
-        # Find the protocol via multiple paths
+        # Find the protocol via multiple paths (varies by reolink_aio version)
         protocol = None
         connection = getattr(bc, "_connection", None)
 
-        if connection:
-            # Method 1: Direct attribute access
+        # Method 1: bc._protocol (works on HA's reolink_aio version)
+        if hasattr(bc, "_protocol") and bc._protocol:
+            protocol = bc._protocol
+
+        # Method 2: connection._protocol
+        if not protocol and connection:
             protocol = getattr(connection, "_protocol", None)
 
-            # Method 2: Use asyncio transport.get_protocol() (standard API)
-            if not protocol:
-                transport = getattr(connection, "_transport", None)
-                if transport and hasattr(transport, "get_protocol"):
-                    protocol = transport.get_protocol()
-
-            _LOGGER.warning(
-                "Baichuan intercept: connection=%s, protocol=%s, transport=%s",
-                type(connection).__name__,
-                type(protocol).__name__ if protocol else "None",
-                "yes" if getattr(connection, "_transport", None) else "no",
-            )
+        # Method 3: transport.get_protocol() (standard asyncio)
+        if not protocol and connection:
+            transport = getattr(connection, "_transport", None)
+            if transport and hasattr(transport, "get_protocol"):
+                protocol = transport.get_protocol()
 
         if not protocol:
-            _LOGGER.warning(
-                "Cannot install audio intercept: no protocol found. "
-                "Trying bc-level attributes..."
-            )
-            # Method 3: Check bc._protocol or bc._connection.protocol (property)
-            if hasattr(bc, "_protocol"):
-                protocol = bc._protocol
-            if not protocol and connection:
-                for attr in ["protocol", "_tcp_protocol", "_client_protocol"]:
-                    if hasattr(connection, attr):
-                        protocol = getattr(connection, attr)
-                        if protocol:
-                            break
-
-        if not protocol:
-            _LOGGER.warning(
-                "Audio intercept FAILED: no protocol anywhere. "
-                "connection type=%s, connection attrs=%s",
-                type(connection).__name__ if connection else "None",
-                sorted([a for a in dir(connection) if not a.startswith("__")])[:30] if connection else "N/A",
-            )
+            _LOGGER.warning("Audio intercept FAILED: no protocol found on Baichuan object")
             return False
 
-        if not hasattr(protocol, "parse_bc_data"):
+        # Find the correct parse method name (varies by reolink_aio version)
+        parse_method_name = None
+        for name in ["parse_bc_data", "parse_data"]:
+            if hasattr(protocol, name):
+                parse_method_name = name
+                break
+
+        if not parse_method_name:
             _LOGGER.warning(
-                "Protocol %s has no parse_bc_data — attrs: %s",
+                "Protocol %s has no parse method — attrs: %s",
                 type(protocol).__name__,
                 sorted([a for a in dir(protocol) if not a.startswith("__")])[:20],
             )
             return False
 
-        # Patch parse_bc_data to intercept CMD 202 before status code filtering
-        original_parse = protocol.parse_bc_data
-        input_count = [0]  # mutable counter for closure
-        from reolink_aio.baichuan.util import HEADER_MAGIC  # noqa: PLC0415
+        _LOGGER.warning(
+            "Installing audio intercept on %s.%s",
+            type(protocol).__name__, parse_method_name,
+        )
 
-        def _patched_parse_bc_data() -> None:
+        # Patch the parse method to intercept CMD 202 before status code filtering
+        original_parse = getattr(protocol, parse_method_name)
+        input_count = [0]  # mutable counter for closure
+
+        def _patched_parse() -> None:
             """Patched parser that intercepts CMD 202 audio before normal processing."""
             data = protocol._data
             if not data or len(data) < 20:
@@ -1216,25 +1204,26 @@ class ReolinkAudioHandler:
                         len(payload),
                     )
                 elif input_count[0] % 500 == 0:
-                    _LOGGER.info("Baichuan audio input: %d packets received", input_count[0])
+                    _LOGGER.warning("Baichuan audio input: %d packets received", input_count[0])
 
                 # Parse BcMedia and decode ADPCM → PCM
                 pcm_data = self._parse_bcmedia_to_pcm(payload)
                 if pcm_data and self._listen_active:
                     asyncio.ensure_future(self._on_audio_received(pcm_data))
 
-            # Consume this message from the buffer (same as what parse_bc_data does)
+            # Consume this message from the buffer
             if len_body > rec_len_body:
                 protocol._data = data[len_chunk:]
-                # Check if there are more messages to parse
-                if protocol._data and protocol._data[0:4].hex() == HEADER_MAGIC:
-                    _patched_parse_bc_data()
+                # Parse next message if present
+                if protocol._data and len(protocol._data) >= 4:
+                    magic_hex = protocol._data[0:4].hex()
+                    if magic_hex == "f0debc0a":  # Baichuan HEADER_MAGIC
+                        _patched_parse()
             else:
                 protocol._data = b""
 
-        protocol.parse_bc_data = _patched_parse_bc_data
-        _LOGGER.info("Baichuan audio intercept installed (CMD 202 parser patch)")
-        return True
+        setattr(protocol, parse_method_name, _patched_parse)
+        _LOGGER.warning("✓ Baichuan audio intercept installed on %s", parse_method_name)
         return True
 
     def _parse_bcmedia_to_pcm(self, payload: bytes) -> bytes | None:
