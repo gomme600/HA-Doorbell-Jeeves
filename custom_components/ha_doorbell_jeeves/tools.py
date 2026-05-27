@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from homeassistant import config_entries
+from homeassistant.components.camera import async_get_image as ha_camera_get_image
 from homeassistant.core import HomeAssistant
 
 from .const import (
@@ -759,7 +760,7 @@ async def _execute_view_camera(
         return {"error": f"Camera '{camera_id}' not in managed entities."}
 
     try:
-        image = await hass.components.camera.async_get_image(camera_id, timeout=10)
+        image = await ha_camera_get_image(hass, camera_id, timeout=10)
         if not image:
             return {"error": f"Could not get image from {camera_id}"}
 

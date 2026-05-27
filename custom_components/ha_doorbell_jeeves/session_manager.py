@@ -9,6 +9,7 @@ import logging
 import time
 from typing import Any
 
+from homeassistant.components.camera import async_get_image as ha_camera_get_image
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import CALLBACK_TYPE, Event, HomeAssistant, callback
 from homeassistant.helpers.event import async_track_state_change_event
@@ -269,15 +270,16 @@ class JeevesSessionManager:
         try:
             _LOGGER.warning("async_start_session: beginning startup sequence")
 
-            # Capture visitor snapshot immediately (camera is most likely available now)
-            self._session_start_snapshot = await self._capture_memory_snapshot()
-            if self._session_start_snapshot:
-                _LOGGER.debug("Captured session start snapshot (%d bytes)", len(self._session_start_snapshot))
-
             # Lazy Reolink go2rtc setup (deferred from entry load for timing)
             if getattr(self, "reolink_needs_setup", False):
                 await self._lazy_setup_reolink()
                 self.reolink_needs_setup = False
+
+            # Capture visitor snapshot immediately after go2rtc is ready
+            # (camera HTTP API + go2rtc fallback both available now)
+            self._session_start_snapshot = await self._capture_memory_snapshot()
+            if self._session_start_snapshot:
+                _LOGGER.info("Captured session start snapshot (%d bytes)", len(self._session_start_snapshot))
 
             config = self._config
             provider = config.get(CONF_PROVIDER, PROVIDER_GEMINI)
@@ -734,10 +736,10 @@ class JeevesSessionManager:
         while self._active:
             try:
                 image_bytes: bytes | None = None
-                # Primary: HA camera snapshot API (HTTP API, independent of RTSP)
+                # Primary: HA camera snapshot API
                 try:
-                    image = await self.hass.components.camera.async_get_image(
-                        camera_entity, timeout=5
+                    image = await ha_camera_get_image(
+                        self.hass, camera_entity, timeout=5
                     )
                     if image and image.content:
                         image_bytes = image.content
@@ -1222,13 +1224,16 @@ class JeevesSessionManager:
         self._session_memory_saved = True
 
     async def _capture_memory_snapshot(self) -> str:
-        """Capture a camera image to attach to the stored memory."""
+        """Capture a camera image to attach to the stored memory.
+
+        Tries HA camera API first, falls back to go2rtc JPEG snapshot.
+        """
         camera_entity = self._config.get(CONF_CAMERA_ENTITY, "")
         if not camera_entity:
             _LOGGER.warning("No camera entity configured for memory snapshot")
             return ""
         try:
-            image = await self.hass.components.camera.async_get_image(camera_entity, timeout=5)
+            image = await ha_camera_get_image(self.hass, camera_entity, timeout=5)
             if image and image.content:
                 b64 = base64.b64encode(image.content).decode("ascii")
                 _LOGGER.info(
@@ -1239,7 +1244,19 @@ class JeevesSessionManager:
                 return b64
             _LOGGER.warning("Camera %s returned empty image", camera_entity)
         except Exception:
-            _LOGGER.warning("Failed to capture memory snapshot from %s", camera_entity, exc_info=True)
+            _LOGGER.debug("HA camera API failed for snapshot, trying go2rtc fallback", exc_info=True)
+        # Fallback: go2rtc JPEG snapshot
+        go2rtc_stream = self._config.get(CONF_GO2RTC_STREAM_NAME, "")
+        if go2rtc_stream:
+            try:
+                frame_bytes = await self._go2rtc_snapshot(go2rtc_stream)
+                if frame_bytes:
+                    b64 = base64.b64encode(frame_bytes).decode("ascii")
+                    _LOGGER.info("Memory snapshot captured via go2rtc (%d bytes)", len(frame_bytes))
+                    return b64
+            except Exception:
+                _LOGGER.debug("go2rtc snapshot fallback also failed", exc_info=True)
+        _LOGGER.warning("Failed to capture memory snapshot from %s (all methods)", camera_entity)
         return ""
 
     async def _generate_session_recap(

@@ -9,6 +9,7 @@ import logging
 import time
 from typing import Any
 
+from homeassistant.components.camera import async_get_image as ha_camera_get_image
 from homeassistant.core import HomeAssistant
 
 from .const import (
@@ -294,7 +295,7 @@ class SecurityManager:
         if not camera_entity:
             return None
         try:
-            image = await self._hass.components.camera.async_get_image(camera_entity, timeout=5)
+            image = await ha_camera_get_image(self._hass, camera_entity, timeout=5)
             if image:
                 return base64.b64encode(image.content).decode("ascii")
         except Exception:
