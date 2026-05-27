@@ -190,25 +190,27 @@ class ToolRouter:
         from google import genai  # noqa: PLC0415
         from google.genai import types  # noqa: PLC0415
 
-        # genai.Client() does blocking I/O — run in executor
-        loop = asyncio.get_event_loop()
-        client = await loop.run_in_executor(
-            None, lambda: genai.Client(api_key=self._api_key)
-        )
-
         # Build messages
         messages = self._build_tool_check_messages(new_turns)
 
         try:
-            response = await client.aio.models.generate_content(
-                model=self._model,
-                contents=[types.Content(role="user", parts=[types.Part(text=messages)])],
-                config=types.GenerateContentConfig(
-                    system_instruction=self._build_tool_system_prompt(),
-                    tools=self._tools if self._tools else None,
-                    temperature=0.1,
-                ),
-            )
+            # Google GenAI can perform blocking file/network operations (for example
+            # netrc lookup) even in async paths, so run the request fully off-loop.
+            loop = asyncio.get_running_loop()
+
+            def _request() -> Any:
+                client = genai.Client(api_key=self._api_key)
+                return client.models.generate_content(
+                    model=self._model,
+                    contents=[types.Content(role="user", parts=[types.Part(text=messages)])],
+                    config=types.GenerateContentConfig(
+                        system_instruction=self._build_tool_system_prompt(),
+                        tools=self._tools if self._tools else None,
+                        temperature=0.1,
+                    ),
+                )
+
+            response = await loop.run_in_executor(None, _request)
         except Exception:
             _LOGGER.exception("Gemini tool model request failed")
             return []
