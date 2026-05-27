@@ -888,7 +888,7 @@ class JeevesSessionManager:
             _LOGGER.warning("Audio diagnostic: google-genai not available")
             return
 
-        api_key = self._config.get("gemini_api_key", "")
+        api_key = self._config.get("api_key", "")
         if not api_key:
             _LOGGER.warning("Audio diagnostic: no API key configured")
             return
@@ -922,7 +922,7 @@ class JeevesSessionManager:
                 ),
             )
 
-            model = self._config.get("gemini_model", "gemini-2.5-flash-native-audio-latest")
+            model = self._config.get("model", "gemini-2.5-flash-native-audio-latest")
             async with client.aio.live.connect(model=model, config=config) as session:
                 # Send audio at real-time rate
                 CHUNK = 4096
