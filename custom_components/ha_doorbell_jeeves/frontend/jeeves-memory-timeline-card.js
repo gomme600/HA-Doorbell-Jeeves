@@ -130,10 +130,11 @@ class JeevesMemoryTimelineCardEditor extends HTMLElement {
       if (el) el.addEventListener("input", () => this._onChange());
     });
 
-    // Auto-emit config if entity dropdown has a value but config doesn't
+    // Auto-emit config if entity dropdown has a value but config doesn't.
+    // Use setTimeout to ensure the editor is connected to DOM first.
     const entitySelect = this.shadowRoot.getElementById("entity");
     if (entitySelect && entitySelect.value && !this._config.entity) {
-      this._onChange();
+      setTimeout(() => this._onChange(), 100);
     }
   }
 
@@ -213,6 +214,16 @@ class JeevesMemoryTimelineCard extends HTMLElement {
 
   set hass(hass) {
     this._hass = hass;
+    // Auto-detect entity if not configured
+    if (!this._config.entity && hass && hass.states) {
+      const autoEntity = Object.keys(hass.states).find(
+        (e) => e.startsWith("sensor.") && e.includes("memory_feed")
+      );
+      if (autoEntity) {
+        this._config = { ...this._config, entity: autoEntity };
+        this._needsEntity = false;
+      }
+    }
     this._render();
   }
 
