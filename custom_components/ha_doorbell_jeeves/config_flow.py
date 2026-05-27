@@ -621,129 +621,150 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
         )
 
     async def async_step_audio(self, user_input: dict[str, Any] | None = None) -> FlowResult:
-        errors: dict[str, str] = {}
-        audio_mode = self._data.get(CONF_AUDIO_MODE, AUDIO_MODE_REOLINK)
-        manual_mode = self._data.get(CONF_AUDIO_MANUAL_MODE, DEFAULT_AUDIO_MANUAL_MODE)
-        reolink_options = _reolink_entry_selector_options(self.hass)
-
         if user_input is not None:
             audio_mode = user_input.get(CONF_AUDIO_MODE, AUDIO_MODE_REOLINK)
             self._data[CONF_AUDIO_MODE] = audio_mode
-
             if audio_mode == AUDIO_MODE_REOLINK:
-                reolink_entry_id = _clean_text(user_input.get(CONF_REOLINK_ENTRY_ID, ""))
-                if not reolink_entry_id:
-                    errors[CONF_REOLINK_ENTRY_ID] = "required"
-                elif not any(option["value"] == reolink_entry_id for option in reolink_options):
-                    errors["base"] = "no_reolink_found"
-                else:
-                    self._data[CONF_REOLINK_ENTRY_ID] = reolink_entry_id
-                    self._data[CONF_AUDIO_OUTPUT_MODE] = AUDIO_OUTPUT_GO2RTC
-                    self._data.pop(CONF_AUDIO_MANUAL_MODE, None)
-                    self._data.pop(CONF_GO2RTC_STREAM_NAME, None)
-                    self._data.pop(CONF_MEDIA_PLAYER_ENTITY, None)
-                    self._data.pop(CONF_MICROPHONE_ENTITY, None)
-                    trigger_entity = _auto_detect_reolink_trigger_entity(self.hass, reolink_entry_id)
-                    if trigger_entity:
-                        self._data["doorbell_trigger_entity"] = trigger_entity
-                    return self._save_options()
-            else:
-                manual_mode = user_input.get(CONF_AUDIO_MANUAL_MODE, DEFAULT_AUDIO_MANUAL_MODE)
-                if manual_mode == AUDIO_MANUAL_EXTERNAL_GO2RTC:
-                    if not _clean_text(user_input.get(CONF_GO2RTC_STREAM_NAME, "")):
-                        errors[CONF_GO2RTC_STREAM_NAME] = "required"
-                elif manual_mode == AUDIO_MANUAL_HA_ENTITIES:
-                    if not user_input.get(CONF_MEDIA_PLAYER_ENTITY):
-                        errors[CONF_MEDIA_PLAYER_ENTITY] = "required"
-                    if not user_input.get(CONF_MICROPHONE_ENTITY):
-                        errors[CONF_MICROPHONE_ENTITY] = "required"
-
-                if not errors:
-                    self._data[CONF_AUDIO_MANUAL_MODE] = str(manual_mode)
-                    self._data.pop(CONF_REOLINK_ENTRY_ID, None)
-                    self._data.pop("doorbell_trigger_entity", None)
-                    if manual_mode == AUDIO_MANUAL_EXTERNAL_GO2RTC:
-                        self._data[CONF_GO2RTC_STREAM_NAME] = _clean_text(
-                            user_input.get(CONF_GO2RTC_STREAM_NAME, "")
-                        )
-                        self._data[CONF_AUDIO_OUTPUT_MODE] = AUDIO_OUTPUT_EVENT
-                        self._data.pop(CONF_MEDIA_PLAYER_ENTITY, None)
-                        self._data.pop(CONF_MICROPHONE_ENTITY, None)
-                    else:
-                        self._data[CONF_MEDIA_PLAYER_ENTITY] = _clean_text(
-                            user_input.get(CONF_MEDIA_PLAYER_ENTITY, "")
-                        )
-                        self._data[CONF_MICROPHONE_ENTITY] = _clean_text(
-                            user_input.get(CONF_MICROPHONE_ENTITY, "")
-                        )
-                        self._data[CONF_AUDIO_OUTPUT_MODE] = AUDIO_OUTPUT_MEDIA_PLAYER
-                        self._data.pop(CONF_GO2RTC_STREAM_NAME, None)
-                    return self._save_options()
-
-        schema: dict[Any, Any] = {
-            vol.Required(CONF_AUDIO_MODE, default=audio_mode): SelectSelector(
-                SelectSelectorConfig(
-                    options=[
-                        {"value": AUDIO_MODE_REOLINK, "label": "Reolink native (auto)"},
-                        {"value": AUDIO_MODE_MANUAL, "label": "Manual setup"},
-                    ],
-                    mode=SelectSelectorMode.DROPDOWN,
-                )
-            )
-        }
-
-        if audio_mode == AUDIO_MODE_REOLINK:
-            if reolink_options:
-                schema[
-                    vol.Required(
-                        CONF_REOLINK_ENTRY_ID,
-                        default=self._data.get(CONF_REOLINK_ENTRY_ID, ""),
-                    )
-                ] = SelectSelector(
-                    SelectSelectorConfig(options=reolink_options, mode=SelectSelectorMode.DROPDOWN)
-                )
-            else:
-                errors["base"] = "no_reolink_found"
-        else:
-            schema[
-                vol.Required(
-                    CONF_AUDIO_MANUAL_MODE,
-                    default=manual_mode,
-                )
-            ] = SelectSelector(
-                SelectSelectorConfig(
-                    options=[
-                        {"value": AUDIO_MANUAL_EXTERNAL_GO2RTC, "label": "External go2rtc stream"},
-                        {
-                            "value": AUDIO_MANUAL_HA_ENTITIES,
-                            "label": "Home Assistant entities (speaker + microphone)",
-                        },
-                    ],
-                    mode=SelectSelectorMode.DROPDOWN,
-                )
-            )
-            schema[
-                vol.Optional(
-                    CONF_GO2RTC_STREAM_NAME,
-                    default=self._data.get(CONF_GO2RTC_STREAM_NAME, ""),
-                )
-            ] = TextSelector()
-            schema[
-                vol.Optional(
-                    CONF_MEDIA_PLAYER_ENTITY,
-                    default=self._data.get(CONF_MEDIA_PLAYER_ENTITY, ""),
-                )
-            ] = EntitySelector(EntitySelectorConfig(domain="media_player"))
-            schema[
-                vol.Optional(
-                    CONF_MICROPHONE_ENTITY,
-                    default=self._data.get(CONF_MICROPHONE_ENTITY, ""),
-                )
-            ] = EntitySelector(EntitySelectorConfig())
+                return await self.async_step_audio_reolink()
+            return await self.async_step_audio_manual()
 
         return self.async_show_form(
             step_id="audio",
-            data_schema=vol.Schema(schema),
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_AUDIO_MODE,
+                        default=self._data.get(CONF_AUDIO_MODE, AUDIO_MODE_REOLINK),
+                    ): SelectSelector(
+                        SelectSelectorConfig(
+                            options=[
+                                {"value": AUDIO_MODE_REOLINK, "label": "Reolink native (auto)"},
+                                {"value": AUDIO_MODE_MANUAL, "label": "Manual setup"},
+                            ],
+                            mode=SelectSelectorMode.DROPDOWN,
+                        )
+                    )
+                }
+            ),
+        )
+
+    async def async_step_audio_reolink(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        errors: dict[str, str] = {}
+        reolink_options = _reolink_entry_selector_options(self.hass)
+        if not reolink_options:
+            errors["base"] = "no_reolink_found"
+            return self.async_show_form(
+                step_id="audio_reolink",
+                data_schema=vol.Schema({}),
+                errors=errors,
+            )
+
+        if user_input is not None:
+            reolink_entry_id = _clean_text(user_input.get(CONF_REOLINK_ENTRY_ID, ""))
+            if not reolink_entry_id:
+                errors[CONF_REOLINK_ENTRY_ID] = "required"
+            elif not any(option["value"] == reolink_entry_id for option in reolink_options):
+                errors["base"] = "no_reolink_found"
+            else:
+                self._data[CONF_AUDIO_MODE] = AUDIO_MODE_REOLINK
+                self._data[CONF_REOLINK_ENTRY_ID] = reolink_entry_id
+                self._data[CONF_AUDIO_OUTPUT_MODE] = AUDIO_OUTPUT_GO2RTC
+                self._data.pop(CONF_AUDIO_MANUAL_MODE, None)
+                self._data.pop(CONF_GO2RTC_STREAM_NAME, None)
+                self._data.pop(CONF_MEDIA_PLAYER_ENTITY, None)
+                self._data.pop(CONF_MICROPHONE_ENTITY, None)
+
+                trigger_entity = _auto_detect_reolink_trigger_entity(self.hass, reolink_entry_id)
+                if trigger_entity:
+                    self._data["doorbell_trigger_entity"] = trigger_entity
+                return self._save_options()
+
+        return self.async_show_form(
+            step_id="audio_reolink",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_REOLINK_ENTRY_ID,
+                        default=self._data.get(CONF_REOLINK_ENTRY_ID, ""),
+                    ): SelectSelector(
+                        SelectSelectorConfig(options=reolink_options, mode=SelectSelectorMode.DROPDOWN)
+                    )
+                }
+            ),
+            errors=errors,
+        )
+
+    async def async_step_audio_manual(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        errors: dict[str, str] = {}
+        manual_mode = self._data.get(CONF_AUDIO_MANUAL_MODE, DEFAULT_AUDIO_MANUAL_MODE)
+
+        if user_input is not None:
+            manual_mode = user_input.get(CONF_AUDIO_MANUAL_MODE, DEFAULT_AUDIO_MANUAL_MODE)
+            if manual_mode == AUDIO_MANUAL_EXTERNAL_GO2RTC:
+                if not _clean_text(user_input.get(CONF_GO2RTC_STREAM_NAME, "")):
+                    errors[CONF_GO2RTC_STREAM_NAME] = "required"
+            elif manual_mode == AUDIO_MANUAL_HA_ENTITIES:
+                if not user_input.get(CONF_MEDIA_PLAYER_ENTITY):
+                    errors[CONF_MEDIA_PLAYER_ENTITY] = "required"
+                if not user_input.get(CONF_MICROPHONE_ENTITY):
+                    errors[CONF_MICROPHONE_ENTITY] = "required"
+
+            if not errors:
+                self._data[CONF_AUDIO_MODE] = AUDIO_MODE_MANUAL
+                self._data[CONF_AUDIO_MANUAL_MODE] = str(manual_mode)
+                self._data.pop(CONF_REOLINK_ENTRY_ID, None)
+                self._data.pop("doorbell_trigger_entity", None)
+                if manual_mode == AUDIO_MANUAL_EXTERNAL_GO2RTC:
+                    self._data[CONF_GO2RTC_STREAM_NAME] = _clean_text(
+                        user_input.get(CONF_GO2RTC_STREAM_NAME, "")
+                    )
+                    self._data[CONF_AUDIO_OUTPUT_MODE] = AUDIO_OUTPUT_EVENT
+                    self._data.pop(CONF_MEDIA_PLAYER_ENTITY, None)
+                    self._data.pop(CONF_MICROPHONE_ENTITY, None)
+                else:
+                    self._data[CONF_MEDIA_PLAYER_ENTITY] = _clean_text(
+                        user_input.get(CONF_MEDIA_PLAYER_ENTITY, "")
+                    )
+                    self._data[CONF_MICROPHONE_ENTITY] = _clean_text(
+                        user_input.get(CONF_MICROPHONE_ENTITY, "")
+                    )
+                    self._data[CONF_AUDIO_OUTPUT_MODE] = AUDIO_OUTPUT_MEDIA_PLAYER
+                    self._data.pop(CONF_GO2RTC_STREAM_NAME, None)
+                return self._save_options()
+
+        return self.async_show_form(
+            step_id="audio_manual",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_AUDIO_MANUAL_MODE,
+                        default=manual_mode,
+                    ): SelectSelector(
+                        SelectSelectorConfig(
+                            options=[
+                                {"value": AUDIO_MANUAL_EXTERNAL_GO2RTC, "label": "External go2rtc stream"},
+                                {
+                                    "value": AUDIO_MANUAL_HA_ENTITIES,
+                                    "label": "Home Assistant entities (speaker + microphone)",
+                                },
+                            ],
+                            mode=SelectSelectorMode.DROPDOWN,
+                        )
+                    ),
+                    vol.Optional(
+                        CONF_GO2RTC_STREAM_NAME,
+                        default=self._data.get(CONF_GO2RTC_STREAM_NAME, ""),
+                    ): TextSelector(),
+                    vol.Optional(
+                        CONF_MEDIA_PLAYER_ENTITY,
+                        default=self._data.get(CONF_MEDIA_PLAYER_ENTITY, ""),
+                    ): EntitySelector(EntitySelectorConfig(domain="media_player")),
+                    vol.Optional(
+                        CONF_MICROPHONE_ENTITY,
+                        default=self._data.get(CONF_MICROPHONE_ENTITY, ""),
+                    ): EntitySelector(EntitySelectorConfig()),
+                }
+            ),
             errors=errors,
         )
 

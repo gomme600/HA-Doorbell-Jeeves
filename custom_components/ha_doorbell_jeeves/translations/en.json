@@ -129,10 +129,22 @@
       },
       "audio": {
         "title": "Audio Setup",
-        "description": "Configure how Jeeves receives microphone audio and sends spoken responses.",
+        "description": "Choose the audio mode to configure.",
         "data": {
-          "audio_mode": "Audio Mode",
-          "reolink_entry_id": "Reolink Device",
+          "audio_mode": "Audio Mode"
+        }
+      },
+      "audio_reolink": {
+        "title": "Reolink Audio Setup",
+        "description": "Select which Reolink integration entry should provide two-way audio.",
+        "data": {
+          "reolink_entry_id": "Reolink Device"
+        }
+      },
+      "audio_manual": {
+        "title": "Manual Audio Setup",
+        "description": "Configure manual audio routing through an external go2rtc stream or Home Assistant entities.",
+        "data": {
           "audio_manual_mode": "Manual Audio Method",
           "go2rtc_stream_name": "External go2rtc Stream Name",
           "media_player_entity": "Speaker Entity",
