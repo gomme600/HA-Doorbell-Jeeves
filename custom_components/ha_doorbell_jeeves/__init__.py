@@ -166,6 +166,11 @@ async def _register_frontend_resources(hass: HomeAssistant) -> None:
             str(card_path),
             cache_headers=False,
         )
+
+    # Tell the HA frontend to load the card JS on every page
+    from homeassistant.components.frontend import add_extra_js_url  # noqa: PLC0415
+
+    add_extra_js_url(hass, _MEMORY_TIMELINE_CARD_URL)
     _LOGGER.debug("Registered memory timeline card resource: %s", _MEMORY_TIMELINE_CARD_URL)
 
 
