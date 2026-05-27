@@ -330,13 +330,12 @@ class JeevesSessionManager:
 
             if provider == PROVIDER_GEMINI:
                 voice = config.get(CONF_VOICE, DEFAULT_VOICE_GEMINI)
-                # TEMP DEBUG: disable tools to test if they're blocking audio response
                 _LOGGER.warning(
-                    "Tools configured: %d gemini tools (TEMPORARILY DISABLED FOR DEBUGGING)",
+                    "Tools configured: %d gemini tools",
                     len(voice_tools_gemini),
                 )
                 self._client = await self._create_gemini_client(
-                    api_key, model, voice_prompt, voice, [], reference_images
+                    api_key, model, voice_prompt, voice, voice_tools_gemini, reference_images
                 )
             else:
                 voice = config.get(CONF_VOICE, DEFAULT_VOICE_OPENAI)
@@ -374,10 +373,7 @@ class JeevesSessionManager:
             fps = config.get(CONF_VISION_FPS, DEFAULT_VISION_FPS)
             camera_entity = config.get(CONF_CAMERA_ENTITY, "")
             if camera_entity:
-                # TEMP DEBUG: disable vision loop to test if concurrent frame sends
-                # are causing the Gemini 1008 disconnect
-                _LOGGER.warning("TEMP DEBUG: Vision loop DISABLED (testing 1008 cause)")
-                # self._vision_task = asyncio.create_task(self._vision_loop(camera_entity, fps))
+                self._vision_task = asyncio.create_task(self._vision_loop(camera_entity, fps))
 
             timeout = config.get(CONF_SESSION_TIMEOUT, DEFAULT_SESSION_TIMEOUT)
             if timeout > 0:

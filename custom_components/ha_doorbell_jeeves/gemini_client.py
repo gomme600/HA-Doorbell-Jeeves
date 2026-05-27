@@ -128,12 +128,27 @@ class GeminiLiveClient(BaseRealtimeClient):
             _LOGGER.exception("Failed to send audio")
 
     async def send_image(self, image_base64: str, mime_type: str = "image/jpeg") -> None:
+        """Send an image frame to the live session.
+
+        Uses LiveClientContent (content turn) instead of send_realtime_input(video=)
+        because the native audio dialog model does not support realtime video input
+        but can accept images as inline_data in user content turns.
+        turn_complete=False keeps it passive (model sees it without responding).
+        """
         if not self._session or not self._connected:
             return
         try:
             image_bytes = base64.b64decode(image_base64)
-            await self._session.send_realtime_input(
-                video=types.Blob(data=image_bytes, mime_type=mime_type)
+            await self._session.send(
+                input=types.LiveClientContent(
+                    turns=[types.Content(
+                        role="user",
+                        parts=[types.Part(inline_data=types.Blob(
+                            data=image_bytes, mime_type=mime_type
+                        ))],
+                    )],
+                    turn_complete=False,
+                )
             )
         except Exception:
             _LOGGER.exception("Failed to send image")
