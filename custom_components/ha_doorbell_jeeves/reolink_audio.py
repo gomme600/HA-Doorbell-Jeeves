@@ -627,22 +627,12 @@ class ReolinkAudioHandler:
                     "✓ Audio input: native Baichuan FDX active (zero-config, no RTSP)"
                 )
 
-        # Start ffmpeg resampler: 24kHz mono s16le → camera sample_rate mono s16le
-        try:
-            self._ffmpeg_proc = await asyncio.create_subprocess_exec(
-                "ffmpeg",
-                "-hide_banner", "-loglevel", "error",
-                "-f", "s16le", "-ar", "24000", "-ac", "1", "-i", "pipe:0",
-                "-f", "s16le", "-ar", str(sample_rate), "-ac", "1", "pipe:1",
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _LOGGER.warning("ffmpeg resampler started (24kHz → %dHz)", sample_rate)
-        except Exception as exc:
-            _LOGGER.error("Failed to start ffmpeg resampler: %s", exc)
-            await self._stop_baichuan_talk(channel)
-            return
+        # Pure Python resampler: 24kHz mono s16le → camera sample_rate mono s16le
+        # Eliminates ffmpeg dependency and pipe buffering issues.
+        input_rate = 24000
+        _LOGGER.warning(
+            "Audio output resampler ready (in-process %dHz → %dHz)", input_rate, sample_rate
+        )
 
         chunks_sent = 0
         # ADPCM encoder state (persistent across blocks for continuity)
@@ -658,39 +648,67 @@ class ReolinkAudioHandler:
         import time as time_mod  # noqa: PLC0415
         expected_stream_end = time_mod.monotonic()
         resampled_pcm_buffer = bytearray()
+        # Leftover input samples that don't align to a complete resample step
+        resample_leftover = bytearray()
 
         try:
             while self._active:
-                # Feed buffered PCM to ffmpeg for resampling
+                # Grab buffered PCM from AI (24kHz 16-bit mono)
                 async with self._pcm_lock:
                     chunk = bytes(self._pcm_buffer)
                     self._pcm_buffer.clear()
-                if chunk:
-                    try:
-                        self._ffmpeg_proc.stdin.write(chunk)
-                        await self._ffmpeg_proc.stdin.drain()
-                    except Exception:
-                        _LOGGER.warning("ffmpeg stdin write failed")
-                        break
 
-                # Read resampled PCM and keep leftovers between iterations to avoid
-                # repeatedly zero-padding partial ADPCM blocks (causes choppy speech).
-                read_size = pcm_bytes_per_block * 4
-                try:
-                    resampled = await asyncio.wait_for(
-                        self._ffmpeg_proc.stdout.read(read_size),
-                        timeout=0.08,
-                    )
-                except asyncio.TimeoutError:
-                    resampled = b""
-                except Exception:
-                    break
-
-                if resampled:
-                    resampled_pcm_buffer.extend(resampled)
-                elif not chunk:
-                    await asyncio.sleep(0.005)
+                if not chunk:
+                    await asyncio.sleep(0.01)
                     continue
+
+                # Resample in-process: linear interpolation 24kHz → target rate
+                raw_input = resample_leftover + chunk
+                resample_leftover = bytearray()
+
+                # Parse input as int16 samples
+                n_bytes = len(raw_input)
+                # Ensure even number of bytes
+                if n_bytes % 2:
+                    resample_leftover = bytearray(raw_input[-1:])
+                    raw_input = raw_input[:-1]
+                    n_bytes -= 1
+
+                n_samples_in = n_bytes // 2
+                if n_samples_in < 2:
+                    resample_leftover = bytearray(raw_input)
+                    continue
+
+                # Convert to samples array
+                in_samples = struct_mod.unpack(f"<{n_samples_in}h", raw_input)
+
+                # Calculate output samples using linear interpolation
+                ratio = input_rate / sample_rate  # e.g. 24000/16000 = 1.5
+                n_samples_out = int((n_samples_in - 1) / ratio)
+                if n_samples_out < 1:
+                    resample_leftover = bytearray(raw_input)
+                    continue
+
+                out_samples = []
+                for i in range(n_samples_out):
+                    src_pos = i * ratio
+                    idx = int(src_pos)
+                    frac = src_pos - idx
+                    if idx + 1 < n_samples_in:
+                        val = in_samples[idx] + frac * (in_samples[idx + 1] - in_samples[idx])
+                    else:
+                        val = in_samples[idx]
+                    out_samples.append(max(-32768, min(32767, int(val))))
+
+                # Track unconsumed input samples for next iteration
+                consumed_input_samples = int(n_samples_out * ratio) + 1
+                if consumed_input_samples < n_samples_in:
+                    leftover_start = consumed_input_samples * 2
+                    resample_leftover = bytearray(raw_input[leftover_start:])
+
+                # Pack output samples and add to buffer
+                resampled_bytes = struct_mod.pack(f"<{len(out_samples)}h", *out_samples)
+                resampled_pcm_buffer.extend(resampled_bytes)
 
                 # Encode and send exactly one complete ADPCM block at a time.
                 # This preserves block boundaries and improves playback smoothness.
@@ -747,15 +765,6 @@ class ReolinkAudioHandler:
         except Exception:
             _LOGGER.warning("Baichuan audio output loop error", exc_info=True)
         finally:
-            # Clean up ffmpeg
-            if self._ffmpeg_proc and self._ffmpeg_proc.returncode is None:
-                try:
-                    self._ffmpeg_proc.stdin.close()
-                    self._ffmpeg_proc.terminate()
-                except Exception:
-                    pass
-            self._ffmpeg_proc = None
-
             # Let the last queued payload finish playback before stopping talk,
             # otherwise the tail of speech can get clipped.
             remaining = expected_stream_end - time_mod.monotonic()
