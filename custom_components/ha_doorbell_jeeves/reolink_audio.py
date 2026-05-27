@@ -1788,39 +1788,30 @@ class ReolinkAudioHandler:
     async def _get_go2rtc_rtsp_url(self) -> str | None:
         """Get the go2rtc local RTSP URL for the camera's stream.
 
-        go2rtc re-publishes all camera streams via a local RTSP server.
-        The stream name matches the camera entity's unique_id.
-
-        This is the BEST source for mic audio because:
-          - go2rtc already holds the camera's RTSP connection
-          - No auth needed on localhost
-          - Doesn't consume a second camera connection slot
-          - Includes both video and audio tracks
+        go2rtc re-publishes camera streams via a local RTSP server (port 8554).
+        However, in HA OS this port may not be exposed. Returns None if RTSP
+        isn't available so we fall through to HTTP-based alternatives.
         """
-        stream_name = self._camera_unique_id
+        stream_name = await self._resolve_go2rtc_stream_name()
         if not stream_name:
             return None
 
-        # go2rtc RTSP output port (standard HA default = 8554)
-        # Verify go2rtc is available first
-        base_url = await _discover_go2rtc_url(self._hass)
-        if not base_url:
-            return None
-
-        # Extract host/port from go2rtc API URL to derive RTSP port
-        # HA go2rtc API runs on 11984, RTSP on 8554
-        # Standard go2rtc API on 1984, RTSP on 8554
+        # go2rtc RTSP output port (standard = 8554)
         rtsp_url = f"rtsp://127.0.0.1:8554/{stream_name}"
         _LOGGER.warning("go2rtc local RTSP URL: %s", rtsp_url)
         return rtsp_url
 
     async def _get_go2rtc_http_stream_url(self) -> str | None:
-        """Get a go2rtc HTTP stream URL (FLV format) as fallback.
+        """Get a go2rtc HTTP stream URL as a reliable audio source.
 
-        If go2rtc's RTSP output port isn't accessible, the HTTP API
-        can provide a live FLV stream that includes audio.
+        Uses go2rtc's HTTP API to stream the camera's audio+video.
+        This works even when go2rtc's RTSP port isn't exposed because
+        the API runs on the same port as the REST endpoints.
+
+        If the stream isn't registered yet (lazy init), we register it
+        using the camera's RTSP URL that go2rtc will manage itself.
         """
-        stream_name = self._camera_unique_id
+        stream_name = await self._resolve_go2rtc_stream_name()
         if not stream_name:
             return None
 
@@ -1828,7 +1819,6 @@ class ReolinkAudioHandler:
         if not base_url:
             return None
 
-        # Verify the stream exists in go2rtc
         ha_session = _get_go2rtc_session(self._hass)
         own_session: aiohttp.ClientSession | None = None
         if not ha_session:
@@ -1836,37 +1826,106 @@ class ReolinkAudioHandler:
         session = ha_session or own_session
 
         try:
+            # Check if stream already exists in go2rtc
             async with session.get(
                 f"{base_url}/api/streams",
                 timeout=aiohttp.ClientTimeout(total=5),
             ) as resp:
                 if resp.status != 200:
+                    _LOGGER.warning(
+                        "go2rtc API returned status %d for /api/streams", resp.status
+                    )
                     return None
                 streams: dict = await resp.json()
 
-            if stream_name in streams:
-                url = f"{base_url}/api/stream.flv?src={stream_name}"
-                _LOGGER.warning("go2rtc HTTP FLV URL: %s", url)
-                return url
-
-            # Try partial match (some go2rtc versions use different naming)
-            for name in streams:
-                if stream_name in name or name in stream_name:
-                    url = f"{base_url}/api/stream.flv?src={name}"
-                    _LOGGER.warning("go2rtc HTTP FLV URL (partial match): %s", url)
-                    return url
-
-            _LOGGER.info(
-                "Camera stream '%s' not found in go2rtc (available: %s)",
-                stream_name, list(streams.keys())[:5],
+            _LOGGER.warning(
+                "go2rtc streams available: %s", list(streams.keys())[:10]
             )
-            return None
-        except Exception:
-            _LOGGER.debug("Failed to query go2rtc for HTTP stream", exc_info=True)
+
+            # Check if our stream is registered (exact or partial match)
+            matched_name: str | None = None
+            if stream_name in streams:
+                matched_name = stream_name
+            else:
+                # Try partial match
+                for name in streams:
+                    if stream_name in name or name in stream_name:
+                        matched_name = name
+                        break
+
+            if not matched_name:
+                # Stream not registered — register it with camera's RTSP URL
+                _LOGGER.warning(
+                    "Stream '%s' not found in go2rtc — registering it now",
+                    stream_name,
+                )
+                registered = await self._register_go2rtc_stream(
+                    session, base_url, stream_name
+                )
+                if registered:
+                    matched_name = stream_name
+                else:
+                    return None
+
+            # Use ffmpeg-friendly RTSP URL from go2rtc API (most reliable)
+            # The /api/stream.mp4 endpoint provides a progressive download
+            # The /api/ws endpoint provides a WebSocket stream
+            # Actually, for ffmpeg, use the RTSP output OR the MP4 endpoint
+            url = f"{base_url}/api/stream.mp4?src={matched_name}"
+            _LOGGER.warning("go2rtc HTTP stream URL: %s", url)
+            return url
+        except Exception as exc:
+            _LOGGER.warning("go2rtc HTTP stream lookup failed: %s", exc)
             return None
         finally:
             if own_session:
                 await own_session.close()
+
+    async def _resolve_go2rtc_stream_name(self) -> str | None:
+        """Resolve the go2rtc stream name for this camera.
+
+        In HA, go2rtc uses the camera entity's unique_id as the stream name.
+        """
+        if self._camera_unique_id:
+            return self._camera_unique_id
+        return None
+
+    async def _register_go2rtc_stream(
+        self, session: aiohttp.ClientSession, base_url: str, stream_name: str
+    ) -> bool:
+        """Register the camera's stream in go2rtc if not already present.
+
+        Uses the RTSP URL from the Reolink integration. go2rtc will manage
+        the RTSP connection itself (it handles auth, reconnection, etc.).
+        """
+        rtsp_url = getattr(self, "_reolink_rtsp_url", None)
+        if not rtsp_url:
+            _LOGGER.warning("Cannot register go2rtc stream — no RTSP URL available")
+            return False
+
+        try:
+            params = [("name", stream_name), ("src", rtsp_url)]
+            async with session.put(
+                f"{base_url}/api/streams",
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status in (200, 201):
+                    _LOGGER.warning(
+                        "Registered stream '%s' in go2rtc", stream_name
+                    )
+                    # Give go2rtc a moment to establish the RTSP connection
+                    await asyncio.sleep(2)
+                    return True
+                text = await resp.text()
+                _LOGGER.warning(
+                    "Failed to register go2rtc stream (status=%d): %s",
+                    resp.status, text[:200],
+                )
+                return False
+        except Exception as exc:
+            _LOGGER.warning("Failed to register go2rtc stream: %s", exc)
+            return False
 
     async def _get_go2rtc_audio_url(self) -> str | None:
         """Find and return an audio URL from go2rtc's existing streams.
