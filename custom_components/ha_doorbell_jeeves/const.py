@@ -99,6 +99,8 @@ AUDIO_OUTPUT_MODES = [AUDIO_OUTPUT_MEDIA_PLAYER, AUDIO_OUTPUT_GO2RTC, AUDIO_OUTP
 
 CONF_AUDIO_MODE = "audio_mode"
 CONF_GO2RTC_STREAM_NAME = "go2rtc_stream_name"
+CONF_GO2RTC_INPUT_STREAM_NAME = "go2rtc_input_stream_name"
+CONF_GO2RTC_OUTPUT_STREAM_NAME = "go2rtc_output_stream_name"
 CONF_REOLINK_ENTRY_ID = "reolink_entry_id"
 
 # ─── Defaults ─────────────────────────────────────────────────────────────────

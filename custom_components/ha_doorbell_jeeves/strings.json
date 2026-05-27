@@ -20,7 +20,8 @@
         "description": "Choose manual audio wiring: either an external go2rtc stream or Home Assistant speaker/microphone entities.",
         "data": {
           "audio_manual_mode": "Manual Audio Method",
-          "go2rtc_stream_name": "External go2rtc Stream Name",
+          "go2rtc_input_stream_name": "go2rtc Microphone Input Stream",
+          "go2rtc_output_stream_name": "go2rtc Speaker Output Stream",
           "media_player_entity": "Speaker Entity",
           "microphone_entity": "Microphone Entity"
         }
@@ -67,7 +68,9 @@
     },
     "error": {
       "invalid_api_key": "Could not validate the API key. Please check it and try again.",
-      "no_reolink_found": "No active Reolink integrations found. Please set up your Reolink doorbell in Home Assistant first."
+      "no_reolink_found": "No active Reolink integrations found. Please set up your Reolink doorbell in Home Assistant first.",
+      "invalid_speaker_entity": "Speaker must be a valid media_player entity.",
+      "invalid_microphone_entity": "Microphone must be a valid assist_satellite or media_player entity."
     },
     "abort": {
       "already_configured": "This doorbell is already configured."
@@ -146,7 +149,8 @@
         "description": "Configure manual audio routing through an external go2rtc stream or Home Assistant entities.",
         "data": {
           "audio_manual_mode": "Manual Audio Method",
-          "go2rtc_stream_name": "External go2rtc Stream Name",
+          "go2rtc_input_stream_name": "go2rtc Microphone Input Stream",
+          "go2rtc_output_stream_name": "go2rtc Speaker Output Stream",
           "media_player_entity": "Speaker Entity",
           "microphone_entity": "Microphone Entity"
         }
@@ -387,7 +391,9 @@
       }
     },
     "error": {
-      "llmvision_not_found": "LLM Vision is not installed or not loaded. Install/configure it first."
+      "llmvision_not_found": "LLM Vision is not installed or not loaded. Install/configure it first.",
+      "invalid_speaker_entity": "Speaker must be a valid media_player entity.",
+      "invalid_microphone_entity": "Microphone must be a valid assist_satellite or media_player entity."
     }
   }
 }

@@ -27,6 +27,8 @@ from .const import (
     CONF_AUDIO_MODE,
     CONF_AUDIO_OUTPUT_MODE,
     CONF_CAMERA_ENTITY,
+    CONF_GO2RTC_INPUT_STREAM_NAME,
+    CONF_GO2RTC_OUTPUT_STREAM_NAME,
     CONF_GO2RTC_STREAM_NAME,
     CONF_MODEL,
     CONF_REOLINK_ENTRY_ID,
@@ -190,6 +192,8 @@ async def _setup_reolink(hass: HomeAssistant, entry: ConfigEntry, config: dict[s
         # Store the stream name in options for session use
         new_options = dict(entry.options)
         new_options[CONF_GO2RTC_STREAM_NAME] = result["stream_name"]
+        new_options[CONF_GO2RTC_INPUT_STREAM_NAME] = result["stream_name"]
+        new_options[CONF_GO2RTC_OUTPUT_STREAM_NAME] = result["stream_name"]
         hass.config_entries.async_update_entry(entry, options=new_options)
     else:
         _LOGGER.warning(

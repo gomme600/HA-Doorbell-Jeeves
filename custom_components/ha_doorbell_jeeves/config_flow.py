@@ -49,6 +49,8 @@ from .const import (
     CONF_FRAME_MAX_HEIGHT,
     CONF_FRAME_MAX_WIDTH,
     CONF_FRAME_QUALITY,
+    CONF_GO2RTC_INPUT_STREAM_NAME,
+    CONF_GO2RTC_OUTPUT_STREAM_NAME,
     CONF_GO2RTC_STREAM_NAME,
     CONF_IDENTITY_MODE,
     CONF_LLMVISION_CAMERAS,
@@ -109,6 +111,8 @@ from .store import DataStore
 
 _LOGGER = logging.getLogger(__name__)
 _ACTION_STEP_FIELDS = ["action_config", "step_2_config", "step_3_config", "step_4_config", "step_5_config"]
+_SPEAKER_ENTITY_DOMAINS = ("media_player",)
+_MICROPHONE_ENTITY_DOMAINS = ("assist_satellite", "media_player")
 
 
 def _loaded_reolink_entries(hass: Any) -> list[ConfigEntry]:
@@ -183,6 +187,49 @@ def _add_optional_entity_selector(
         schema[vol.Optional(key)] = EntitySelector(selector_config)
 
 
+def _entity_exists(hass: Any, entity_id: str) -> bool:
+    """Return True when entity exists in states or registry."""
+    if hass.states.get(entity_id) is not None:
+        return True
+    return er.async_get(hass).async_get(entity_id) is not None
+
+
+def _is_valid_entity_for_domains(hass: Any, entity_id: Any, allowed_domains: tuple[str, ...]) -> bool:
+    """Validate entity id exists and belongs to one of the allowed domains."""
+    entity = _clean_text(entity_id)
+    if not entity or "." not in entity:
+        return False
+    domain = entity.split(".", 1)[0]
+    if domain not in allowed_domains:
+        return False
+    return _entity_exists(hass, entity)
+
+
+def _manual_stream_default(data: dict[str, Any], key: str) -> str:
+    """Get manual stream default with legacy single-stream fallback."""
+    explicit = _clean_text(data.get(key, ""))
+    if explicit:
+        return explicit
+    return _clean_text(data.get(CONF_GO2RTC_STREAM_NAME, ""))
+
+
+def _sync_manual_stream_fields(data: dict[str, Any]) -> None:
+    """Backfill split go2rtc stream fields from legacy single-stream value."""
+    legacy_stream = _clean_text(data.get(CONF_GO2RTC_STREAM_NAME, ""))
+    input_stream = _clean_text(data.get(CONF_GO2RTC_INPUT_STREAM_NAME, ""))
+    output_stream = _clean_text(data.get(CONF_GO2RTC_OUTPUT_STREAM_NAME, ""))
+
+    if legacy_stream:
+        if not input_stream:
+            data[CONF_GO2RTC_INPUT_STREAM_NAME] = legacy_stream
+        if not output_stream:
+            data[CONF_GO2RTC_OUTPUT_STREAM_NAME] = legacy_stream
+
+    output_for_legacy = _clean_text(data.get(CONF_GO2RTC_OUTPUT_STREAM_NAME, ""))
+    if output_for_legacy:
+        data[CONF_GO2RTC_STREAM_NAME] = output_for_legacy
+
+
 class DoorbellJeevesConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle initial setup of Doorbell Jeeves."""
 
@@ -236,6 +283,8 @@ class DoorbellJeevesConfigFlow(ConfigFlow, domain=DOMAIN):
                 self._data[CONF_AUDIO_OUTPUT_MODE] = AUDIO_OUTPUT_GO2RTC
                 self._data.pop(CONF_AUDIO_MANUAL_MODE, None)
                 self._data.pop(CONF_GO2RTC_STREAM_NAME, None)
+                self._data.pop(CONF_GO2RTC_INPUT_STREAM_NAME, None)
+                self._data.pop(CONF_GO2RTC_OUTPUT_STREAM_NAME, None)
                 self._data.pop(CONF_MEDIA_PLAYER_ENTITY, None)
                 self._data.pop(CONF_MICROPHONE_ENTITY, None)
 
@@ -262,26 +311,46 @@ class DoorbellJeevesConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_manual_audio(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         errors: dict[str, str] = {}
         manual_mode = self._data.get(CONF_AUDIO_MANUAL_MODE, DEFAULT_AUDIO_MANUAL_MODE)
+        _sync_manual_stream_fields(self._data)
 
         if user_input is not None:
             manual_mode = user_input.get(CONF_AUDIO_MANUAL_MODE, DEFAULT_AUDIO_MANUAL_MODE)
             if manual_mode == AUDIO_MANUAL_EXTERNAL_GO2RTC:
-                if not _clean_text(user_input.get(CONF_GO2RTC_STREAM_NAME, "")):
-                    errors[CONF_GO2RTC_STREAM_NAME] = "required"
+                if not _clean_text(user_input.get(CONF_GO2RTC_INPUT_STREAM_NAME, "")):
+                    errors[CONF_GO2RTC_INPUT_STREAM_NAME] = "required"
+                if not _clean_text(user_input.get(CONF_GO2RTC_OUTPUT_STREAM_NAME, "")):
+                    errors[CONF_GO2RTC_OUTPUT_STREAM_NAME] = "required"
             elif manual_mode == AUDIO_MANUAL_HA_ENTITIES:
-                if not user_input.get(CONF_MEDIA_PLAYER_ENTITY):
+                speaker_entity = _clean_text(user_input.get(CONF_MEDIA_PLAYER_ENTITY, ""))
+                microphone_entity = _clean_text(user_input.get(CONF_MICROPHONE_ENTITY, ""))
+                if not speaker_entity:
                     errors[CONF_MEDIA_PLAYER_ENTITY] = "required"
-                if not user_input.get(CONF_MICROPHONE_ENTITY):
+                elif not _is_valid_entity_for_domains(
+                    self.hass,
+                    speaker_entity,
+                    _SPEAKER_ENTITY_DOMAINS,
+                ):
+                    errors[CONF_MEDIA_PLAYER_ENTITY] = "invalid_speaker_entity"
+                if not microphone_entity:
                     errors[CONF_MICROPHONE_ENTITY] = "required"
+                elif not _is_valid_entity_for_domains(
+                    self.hass,
+                    microphone_entity,
+                    _MICROPHONE_ENTITY_DOMAINS,
+                ):
+                    errors[CONF_MICROPHONE_ENTITY] = "invalid_microphone_entity"
 
             if not errors:
+                self._data[CONF_AUDIO_MODE] = AUDIO_MODE_MANUAL
                 self._data[CONF_AUDIO_MANUAL_MODE] = str(manual_mode)
                 self._data.pop(CONF_REOLINK_ENTRY_ID, None)
                 self._data.pop("doorbell_trigger_entity", None)
                 if manual_mode == AUDIO_MANUAL_EXTERNAL_GO2RTC:
-                    self._data[CONF_GO2RTC_STREAM_NAME] = _clean_text(
-                        user_input.get(CONF_GO2RTC_STREAM_NAME, "")
-                    )
+                    input_stream = _clean_text(user_input.get(CONF_GO2RTC_INPUT_STREAM_NAME, ""))
+                    output_stream = _clean_text(user_input.get(CONF_GO2RTC_OUTPUT_STREAM_NAME, ""))
+                    self._data[CONF_GO2RTC_INPUT_STREAM_NAME] = input_stream
+                    self._data[CONF_GO2RTC_OUTPUT_STREAM_NAME] = output_stream
+                    self._data[CONF_GO2RTC_STREAM_NAME] = output_stream
                     self._data[CONF_AUDIO_OUTPUT_MODE] = AUDIO_OUTPUT_EVENT
                     self._data.pop(CONF_MEDIA_PLAYER_ENTITY, None)
                     self._data.pop(CONF_MICROPHONE_ENTITY, None)
@@ -294,6 +363,8 @@ class DoorbellJeevesConfigFlow(ConfigFlow, domain=DOMAIN):
                     )
                     self._data[CONF_AUDIO_OUTPUT_MODE] = AUDIO_OUTPUT_MEDIA_PLAYER
                     self._data.pop(CONF_GO2RTC_STREAM_NAME, None)
+                    self._data.pop(CONF_GO2RTC_INPUT_STREAM_NAME, None)
+                    self._data.pop(CONF_GO2RTC_OUTPUT_STREAM_NAME, None)
                 return await self.async_step_provider()
 
         schema: dict[Any, Any] = {
@@ -316,21 +387,25 @@ class DoorbellJeevesConfigFlow(ConfigFlow, domain=DOMAIN):
                 )
             ),
             vol.Optional(
-                CONF_GO2RTC_STREAM_NAME,
-                default=self._data.get(CONF_GO2RTC_STREAM_NAME, ""),
+                CONF_GO2RTC_INPUT_STREAM_NAME,
+                default=_manual_stream_default(self._data, CONF_GO2RTC_INPUT_STREAM_NAME),
+            ): TextSelector(),
+            vol.Optional(
+                CONF_GO2RTC_OUTPUT_STREAM_NAME,
+                default=_manual_stream_default(self._data, CONF_GO2RTC_OUTPUT_STREAM_NAME),
             ): TextSelector(),
         }
         _add_optional_entity_selector(
             schema,
             CONF_MEDIA_PLAYER_ENTITY,
             self._data.get(CONF_MEDIA_PLAYER_ENTITY),
-            EntitySelectorConfig(domain="media_player"),
+            EntitySelectorConfig(domain=list(_SPEAKER_ENTITY_DOMAINS)),
         )
         _add_optional_entity_selector(
             schema,
             CONF_MICROPHONE_ENTITY,
             self._data.get(CONF_MICROPHONE_ENTITY),
-            EntitySelectorConfig(),
+            EntitySelectorConfig(domain=list(_MICROPHONE_ENTITY_DOMAINS)),
         )
         return self.async_show_form(
             step_id="manual_audio",
@@ -513,6 +588,7 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
     def __init__(self, config_entry: ConfigEntry) -> None:
         self._config_entry = config_entry
         self._data: dict[str, Any] = dict(config_entry.data) | dict(config_entry.options)
+        _sync_manual_stream_fields(self._data)
         self._entity_edit: dict[str, Any] = {}
         self._action_edit: dict[str, Any] = {}
 
@@ -688,6 +764,8 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                 self._data[CONF_AUDIO_OUTPUT_MODE] = AUDIO_OUTPUT_GO2RTC
                 self._data.pop(CONF_AUDIO_MANUAL_MODE, None)
                 self._data.pop(CONF_GO2RTC_STREAM_NAME, None)
+                self._data.pop(CONF_GO2RTC_INPUT_STREAM_NAME, None)
+                self._data.pop(CONF_GO2RTC_OUTPUT_STREAM_NAME, None)
                 self._data.pop(CONF_MEDIA_PLAYER_ENTITY, None)
                 self._data.pop(CONF_MICROPHONE_ENTITY, None)
 
@@ -714,17 +792,34 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
     async def async_step_audio_manual(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         errors: dict[str, str] = {}
         manual_mode = self._data.get(CONF_AUDIO_MANUAL_MODE, DEFAULT_AUDIO_MANUAL_MODE)
+        _sync_manual_stream_fields(self._data)
 
         if user_input is not None:
             manual_mode = user_input.get(CONF_AUDIO_MANUAL_MODE, DEFAULT_AUDIO_MANUAL_MODE)
             if manual_mode == AUDIO_MANUAL_EXTERNAL_GO2RTC:
-                if not _clean_text(user_input.get(CONF_GO2RTC_STREAM_NAME, "")):
-                    errors[CONF_GO2RTC_STREAM_NAME] = "required"
+                if not _clean_text(user_input.get(CONF_GO2RTC_INPUT_STREAM_NAME, "")):
+                    errors[CONF_GO2RTC_INPUT_STREAM_NAME] = "required"
+                if not _clean_text(user_input.get(CONF_GO2RTC_OUTPUT_STREAM_NAME, "")):
+                    errors[CONF_GO2RTC_OUTPUT_STREAM_NAME] = "required"
             elif manual_mode == AUDIO_MANUAL_HA_ENTITIES:
-                if not user_input.get(CONF_MEDIA_PLAYER_ENTITY):
+                speaker_entity = _clean_text(user_input.get(CONF_MEDIA_PLAYER_ENTITY, ""))
+                microphone_entity = _clean_text(user_input.get(CONF_MICROPHONE_ENTITY, ""))
+                if not speaker_entity:
                     errors[CONF_MEDIA_PLAYER_ENTITY] = "required"
-                if not user_input.get(CONF_MICROPHONE_ENTITY):
+                elif not _is_valid_entity_for_domains(
+                    self.hass,
+                    speaker_entity,
+                    _SPEAKER_ENTITY_DOMAINS,
+                ):
+                    errors[CONF_MEDIA_PLAYER_ENTITY] = "invalid_speaker_entity"
+                if not microphone_entity:
                     errors[CONF_MICROPHONE_ENTITY] = "required"
+                elif not _is_valid_entity_for_domains(
+                    self.hass,
+                    microphone_entity,
+                    _MICROPHONE_ENTITY_DOMAINS,
+                ):
+                    errors[CONF_MICROPHONE_ENTITY] = "invalid_microphone_entity"
 
             if not errors:
                 self._data[CONF_AUDIO_MODE] = AUDIO_MODE_MANUAL
@@ -732,9 +827,11 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                 self._data.pop(CONF_REOLINK_ENTRY_ID, None)
                 self._data.pop("doorbell_trigger_entity", None)
                 if manual_mode == AUDIO_MANUAL_EXTERNAL_GO2RTC:
-                    self._data[CONF_GO2RTC_STREAM_NAME] = _clean_text(
-                        user_input.get(CONF_GO2RTC_STREAM_NAME, "")
-                    )
+                    input_stream = _clean_text(user_input.get(CONF_GO2RTC_INPUT_STREAM_NAME, ""))
+                    output_stream = _clean_text(user_input.get(CONF_GO2RTC_OUTPUT_STREAM_NAME, ""))
+                    self._data[CONF_GO2RTC_INPUT_STREAM_NAME] = input_stream
+                    self._data[CONF_GO2RTC_OUTPUT_STREAM_NAME] = output_stream
+                    self._data[CONF_GO2RTC_STREAM_NAME] = output_stream
                     self._data[CONF_AUDIO_OUTPUT_MODE] = AUDIO_OUTPUT_EVENT
                     self._data.pop(CONF_MEDIA_PLAYER_ENTITY, None)
                     self._data.pop(CONF_MICROPHONE_ENTITY, None)
@@ -747,6 +844,8 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                     )
                     self._data[CONF_AUDIO_OUTPUT_MODE] = AUDIO_OUTPUT_MEDIA_PLAYER
                     self._data.pop(CONF_GO2RTC_STREAM_NAME, None)
+                    self._data.pop(CONF_GO2RTC_INPUT_STREAM_NAME, None)
+                    self._data.pop(CONF_GO2RTC_OUTPUT_STREAM_NAME, None)
                 return self._save_options()
 
         schema: dict[Any, Any] = {
@@ -766,21 +865,25 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                 )
             ),
             vol.Optional(
-                CONF_GO2RTC_STREAM_NAME,
-                default=self._data.get(CONF_GO2RTC_STREAM_NAME, ""),
+                CONF_GO2RTC_INPUT_STREAM_NAME,
+                default=_manual_stream_default(self._data, CONF_GO2RTC_INPUT_STREAM_NAME),
+            ): TextSelector(),
+            vol.Optional(
+                CONF_GO2RTC_OUTPUT_STREAM_NAME,
+                default=_manual_stream_default(self._data, CONF_GO2RTC_OUTPUT_STREAM_NAME),
             ): TextSelector(),
         }
         _add_optional_entity_selector(
             schema,
             CONF_MEDIA_PLAYER_ENTITY,
             self._data.get(CONF_MEDIA_PLAYER_ENTITY),
-            EntitySelectorConfig(domain="media_player"),
+            EntitySelectorConfig(domain=list(_SPEAKER_ENTITY_DOMAINS)),
         )
         _add_optional_entity_selector(
             schema,
             CONF_MICROPHONE_ENTITY,
             self._data.get(CONF_MICROPHONE_ENTITY),
-            EntitySelectorConfig(),
+            EntitySelectorConfig(domain=list(_MICROPHONE_ENTITY_DOMAINS)),
         )
         return self.async_show_form(
             step_id="audio_manual",

@@ -29,6 +29,8 @@ from .const import (
     CONF_FRAME_MAX_HEIGHT,
     CONF_FRAME_MAX_WIDTH,
     CONF_FRAME_QUALITY,
+    CONF_GO2RTC_INPUT_STREAM_NAME,
+    CONF_GO2RTC_OUTPUT_STREAM_NAME,
     CONF_GO2RTC_STREAM_NAME,
     CONF_IDENTITY_MODE,
     CONF_MEDIA_PLAYER_ENTITY,
@@ -100,6 +102,7 @@ class JeevesSessionManager:
         self._active = False
         self._starting = False
         self._config = dict(entry.data) | dict(entry.options)
+        self._normalize_manual_audio_config()
 
         # Data store (entities, actions, identities)
         self.store = DataStore(hass, entry.entry_id)
@@ -132,6 +135,23 @@ class JeevesSessionManager:
         self._session_end_reason: str = "session ended"
         self._session_memory_saved = False
         self._transcript_history: list[dict[str, str]] = []
+
+    def _normalize_manual_audio_config(self) -> None:
+        """Backfill split go2rtc stream keys from the legacy single stream key."""
+        legacy_stream = str(self._config.get(CONF_GO2RTC_STREAM_NAME, "") or "").strip()
+        input_stream = str(self._config.get(CONF_GO2RTC_INPUT_STREAM_NAME, "") or "").strip()
+        output_stream = str(self._config.get(CONF_GO2RTC_OUTPUT_STREAM_NAME, "") or "").strip()
+
+        if legacy_stream:
+            if not input_stream:
+                input_stream = legacy_stream
+                self._config[CONF_GO2RTC_INPUT_STREAM_NAME] = input_stream
+            if not output_stream:
+                output_stream = legacy_stream
+                self._config[CONF_GO2RTC_OUTPUT_STREAM_NAME] = output_stream
+
+        if output_stream:
+            self._config[CONF_GO2RTC_STREAM_NAME] = output_stream
 
     @property
     def is_active(self) -> bool:
@@ -222,8 +242,12 @@ class JeevesSessionManager:
             _LOGGER.info("Reolink go2rtc configured: stream=%s", result.get("stream_name"))
             new_options = dict(self.entry.options)
             new_options[CONF_GO2RTC_STREAM_NAME] = result["stream_name"]
+            new_options[CONF_GO2RTC_INPUT_STREAM_NAME] = result["stream_name"]
+            new_options[CONF_GO2RTC_OUTPUT_STREAM_NAME] = result["stream_name"]
             self.hass.config_entries.async_update_entry(self.entry, options=new_options)
             self._config[CONF_GO2RTC_STREAM_NAME] = result["stream_name"]
+            self._config[CONF_GO2RTC_INPUT_STREAM_NAME] = result["stream_name"]
+            self._config[CONF_GO2RTC_OUTPUT_STREAM_NAME] = result["stream_name"]
         else:
             _LOGGER.warning("go2rtc not available — 2-way audio may not work")
 
@@ -841,6 +865,12 @@ class JeevesSessionManager:
         else:
             audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
             speaker_entity = self._config.get(CONF_MEDIA_PLAYER_ENTITY, "")
+            go2rtc_output_stream = self._config.get(CONF_GO2RTC_OUTPUT_STREAM_NAME) or self._config.get(
+                CONF_GO2RTC_STREAM_NAME, ""
+            )
+            go2rtc_input_stream = self._config.get(CONF_GO2RTC_INPUT_STREAM_NAME) or self._config.get(
+                CONF_GO2RTC_STREAM_NAME, ""
+            )
             self.hass.bus.async_fire(
                 EVENT_AUDIO_OUTPUT,
                 {
@@ -852,7 +882,9 @@ class JeevesSessionManager:
                     "audio_mode": self._config.get(CONF_AUDIO_MODE, AUDIO_MODE_MANUAL),
                     "manual_audio_mode": self._config.get(CONF_AUDIO_MANUAL_MODE, ""),
                     "audio_output_mode": self._config.get(CONF_AUDIO_OUTPUT_MODE, ""),
-                    "go2rtc_stream_name": self._config.get(CONF_GO2RTC_STREAM_NAME, ""),
+                    "go2rtc_stream_name": go2rtc_output_stream,
+                    "go2rtc_input_stream_name": go2rtc_input_stream,
+                    "go2rtc_output_stream_name": go2rtc_output_stream,
                 },
             )
 

@@ -98,12 +98,13 @@ The integration includes a dedicated **Reolink Quick Setup** mode that:
 
 ### Manual Setup (non-Reolink)
 For other doorbells, choose "Manual Setup" and pick one method:
-- **External go2rtc stream** (provide stream name)
-- **Home Assistant entities** (choose speaker + microphone entities)
+- **External go2rtc streams** (provide separate microphone-input and speaker-output stream names)
+- **Home Assistant entities** (speaker must be `media_player`; microphone must be `assist_satellite` or `media_player`)
 
 Camera feed selection remains separate and can be any HA camera.
 In manual modes, inbound mic chunks are supplied through `ha_doorbell_jeeves.send_audio`, and
-AI output is emitted on `ha_doorbell_jeeves_audio_output` with your selected routing metadata.
+AI output is emitted on `ha_doorbell_jeeves_audio_output` with routing metadata, including
+`go2rtc_input_stream_name` and `go2rtc_output_stream_name`.
 
 ---
 
