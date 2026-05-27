@@ -192,7 +192,7 @@ async def _ensure_lovelace_resource(hass: HomeAssistant, url: str) -> None:
             return
 
         # Check if using storage mode (default for most HA installs)
-        resources = lovelace_data.get("resources")
+        resources = getattr(lovelace_data, "resources", None)
         if resources is None:
             _LOGGER.debug("Lovelace resources not available, using add_extra_js_url fallback")
             from homeassistant.components.frontend import add_extra_js_url  # noqa: PLC0415
@@ -204,11 +204,18 @@ async def _ensure_lovelace_resource(hass: HomeAssistant, url: str) -> None:
         existing = await resources.async_get_items() if hasattr(resources, "async_get_items") else []
         for item in existing:
             if item.get("url") == url:
-                _LOGGER.debug("Lovelace resource already registered: %s", url)
-                return
+                if item.get("type") == "js":
+                    _LOGGER.debug("Lovelace resource already registered: %s", url)
+                    return
+                # Remove old 'module' type entry and re-add as 'js'
+                item_id = item.get("id")
+                if item_id and hasattr(resources, "async_delete_item"):
+                    await resources.async_delete_item(item_id)
+                break
 
-        # Register new resource
-        await resources.async_create_item({"res_type": "module", "url": url})
+        # Register as 'js' type (loaded via <script> tag, not import())
+        # to avoid MIME type enforcement with nosniff header
+        await resources.async_create_item({"res_type": "js", "url": url})
         _LOGGER.info("Added Lovelace resource: %s", url)
     except Exception as exc:  # noqa: BLE001
         # Fallback to add_extra_js_url if Lovelace API isn't available
