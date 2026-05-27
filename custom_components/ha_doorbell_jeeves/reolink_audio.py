@@ -1305,12 +1305,11 @@ class ReolinkAudioHandler:
                 pcm_data = self._parse_bcmedia_to_pcm(payload)
                 if pcm_data and self._listen_active:
                     asyncio.ensure_future(self._on_audio_received(pcm_data))
-                elif not pcm_data and input_count[0] <= 3:
-                    _LOGGER.warning(
-                        "Audio input: pcm_data=None for packet #%d (payload=%d bytes, "
-                        "listen_active=%s). Hex[:32]: %s",
-                        input_count[0], len(payload), self._listen_active,
-                        payload[:32].hex(),
+                elif not pcm_data and input_count[0] <= 5:
+                    # Video-only packets are normal in the mixed stream
+                    _LOGGER.debug(
+                        "Audio input: no audio in packet #%d (%d bytes, likely video)",
+                        input_count[0], len(payload),
                     )
 
             # Consume this message from the buffer
@@ -1329,79 +1328,169 @@ class ReolinkAudioHandler:
         return True
 
     def _parse_bcmedia_to_pcm(self, payload: bytes) -> bytes | None:
-        """Parse BcMedia frames from incoming audio and decode ADPCM to 16-bit PCM.
+        """Parse BcMedia frames from incoming stream and decode ADPCM audio to PCM.
 
-        BcMedia frame format (same as what we build for output):
-          - 4 bytes: magic (0x62773130 = "bw10")
-          - 2 bytes: payload_len
-          - 2 bytes: payload_len (repeated)
+        The decrypted CMD 202 payload contains a stream of BcMedia frames that
+        can include video (I-frames, P-frames) AND audio (ADPCM/AAC). We must:
+          1. Identify each frame by its 4-byte magic
+          2. Skip video frames (they have variable-length headers + data)
+          3. Extract and decode ADPCM audio frames
+
+        BcMedia frame types (magic as u32 LE):
+          - 0x31303031: InfoV1 (stream metadata)
+          - 0x32303031: InfoV2 (stream metadata)
+          - 0x63643030-0x63643039: IFrame (video key frame)
+          - 0x63643130-0x63643139: PFrame (video predicted frame)
+          - 0x62773530: AAC audio
+          - 0x62773130: ADPCM audio
+
+        ADPCM frame structure (after magic):
+          - 2 bytes: payload_size (u16 LE)
+          - 2 bytes: payload_size (repeated)
           - 2 bytes: data_magic (0x0100)
-          - 2 bytes: block_size_halved
-          - N bytes: ADPCM block (4-byte header + nibbles)
+          - 2 bytes: half_block_size
+          - N bytes: ADPCM block data (payload_size - 4)
           - padding to 8-byte alignment
 
-        ADPCM block header:
-          - 2 bytes: initial predictor (i16 LE)
-          - 1 byte: step table index (0–88)
-          - 1 byte: reserved
-          - remaining: packed 4-bit nibbles (low nibble first)
+        Video frame structure (after magic):
+          - 4 bytes: video_type ("H264" or "H265")
+          - 4 bytes: payload_size (u32 LE)
+          - 4 bytes: additional_header_size (u32 LE)
+          - 4 bytes: microseconds (u32 LE)
+          - 4 bytes: unknown
+          - N bytes: additional_header [additional_header_size]
+          - N bytes: video data [payload_size]
+          - padding to 8-byte alignment
         """
         import struct as struct_mod  # noqa: PLC0415
 
-        MAGIC = 0x62773130
-        HEADER_SIZE = 12
+        MAGIC_ADPCM = 0x62773130
+        MAGIC_AAC = 0x62773530
+        MAGIC_INFO_V1 = 0x31303031
+        MAGIC_INFO_V2 = 0x32303031
+        # IFRAME: 0x63643030-0x63643039, PFRAME: 0x63643130-0x63643139
+        IFRAME_BASE = 0x63643030
+        PFRAME_BASE = 0x63643130
+        PAD_SIZE = 8
+
         pcm_out = bytearray()
         offset = 0
+        frame_count = 0
+        audio_frames = 0
+        video_frames = 0
 
-        if not payload or len(payload) < HEADER_SIZE:
-            _LOGGER.warning("BcMedia parse: payload too short (%d bytes)", len(payload) if payload else 0)
+        if not payload or len(payload) < 4:
             return None
 
-        while offset + HEADER_SIZE <= len(payload):
-            # Read BcMedia header
+        while offset + 4 <= len(payload):
+            # Read magic
             try:
-                magic, plen1, plen2, data_magic, block_halved = struct_mod.unpack_from(
-                    "<IHHHH", payload, offset
-                )
+                magic = struct_mod.unpack_from("<I", payload, offset)[0]
             except struct_mod.error:
                 break
 
-            if magic != MAGIC:
-                # Not a valid BcMedia frame — try raw ADPCM fallback
+            frame_count += 1
+            offset += 4  # past magic
+
+            if magic == MAGIC_ADPCM:
+                # ADPCM audio frame
+                if offset + 8 > len(payload):
+                    break
+                plen1, plen2, data_magic, half_block = struct_mod.unpack_from(
+                    "<HHHH", payload, offset
+                )
+                offset += 8  # past sub-header
+
+                # payload_size includes the 4-byte sub-header (data_magic + half_block)
+                block_size = plen1 - 4 if plen1 > 4 else plen1
+                if block_size <= 0 or offset + block_size > len(payload):
+                    break
+
+                adpcm_block = payload[offset:offset + block_size]
+                pcm_block = self._decode_ima_adpcm_block(adpcm_block)
+                if pcm_block:
+                    pcm_out.extend(pcm_block)
+                    audio_frames += 1
+
+                # Advance past data + padding
+                offset += block_size
+                pad = (-plen1) % PAD_SIZE
+                offset += pad
+
+            elif magic == MAGIC_AAC:
+                # AAC audio — skip (we only handle ADPCM)
+                if offset + 4 > len(payload):
+                    break
+                plen1, plen2 = struct_mod.unpack_from("<HH", payload, offset)
+                offset += 4
+                offset += plen1
+                pad = (-plen1) % PAD_SIZE
+                offset += pad
+
+            elif (IFRAME_BASE <= magic <= IFRAME_BASE + 9) or \
+                 (PFRAME_BASE <= magic <= PFRAME_BASE + 9):
+                # Video frame (I-frame or P-frame)
+                # Structure: video_type(4) + payload_size(4) + add_header_size(4) +
+                #            microseconds(4) + unknown(4) + add_header + data + padding
+                if offset + 20 > len(payload):
+                    break
+                # Skip video_type (4 bytes)
+                offset += 4
+                payload_size, add_header_size = struct_mod.unpack_from(
+                    "<II", payload, offset
+                )
+                offset += 4 + 4  # past payload_size + add_header_size
+                offset += 4 + 4  # past microseconds + unknown
+                offset += add_header_size  # past additional header
+                offset += payload_size  # past video data
+                # Padding
+                pad = (-payload_size) % PAD_SIZE
+                offset += pad
+                video_frames += 1
+
+            elif magic in (MAGIC_INFO_V1, MAGIC_INFO_V2):
+                # Info frame — skip it
+                # InfoV1/V2: header_size(4) + various fields; skip by header_size
+                if offset + 4 > len(payload):
+                    break
+                header_size = struct_mod.unpack_from("<I", payload, offset)[0]
+                offset += header_size
+                # Info frames may have padding too
+                pad = (-header_size) % PAD_SIZE
+                offset += pad
+
+            else:
+                # Unknown magic — try raw ADPCM fallback from this point
+                offset -= 4  # rewind past the magic we read
                 if offset == 0:
                     _LOGGER.debug(
-                        "BcMedia magic mismatch at offset 0: got 0x%08x (%s), "
-                        "expected 0x%08x. First 32 bytes: %s. Trying raw ADPCM fallback.",
-                        magic, payload[:4].hex(), MAGIC, payload[:32].hex(),
+                        "BcMedia: unknown magic 0x%08x at offset 0, trying raw fallback. "
+                        "First 32 hex: %s",
+                        magic, payload[:32].hex(),
                     )
                     return self._try_raw_adpcm_decode(payload)
                 break
 
-            offset += HEADER_SIZE
-            block_size = (block_halved * 2) + 4  # Reconstruct block size
-
-            if offset + block_size > len(payload):
-                break
-
-            adpcm_block = payload[offset: offset + block_size]
-
-            # Decode this ADPCM block to PCM
-            pcm_block = self._decode_ima_adpcm_block(adpcm_block)
-            if pcm_block:
-                pcm_out.extend(pcm_block)
-
-            # Advance past block + padding
-            padded_size = block_size + ((-block_size) % 8)
-            offset += padded_size
-
-        if not pcm_out and offset == 0:
-            _LOGGER.debug(
-                "BcMedia parse produced no PCM. Payload len=%d, first 32 bytes: %s",
-                len(payload), payload[:32].hex(),
+        # Log first successful parse
+        if audio_frames > 0 and not hasattr(self, "_bcmedia_parse_logged"):
+            self._bcmedia_parse_logged = True
+            _LOGGER.warning(
+                "✓ BcMedia stream parsed: %d audio frames, %d video frames "
+                "(%d total) → %d bytes PCM",
+                audio_frames, video_frames, frame_count, len(pcm_out),
             )
-            return self._try_raw_adpcm_decode(payload)
 
-        return bytes(pcm_out) if pcm_out else None
+        if pcm_out:
+            return bytes(pcm_out)
+
+        # No audio in this packet (video-only) — that's normal
+        if video_frames > 0:
+            return None
+
+        # Nothing parsed — try raw fallback
+        if frame_count == 0:
+            return self._try_raw_adpcm_decode(payload)
+        return None
 
     def _try_raw_adpcm_decode(self, payload: bytes) -> bytes | None:
         """Fallback: try decoding payload as ADPCM or G.711.
