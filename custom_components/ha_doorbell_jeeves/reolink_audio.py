@@ -125,10 +125,20 @@ def _get_go2rtc_session(hass: HomeAssistant) -> aiohttp.ClientSession | None:
     """
     try:
         go2rtc_data = hass.data.get("go2rtc")
-        if go2rtc_data and hasattr(go2rtc_data, "session"):
-            return go2rtc_data.session
-    except (AttributeError, KeyError, TypeError):
-        pass
+        if go2rtc_data:
+            # Try various attribute names (varies by HA version)
+            for attr in ("session", "_session", "client_session"):
+                sess = getattr(go2rtc_data, attr, None)
+                if sess and isinstance(sess, aiohttp.ClientSession):
+                    return sess
+            # Log what we found for debugging
+            attrs = [a for a in dir(go2rtc_data) if not a.startswith("__")]
+            _LOGGER.warning(
+                "go2rtc data found but no session attr. Type=%s, attrs=%s",
+                type(go2rtc_data).__name__, attrs[:15],
+            )
+    except (AttributeError, KeyError, TypeError) as exc:
+        _LOGGER.debug("go2rtc session lookup failed: %s", exc)
     return None
 
 
@@ -326,12 +336,19 @@ class ReolinkAudioHandler:
                 entity_entry = registry.async_get(camera_entity)
                 if entity_entry and entity_entry.unique_id:
                     self._camera_unique_id = entity_entry.unique_id
-                    _LOGGER.info(
+                    _LOGGER.warning(
                         "Camera unique_id (go2rtc stream name): %s",
                         self._camera_unique_id,
                     )
+                else:
+                    _LOGGER.warning(
+                        "Could not find unique_id for camera %s (entry=%s)",
+                        camera_entity, entity_entry,
+                    )
             except Exception as exc:
-                _LOGGER.debug("Could not get camera unique_id: %s", exc)
+                _LOGGER.warning("Could not get camera unique_id: %s", exc)
+        else:
+            _LOGGER.warning("No camera entity set — go2rtc stream name unavailable")
 
         if reolink_entry_id:
             reolink_config = get_reolink_config(self._hass, reolink_entry_id)
@@ -1170,18 +1187,20 @@ class ReolinkAudioHandler:
         """
         stream_name = await self._resolve_go2rtc_stream_name()
         if not stream_name:
-            _LOGGER.info("go2rtc proxy: no stream name available")
+            _LOGGER.warning("go2rtc proxy: no stream name (camera_unique_id=%s)", self._camera_unique_id)
             return False
 
         base_url = await _discover_go2rtc_url(self._hass)
         if not base_url:
-            _LOGGER.info("go2rtc proxy: go2rtc not available")
+            _LOGGER.warning("go2rtc proxy: go2rtc not available")
             return False
 
         ha_session = _get_go2rtc_session(self._hass)
         if not ha_session:
-            _LOGGER.info("go2rtc proxy: no authenticated session available")
-            return False
+            _LOGGER.warning("go2rtc proxy: no authenticated session — trying raw session")
+            # Fallback: try without auth (some go2rtc setups don't need it)
+            ha_session = aiohttp.ClientSession()
+            self._go2rtc_own_session = ha_session  # track for cleanup
 
         # Check if stream exists; register if not
         try:
