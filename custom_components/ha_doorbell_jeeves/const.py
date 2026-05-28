@@ -103,6 +103,8 @@ CONF_GO2RTC_STREAM_NAME = "go2rtc_stream_name"
 CONF_GO2RTC_INPUT_STREAM_NAME = "go2rtc_input_stream_name"
 CONF_GO2RTC_OUTPUT_STREAM_NAME = "go2rtc_output_stream_name"
 CONF_REOLINK_ENTRY_ID = "reolink_entry_id"
+CONF_REOLINK_MIC_METHOD = "reolink_mic_method"  # Cached best audio input method
+CONF_REOLINK_MIC_URL = "reolink_mic_url"  # Cached working URL for mic input
 
 # ─── Defaults ─────────────────────────────────────────────────────────────────
 

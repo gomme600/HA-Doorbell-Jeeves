@@ -228,6 +228,104 @@ async def setup_go2rtc_stream(
             await own_session.close()
 
 
+async def probe_audio_input_method(
+    host: str, username: str, password: str, rtsp_port: int = 554
+) -> tuple[str, str]:
+    """Probe all audio input methods and return the best working one.
+
+    Called during config setup so we can skip probing at session start.
+    Returns (method, url) where method is one of:
+      "rtsp", "https-flv", "http-flv", "rtmp", "none"
+
+    Priority: RTSP > HTTPS-FLV > HTTP-FLV > RTMP
+    """
+    encoded_pass = quote(password, safe="")
+
+    # --- Try RTSP variants ---
+    base = f"rtsp://{username}:{encoded_pass}@{host}:{rtsp_port}"
+    rtsp_urls = [
+        f"{base}/h264Preview_01_sub",
+        f"{base}/Preview_01_sub",
+        f"{base}/h264Preview_01_main",
+        f"{base}/h265Preview_01_sub",
+    ]
+
+    for url in rtsp_urls:
+        if await _probe_ffmpeg_url(url, rtsp=True):
+            _LOGGER.warning("Audio probe: RTSP works → %s", _mask_stream_url(url))
+            return ("rtsp", url)
+
+    # --- Try FLV variants ---
+    https_flv = (
+        f"https://{host}:443/flv?port=1935&app=bcs"
+        f"&stream=channel0_sub.bcs&user={username}&password={encoded_pass}"
+    )
+    if await _probe_ffmpeg_url(https_flv, tls_noverify=True):
+        _LOGGER.warning("Audio probe: HTTPS-FLV works")
+        return ("https-flv", https_flv)
+
+    http_flv = (
+        f"http://{host}/flv?port=1935&app=bcs"
+        f"&stream=channel0_sub.bcs&user={username}&password={encoded_pass}"
+    )
+    if await _probe_ffmpeg_url(http_flv):
+        _LOGGER.warning("Audio probe: HTTP-FLV works")
+        return ("http-flv", http_flv)
+
+    # --- Try RTMP ---
+    rtmp_url = (
+        f"rtmp://{host}:1935/bcs/channel0_sub.bcs"
+        f"?channel=0&stream=1&user={username}&password={encoded_pass}"
+    )
+    if await _probe_ffmpeg_url(rtmp_url):
+        _LOGGER.warning("Audio probe: RTMP works")
+        return ("rtmp", rtmp_url)
+
+    _LOGGER.warning("Audio probe: no working method found")
+    return ("none", "")
+
+
+async def _probe_ffmpeg_url(url: str, rtsp: bool = False, tls_noverify: bool = False) -> bool:
+    """Test if ffmpeg can connect to a URL and receive audio data within 2s."""
+    ffmpeg_args = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats"]
+    if rtsp:
+        ffmpeg_args.extend(["-rtsp_transport", "tcp"])
+    if tls_noverify:
+        ffmpeg_args.extend(["-tls_verify", "0"])
+    ffmpeg_args.extend([
+        "-fflags", "+nobuffer",
+        "-analyzeduration", "500000",
+        "-probesize", "500000",
+        "-t", "2",  # Only capture 2 seconds max
+        "-i", url,
+        "-vn",
+        "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+        "-f", "s16le", "pipe:1",
+    ])
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *ffmpeg_args,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        # Wait up to 3s for some audio data
+        try:
+            stdout_data = await asyncio.wait_for(proc.stdout.read(640), timeout=3.0)
+        except asyncio.TimeoutError:
+            stdout_data = b""
+        # Kill the probe process
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        await proc.wait()
+        return len(stdout_data) >= 640  # Got at least one audio frame
+    except Exception:
+        return False
+
+
 class ReolinkAudioHandler:
     """Handles 2-way audio for Reolink doorbells.
 
@@ -354,16 +452,11 @@ class ReolinkAudioHandler:
         return self._active
 
     async def start(self) -> None:
-        """Start 2-way audio: output via Baichuan, input via RTSP/ffmpeg.
+        """Start 2-way audio: output via Baichuan, input via cached method.
 
         Speaker output pipeline starts FIRST (fast: ~1s) so the AI greeting
-        can play as soon as possible. Mic input discovery runs afterward
-        (can take 10-15s due to RTSP fallback probing).
-
-        Audio input priority:
-          1. ffmpeg with RTSP URL (continuous audio, best quality)
-          2. ffmpeg with FLV/RTMP URL (continuous, fallback)
-          3. Native Baichuan Preview CMD 3 (sparse ~1fps, last resort)
+        can play as soon as possible. Mic input uses the pre-probed method
+        stored in config (no runtime probing needed).
 
         Audio output always uses Baichuan talk (CMD 201/202).
         """
@@ -376,28 +469,35 @@ class ReolinkAudioHandler:
         self._active = True
 
         # --- SPEAKER OUTPUT FIRST (fast path, ~1s) ---
-        # Start the output pipeline immediately so AI audio can reach the
-        # speaker as soon as it's available. This only needs a Baichuan
-        # connection + TalkAbility query — no slow RTSP probing.
         await self._start_output_pipeline()
 
-        # --- Audio INPUT: runs after output is ready ---
+        # --- Audio INPUT: use cached method or probe ---
+        cached_method = getattr(self, "_cached_mic_method", "") or ""
+        cached_url = getattr(self, "_cached_mic_url", "") or ""
+
+        if cached_method and cached_url:
+            # Fast path: use the pre-probed working method directly
+            _LOGGER.warning("Audio input: using cached method '%s'", cached_method)
+            started = await self._start_ffmpeg_with_url(cached_url, cached_method.upper())
+            if started:
+                _LOGGER.warning("Audio input: %s connected (cached)", cached_method)
+                return
+            _LOGGER.warning("Audio input: cached method '%s' failed — falling back to probe", cached_method)
+
+        # Slow fallback: probe all methods (only if no cache or cache failed)
         # Create a second Baichuan connection for Preview fallback
         bc = await self._get_baichuan_object()
         if bc:
             self._baichuan = bc
 
-        # Try mic input sources (this is slow: RTSP probing can take 10-15s)
         rtsp_started = await self._start_rtsp_audio_input()
         if rtsp_started:
             _LOGGER.warning("Audio input: using ffmpeg/RTSP (continuous audio)")
         else:
-            # Fallback: try other ffmpeg sources (FLV, RTMP)
             ffmpeg_started = await self._start_ffmpeg_fallback_input()
             if ffmpeg_started:
                 _LOGGER.warning("Audio input: using ffmpeg fallback (FLV/RTMP)")
             elif bc:
-                # Last resort: native Baichuan Preview (sparse but works)
                 preview_ok = await self._start_preview_stream()
                 if preview_ok:
                     _LOGGER.warning(
@@ -580,6 +680,56 @@ class ReolinkAudioHandler:
         except Exception as exc:
             _LOGGER.warning("Error checking/enabling RTSP: %s", exc)
 
+    async def _start_ffmpeg_with_url(self, url: str, label: str = "CACHED") -> bool:
+        """Start ffmpeg audio input with a specific known-good URL (no probing)."""
+        ffmpeg_args = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostats"]
+        if url.startswith("rtsp://"):
+            ffmpeg_args.extend(["-rtsp_transport", "tcp"])
+        elif url.startswith("https://"):
+            ffmpeg_args.extend(["-tls_verify", "0"])
+        ffmpeg_args.extend([
+            "-fflags", "+nobuffer+flush_packets",
+            "-flags", "low_delay",
+            "-analyzeduration", "500000",
+            "-probesize", "500000",
+            "-i", url,
+            "-vn",
+            "-acodec", "pcm_s16le",
+            "-ar", str(AUDIO_INPUT_SAMPLE_RATE),
+            "-ac", "1",
+            "-f", "s16le",
+            "pipe:1",
+        ])
+
+        proc = await asyncio.create_subprocess_exec(
+            *ffmpeg_args,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        # Wait briefly for connection
+        await asyncio.sleep(1.5)
+        if proc.returncode is not None:
+            stderr_data = b""
+            try:
+                stderr_data = await asyncio.wait_for(proc.stderr.read(2000), timeout=1.0)
+            except Exception:
+                pass
+            _LOGGER.warning(
+                "%s audio: ffmpeg failed for cached URL (rc=%d): %s",
+                label, proc.returncode,
+                stderr_data.decode(errors="replace").strip()[:200] if stderr_data else "",
+            )
+            return False
+
+        _LOGGER.warning("✓ %s audio input connected (ffmpeg PID=%d)", label, proc.pid)
+        self._listen_active = True
+        self._input_processor_task = asyncio.create_task(
+            self._ffmpeg_audio_read_loop(proc, label)
+        )
+        return True
+
     async def _start_rtsp_audio_input(self) -> bool:
         """Start continuous audio capture via ffmpeg reading from RTSP.
 
@@ -708,10 +858,18 @@ class ReolinkAudioHandler:
                 f"&password={encoded_pass}"
             )
             urls_to_try.append((http_flv, "HTTP-FLV"))
+            # HTTPS FLV (port 443) — works when HTTP is blocked/redirected
+            https_flv = (
+                f"https://{self._reolink_host}:443/flv?port=1935&app=bcs"
+                f"&stream=channel0_sub.bcs&user={self._reolink_user}"
+                f"&password={encoded_pass}"
+            )
+            urls_to_try.append((https_flv, "HTTPS-FLV"))
 
+        # Also try discovered FLV URL if different from constructed ones
         flv_url = getattr(self, "_reolink_flv_url", None)
-        if flv_url:
-            urls_to_try.append((flv_url, "HTTPS-FLV"))
+        if flv_url and flv_url not in [u for u, _ in urls_to_try]:
+            urls_to_try.append((flv_url, "HTTPS-FLV-discovered"))
 
         # Direct RTMP (often port 1935 is blocked)
         rtmp_url = getattr(self, "_reolink_rtmp_url", None)

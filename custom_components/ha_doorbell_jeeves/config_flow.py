@@ -66,6 +66,8 @@ from .const import (
     CONF_PIN_CODE,
     CONF_PROVIDER,
     CONF_REOLINK_ENTRY_ID,
+    CONF_REOLINK_MIC_METHOD,
+    CONF_REOLINK_MIC_URL,
     CONF_SESSION_TIMEOUT,
     CONF_STOP_ENTITIES,
     CONF_SYSTEM_PROMPT,
@@ -337,6 +339,9 @@ class DoorbellJeevesConfigFlow(ConfigFlow, domain=DOMAIN):
                 self._data.pop(CONF_MEDIA_PLAYER_ENTITY, None)
                 self._data.pop(CONF_MICROPHONE_ENTITY, None)
 
+                # Probe audio input methods in background and cache the result
+                await self._probe_reolink_audio(str(reolink_entry_id))
+
                 trigger_entity = _auto_detect_reolink_trigger_entity(self.hass, str(reolink_entry_id))
                 if trigger_entity:
                     self._data["doorbell_trigger_entity"] = trigger_entity
@@ -356,6 +361,31 @@ class DoorbellJeevesConfigFlow(ConfigFlow, domain=DOMAIN):
             ),
             errors=errors,
         )
+
+    async def _probe_reolink_audio(self, reolink_entry_id: str) -> None:
+        """Probe audio input methods for a Reolink camera and cache the best one."""
+        from .reolink_audio import get_reolink_config, probe_audio_input_method  # noqa: PLC0415
+
+        reolink_config = get_reolink_config(self.hass, reolink_entry_id)
+        if not reolink_config or not reolink_config.get("host"):
+            return
+
+        try:
+            method, url = await probe_audio_input_method(
+                host=reolink_config["host"],
+                username=reolink_config.get("username", ""),
+                password=reolink_config.get("password", ""),
+                rtsp_port=reolink_config.get("rtsp_port", 554),
+            )
+            if method != "none":
+                self._data[CONF_REOLINK_MIC_METHOD] = method
+                self._data[CONF_REOLINK_MIC_URL] = url
+                _LOGGER.info("Audio probe result: method=%s", method)
+            else:
+                self._data.pop(CONF_REOLINK_MIC_METHOD, None)
+                self._data.pop(CONF_REOLINK_MIC_URL, None)
+        except Exception:
+            _LOGGER.warning("Audio probe failed (non-critical)", exc_info=True)
 
     async def async_step_manual_audio(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         errors: dict[str, str] = {}
@@ -842,6 +872,9 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                 self._data.pop(CONF_GO2RTC_OUTPUT_STREAM_NAME, None)
                 self._data.pop(CONF_MEDIA_PLAYER_ENTITY, None)
                 self._data.pop(CONF_MICROPHONE_ENTITY, None)
+
+                # Probe audio input methods and cache the best one
+                await self._probe_reolink_audio(reolink_entry_id)
 
                 trigger_entity = _auto_detect_reolink_trigger_entity(self.hass, reolink_entry_id)
                 if trigger_entity:
