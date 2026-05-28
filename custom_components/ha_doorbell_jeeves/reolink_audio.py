@@ -487,18 +487,31 @@ class ReolinkAudioHandler:
         cached_method = getattr(self, "_cached_mic_method", "") or ""
         cached_url = getattr(self, "_cached_mic_url", "") or ""
 
-        if cached_method and cached_url:
-            # Fast path: use the pre-probed working method directly
+        if cached_method:
             _LOGGER.warning("Audio input: using cached method '%s'", cached_method)
-            # For go2rtc methods, ensure the stream is active first
-            if "go2rtc" in cached_method:
+
+            # For methods with dynamic URLs (HLS tokens expire), regenerate
+            if cached_method == "ha_hls":
+                cached_url = await self._get_ha_hls_stream_url() or ""
+                if not cached_url:
+                    _LOGGER.warning("Audio input: could not get fresh HLS URL — falling back")
+                    cached_method = ""
+            elif cached_method == "go2rtc_http":
                 await self._ensure_go2rtc_stream_active()
-            started = await self._start_ffmpeg_with_url(cached_url, cached_method.upper())
-            if started:
-                _LOGGER.warning("Audio input: %s connected (cached)", cached_method)
-                return
-            # Clear stale cache so we don't keep trying a broken method
-            _LOGGER.warning("Audio input: cached method '%s' failed — clearing cache", cached_method)
+                cached_url = await self._get_go2rtc_http_stream_url() or ""
+                if not cached_url:
+                    cached_method = ""
+            elif "go2rtc" in cached_method:
+                await self._ensure_go2rtc_stream_active()
+
+            if cached_method and cached_url:
+                started = await self._start_ffmpeg_with_url(cached_url, cached_method.upper())
+                if started:
+                    _LOGGER.warning("Audio input: %s connected (cached)", cached_method)
+                    return
+                # Clear stale cache so we don't keep trying a broken method
+                _LOGGER.warning("Audio input: cached method '%s' failed — clearing cache", cached_method)
+
             self._cached_mic_method = ""
             self._cached_mic_url = ""
 

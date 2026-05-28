@@ -630,12 +630,11 @@ class JeevesSessionManager:
         await self._audio_handler.start()
         _LOGGER.info("Reolink audio handler active (stream=%s)", stream_name)
 
-        # If no cached method was available, save what the handler discovered
-        # for future sessions (the handler's fallback path found a working URL)
-        if not cached_method and self._audio_handler._listen_active:
+        # Save the discovered method for future sessions if it differs from cache
+        if self._audio_handler._listen_active:
             discovered_url = getattr(self._audio_handler, "_discovered_mic_url", "")
             discovered_method = getattr(self._audio_handler, "_discovered_mic_method", "")
-            if discovered_method and discovered_url:
+            if discovered_method and discovered_method != cached_method:
                 new_options = dict(self.entry.options)
                 new_options[CONF_REOLINK_MIC_METHOD] = discovered_method
                 new_options[CONF_REOLINK_MIC_URL] = discovered_url
