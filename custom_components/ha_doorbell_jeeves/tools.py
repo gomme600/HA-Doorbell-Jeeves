@@ -93,6 +93,66 @@ def _position_description(x: float, y: float) -> str:
     return " ".join(parts) + " of house" if parts else "near the house"
 
 
+def render_camera_map_image(store: DataStore) -> bytes | None:
+    """Render a simple visual map of camera placements as a JPEG image.
+
+    Returns JPEG bytes or None if no placements or PIL unavailable.
+    This image is sent to the model at session start for spatial understanding.
+    """
+    if not store.camera_placements:
+        return None
+    try:
+        from PIL import Image, ImageDraw, ImageFont  # noqa: PLC0415
+    except ImportError:
+        return None
+
+    W, H = 400, 400
+    img = Image.new("RGB", (W, H), (240, 240, 240))
+    draw = ImageDraw.Draw(img)
+
+    # Draw house rectangle (center 25%-75%)
+    house_rect = (W * 0.25, H * 0.25, W * 0.75, H * 0.75)
+    draw.rectangle(house_rect, outline=(100, 100, 200), width=3)
+    draw.text((W * 0.45, H * 0.48), "HOUSE", fill=(100, 100, 200))
+
+    # Draw compass
+    draw.text((W * 0.47, 5), "N", fill=(80, 80, 80))
+    draw.text((W * 0.47, H - 18), "S", fill=(80, 80, 80))
+    draw.text((5, H * 0.48), "W", fill=(80, 80, 80))
+    draw.text((W - 15, H * 0.48), "E", fill=(80, 80, 80))
+
+    import math  # noqa: PLC0415
+    for cp in store.camera_placements:
+        cx = int(cp.x * W)
+        cy = int(cp.y * H)
+
+        # Draw FOV triangle
+        fov_len = 35
+        fov_half = 30  # degrees
+        rad = math.radians(cp.rotation)
+        l_rad = math.radians(cp.rotation - fov_half)
+        r_rad = math.radians(cp.rotation + fov_half)
+        tip1 = (cx + math.sin(l_rad) * fov_len, cy - math.cos(l_rad) * fov_len)
+        tip2 = (cx + math.sin(r_rad) * fov_len, cy - math.cos(r_rad) * fov_len)
+        draw.polygon([(cx, cy), tip1, tip2], fill=(70, 130, 230, 60), outline=(70, 130, 230))
+
+        # Draw camera dot
+        color = (220, 50, 50) if cp.is_doorbell else (50, 150, 50)
+        draw.ellipse((cx - 6, cy - 6, cx + 6, cy + 6), fill=color, outline=(30, 30, 30))
+
+        # Label
+        label = cp.name
+        if cp.has_audio:
+            label += " 🎙"
+        draw.text((cx + 8, cy - 6), label, fill=(30, 30, 30))
+
+    # Convert to JPEG
+    import io  # noqa: PLC0415
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=80)
+    return buf.getvalue()
+
+
 def build_system_context(
     store: DataStore,
     hass: HomeAssistant,
@@ -139,23 +199,44 @@ def build_system_context(
     # Camera placement map (spatial context)
     if store.camera_placements:
         lines.append("\n--- CAMERA PLACEMENT MAP (spatial layout of the property) ---")
-        lines.append("Cameras are placed around the property. Positions are relative to the house center.")
-        lines.append("Directions indicate where each camera points:")
+        lines.append(
+            "Property map uses a coordinate grid: x=0 (west) to x=1 (east), "
+            "y=0 (north) to y=1 (south). The house is at center (~0.25-0.75)."
+        )
+        lines.append("Each camera's exact position and facing direction:")
         for cp in store.camera_placements:
-            ptz_label = " [PTZ]" if cp.has_ptz else ""
-            doorbell_label = " [DOORBELL]" if cp.is_doorbell else ""
-            # Describe position relative to house center
+            caps = []
+            if cp.has_ptz:
+                caps.append("PTZ")
+            if cp.is_doorbell:
+                caps.append("DOORBELL")
+            if cp.has_audio:
+                caps.append("2-WAY AUDIO")
+            caps_str = f" [{', '.join(caps)}]" if caps else ""
             pos_desc = _position_description(cp.x, cp.y)
             lines.append(
                 f"• {cp.name} [{cp.entity_id}]: "
-                f"positioned {pos_desc}, facing {cp.facing_direction}{ptz_label}{doorbell_label}"
+                f"at ({cp.x:.2f}, {cp.y:.2f}) = {pos_desc}, "
+                f"facing {cp.facing_direction} ({int(cp.rotation)}°){caps_str}"
             )
             if cp.area_description:
                 lines.append(f"  Covers: {cp.area_description}")
+        lines.append(
+            "\nSpatial reasoning: If a person walks from a camera's view toward "
+            "another camera's position, they will appear on that next camera. "
+            "Use coordinates and facing directions to follow movement."
+        )
+        audio_cameras = [cp for cp in store.camera_placements if cp.has_audio]
+        if audio_cameras:
+            names = ", ".join(c.name for c in audio_cameras)
+            lines.append(
+                f"\n2-way audio cameras ({names}): You can switch_camera to talk/listen "
+                "from these cameras in addition to the doorbell."
+            )
         ptz_cameras = [cp for cp in store.camera_placements if cp.has_ptz]
         if ptz_cameras:
             lines.append(
-                "\nPTZ cameras can be moved with 'ptz_move' tool (up/down/left/right) "
+                "PTZ cameras can be moved with 'ptz_move' tool (up/down/left/right) "
                 "and returned to monitoring position with 'ptz_return_to_monitor'."
             )
 

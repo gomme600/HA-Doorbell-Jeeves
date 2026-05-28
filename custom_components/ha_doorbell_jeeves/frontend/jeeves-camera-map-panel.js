@@ -129,6 +129,7 @@ class JeevesCameraMapPanel extends HTMLElement {
         </svg>
         <div class="cam-icon">
           <ha-icon icon="${p.is_doorbell ? "mdi:doorbell-video" : "mdi:cctv"}"></ha-icon>
+          ${p.has_audio ? '<span class="audio-badge" title="2-way audio">🎙</span>' : ''}
         </div>
         <div class="cam-label">${p.name}</div>
         <div class="rotate-handle" data-idx="${idx}" title="Drag to rotate">
@@ -145,10 +146,6 @@ class JeevesCameraMapPanel extends HTMLElement {
     const ptzEntities = Object.keys(this._hass.states)
       .filter(eid => eid.startsWith("button.") || eid.startsWith("script."))
       .sort();
-    const ptzOptions = ptzEntities.map(eid => {
-      const friendly = this._hass.states[eid].attributes.friendly_name || eid;
-      return `<option value="${eid}">${friendly}</option>`;
-    }).join("");
     const makeSelect = (id, label, value) => `
       <label>${label}</label>
       <select id="${id}" class="ptz-select">
@@ -160,6 +157,9 @@ class JeevesCameraMapPanel extends HTMLElement {
         }).join("")}
       </select>
     `;
+    const audioStatus = p.has_audio
+      ? (p.audio_method ? `<span class="audio-ok">✓ ${p.audio_method}</span>` : '<span class="audio-pending">⏳ Not verified</span>')
+      : '';
     return `
       <div class="edit-panel">
         <div class="edit-header">
@@ -169,8 +169,14 @@ class JeevesCameraMapPanel extends HTMLElement {
         <div class="edit-body">
           <label>Area Description</label>
           <textarea id="edit-area" rows="2" placeholder="e.g. Front garden, driveway">${p.area_description || ""}</textarea>
-          <label>Is Doorbell</label>
-          <input type="checkbox" id="edit-doorbell" ${p.is_doorbell ? "checked" : ""}>
+          <div class="checkbox-row">
+            <label><input type="checkbox" id="edit-doorbell" ${p.is_doorbell ? "checked" : ""}> Is Doorbell</label>
+          </div>
+          <div class="checkbox-row">
+            <label><input type="checkbox" id="edit-audio" ${p.has_audio ? "checked" : ""}> 2-Way Audio</label>
+            ${audioStatus}
+            ${p.has_audio ? '<button class="verify-btn" id="verify-audio" title="Verify audio stream path">Verify</button>' : ''}
+          </div>
           <label>Rotation: <span id="rot-val">${Math.round(p.rotation || 0)}°</span></label>
           <input type="range" id="edit-rotation" min="0" max="360" value="${p.rotation || 0}">
           <div class="ptz-section">
@@ -214,6 +220,7 @@ class JeevesCameraMapPanel extends HTMLElement {
         x, y, rotation: 0,
         area_description: cam ? cam.description : "",
         is_doorbell: false,
+        has_audio: false, audio_method: "", audio_url: "",
         ptz_up: "", ptz_down: "", ptz_left: "", ptz_right: "", ptz_return_to_monitor: "",
       });
       this._save();
@@ -296,6 +303,7 @@ class JeevesCameraMapPanel extends HTMLElement {
         const p = this._placements[this._selected];
         p.area_description = this.shadowRoot.getElementById("edit-area").value;
         p.is_doorbell = this.shadowRoot.getElementById("edit-doorbell").checked;
+        p.has_audio = this.shadowRoot.getElementById("edit-audio").checked;
         p.rotation = parseFloat(this.shadowRoot.getElementById("edit-rotation").value);
         p.ptz_up = this.shadowRoot.getElementById("ptz-up").value.trim();
         p.ptz_down = this.shadowRoot.getElementById("ptz-down").value.trim();
@@ -304,6 +312,34 @@ class JeevesCameraMapPanel extends HTMLElement {
         p.ptz_return_to_monitor = this.shadowRoot.getElementById("ptz-return").value.trim();
         this._save();
         this._render();
+      });
+    }
+
+    // Verify audio button
+    const verifyBtn = this.shadowRoot.getElementById("verify-audio");
+    if (verifyBtn) {
+      verifyBtn.addEventListener("click", async () => {
+        const p = this._placements[this._selected];
+        verifyBtn.textContent = "Checking...";
+        verifyBtn.disabled = true;
+        try {
+          const result = await this._hass.callWS({
+            type: "ha_doorbell_jeeves/camera_placements/verify_audio",
+            entity_id: p.entity_id,
+          });
+          if (result.success) {
+            p.audio_method = result.method;
+            p.audio_url = result.url || "";
+            this._save();
+            this._render();
+          } else {
+            verifyBtn.textContent = "Failed: " + (result.error || "unknown");
+            setTimeout(() => this._render(), 3000);
+          }
+        } catch (e) {
+          verifyBtn.textContent = "Error: " + e.message;
+          setTimeout(() => this._render(), 3000);
+        }
       });
     }
 
@@ -384,6 +420,12 @@ class JeevesCameraMapPanel extends HTMLElement {
         background: var(--card-background-color); padding: 1px 5px; border-radius: 4px;
         box-shadow: 0 1px 3px rgba(0,0,0,0.2); z-index: 2;
       }
+      .audio-badge {
+        position: absolute; top: -4px; right: -4px; font-size: 10px;
+        background: var(--card-background-color); border-radius: 50%;
+        width: 14px; height: 14px; display: flex; align-items: center;
+        justify-content: center; box-shadow: 0 1px 2px rgba(0,0,0,0.3);
+      }
       .fov-triangle {
         position: absolute;
         top: 50%; left: 50%;
@@ -438,6 +480,16 @@ class JeevesCameraMapPanel extends HTMLElement {
         font-size: 0.82rem; box-sizing: border-box;
         background: var(--card-background-color); color: var(--primary-text-color);
       }
+      .checkbox-row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+      .checkbox-row label { display: flex; align-items: center; gap: 4px; font-size: 0.85rem; cursor: pointer; }
+      .audio-ok { color: var(--success-color, #4caf50); font-size: 0.75rem; }
+      .audio-pending { color: var(--warning-color, #ff9800); font-size: 0.75rem; }
+      .verify-btn {
+        padding: 2px 8px; font-size: 0.72rem; border: 1px solid var(--primary-color);
+        border-radius: 4px; background: transparent; color: var(--primary-color);
+        cursor: pointer;
+      }
+      .verify-btn:hover { background: var(--primary-color); color: white; }
       .save-btn {
         display: block; width: 100%; padding: 8px; margin-top: 12px;
         background: var(--primary-color); color: white; border: none;

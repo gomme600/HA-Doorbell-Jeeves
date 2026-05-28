@@ -327,6 +327,23 @@ class JeevesSessionManager:
                 full_prompt += f"\n\n{identity_context}"
 
             reference_images = self._get_reference_images()
+
+            # Add visual camera map if placements exist
+            from .tools import render_camera_map_image  # noqa: PLC0415
+            map_jpeg = await self.hass.async_add_executor_job(
+                render_camera_map_image, self.store
+            )
+            if map_jpeg:
+                reference_images.append({
+                    "image_base64": base64.b64encode(map_jpeg).decode(),
+                    "caption": (
+                        "PROPERTY CAMERA MAP: This image shows the spatial layout of all cameras. "
+                        "The grey rectangle is the house. Camera dots show positions, triangles show "
+                        "viewing direction (FOV). Red dot = doorbell. Green dot = other cameras. "
+                        "Use this to understand which camera sees which area."
+                    ),
+                })
+                _LOGGER.info("Injected camera map image (%d bytes) into session context", len(map_jpeg))
             gemini_tools = await self.hass.async_add_executor_job(
                 build_gemini_tools, self.store, config
             )

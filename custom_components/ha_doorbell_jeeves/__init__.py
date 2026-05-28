@@ -573,6 +573,79 @@ def _register_ws_commands(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_save_placements)
     websocket_api.async_register_command(hass, ws_list_available_cameras)
 
+    @websocket_api.websocket_command({
+        vol.Required("type"): f"{DOMAIN}/camera_placements/verify_audio",
+        vol.Optional("entry_id"): str,
+        vol.Required("entity_id"): str,
+    })
+    @websocket_api.async_response
+    async def ws_verify_audio(
+        hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
+    ) -> None:
+        """Verify audio stream path for a camera (same discovery as doorbell)."""
+        from .reolink_audio import (  # noqa: PLC0415
+            ReolinkAudioHandler,
+            _discover_go2rtc_url,
+            find_reolink_entry_for_camera,
+        )
+
+        camera_entity = msg["entity_id"]
+        manager = _get_manager_from_msg(hass, msg)
+
+        # Discover the best audio input method
+        method = ""
+        url = ""
+        try:
+            # Create a temporary handler to discover the stream
+            handler = ReolinkAudioHandler(hass, "verify_probe", lambda x: None)
+            handler._camera_entity_id = camera_entity
+            reolink_entry_id = find_reolink_entry_for_camera(hass, camera_entity)
+            if reolink_entry_id:
+                handler._reolink_entry_id = reolink_entry_id
+            await handler._discover_reolink_details()
+
+            # Check go2rtc first
+            go2rtc_url = await _discover_go2rtc_url(hass)
+            if go2rtc_url and handler._camera_unique_id:
+                import aiohttp  # noqa: PLC0415
+                stream_name = handler._camera_unique_id
+                api_url = f"{go2rtc_url}/api/streams?src={stream_name}"
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(api_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                            if resp.status == 200:
+                                method = "go2rtc"
+                                url = f"{go2rtc_url}/api/ws?src={stream_name}"
+                except Exception:
+                    pass
+
+            # Fallback to RTSP
+            if not method and handler._reolink_rtsp_url:
+                method = "rtsp"
+                url = handler._reolink_rtsp_url
+
+            # Fallback to FLV
+            if not method and handler._reolink_flv_url:
+                method = "flv"
+                url = handler._reolink_flv_url
+
+            if method:
+                # Cache the result in the placement
+                if manager:
+                    for cp in manager.store.camera_placements:
+                        if cp.entity_id == camera_entity:
+                            cp.audio_method = method
+                            cp.audio_url = url
+                            break
+                    await manager.store.async_save_entities()
+                connection.send_result(msg["id"], {"success": True, "method": method, "url": url})
+            else:
+                connection.send_result(msg["id"], {"success": False, "error": "No audio stream found"})
+        except Exception as exc:
+            connection.send_result(msg["id"], {"success": False, "error": str(exc)})
+
+    websocket_api.async_register_command(hass, ws_verify_audio)
+
 
 def _get_manager_from_msg(hass: HomeAssistant, msg: dict) -> JeevesSessionManager | None:
     """Resolve a session manager from a WS message (uses entry_id or first available)."""

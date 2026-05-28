@@ -222,6 +222,9 @@ class CameraPlacement:
     facing: str = ""  # legacy
     area_description: str = ""  # e.g., "Front garden, driveway, mailbox"
     is_doorbell: bool = False
+    has_audio: bool = False  # 2-way audio capable (mic + speaker)
+    audio_method: str = ""  # Cached best audio input method (go2rtc_rtsp, rtsp, etc.)
+    audio_url: str = ""  # Cached audio stream URL
     # PTZ capabilities (entity IDs for PTZ controls)
     ptz_up: str = ""
     ptz_down: str = ""
@@ -241,6 +244,9 @@ class CameraPlacement:
             "facing": self.facing,
             "area_description": self.area_description,
             "is_doorbell": self.is_doorbell,
+            "has_audio": self.has_audio,
+            "audio_method": self.audio_method,
+            "audio_url": self.audio_url,
             "ptz_up": self.ptz_up,
             "ptz_down": self.ptz_down,
             "ptz_left": self.ptz_left,
@@ -281,6 +287,9 @@ class CameraPlacement:
             facing=data.get("facing", ""),
             area_description=data.get("area_description", ""),
             is_doorbell=data.get("is_doorbell", False),
+            has_audio=data.get("has_audio", False),
+            audio_method=data.get("audio_method", ""),
+            audio_url=data.get("audio_url", ""),
             ptz_up=data.get("ptz_up", ""),
             ptz_down=data.get("ptz_down", ""),
             ptz_left=data.get("ptz_left", ""),
