@@ -80,11 +80,10 @@
         "data": {
           "entity_id": "Camera Entity",
           "name": "Display Name",
-          "side": "House Side",
-          "offset": "Position Along Side",
-          "facing": "Facing Direction",
-          "area_description": "Area Description",
+          "rotation": "Facing Direction (degrees)",
+          "area_description": "Area Description (what the camera covers)",
           "is_doorbell": "Is Doorbell Camera",
+          "has_audio": "2-Way Audio (mic + speaker)",
           "ptz_up": "PTZ Up Control",
           "ptz_down": "PTZ Down Control",
           "ptz_left": "PTZ Left Control",
@@ -324,12 +323,12 @@
       },
       "add_audio_file": {
         "title": "Add Audio File",
-        "description": "Add an audio file the AI agent can play over speakers or cameras. Use this for sound effects, alerts, themed audio (e.g., Halloween sounds), or any audio you want the agent to trigger during conversations.",
+        "description": "Add an audio file the AI agent can play over speakers or cameras.\n\nFor **Media ID**, use a Home Assistant media source path like:\n`media-source://media_source/local/sounds/scream.mp3`\nor a direct URL like `http://example.com/sound.mp3`",
         "data": {
-          "name": "Name",
+          "name": "Sound Name (e.g. Scary Scream)",
           "media_id": "Media Content ID or URL",
-          "description": "Description (for the AI agent)",
-          "category": "Category",
+          "description": "Description for the AI (e.g. A loud scream, good for scaring trick-or-treaters)",
+          "category": "Category (e.g. Halloween, Alerts, Doorbells)",
           "media_type": "Media Type"
         }
       },
@@ -484,11 +483,10 @@
         "data": {
           "entity_id": "Camera Entity",
           "name": "Display Name",
-          "side": "House Side",
-          "offset": "Position Along Side",
-          "facing": "Facing Direction",
-          "area_description": "Area Description",
+          "rotation": "Facing Direction (degrees)",
+          "area_description": "Area Description (what the camera covers)",
           "is_doorbell": "Is Doorbell Camera",
+          "has_audio": "2-Way Audio (mic + speaker)",
           "ptz_up": "PTZ Up Control",
           "ptz_down": "PTZ Down Control",
           "ptz_left": "PTZ Left Control",

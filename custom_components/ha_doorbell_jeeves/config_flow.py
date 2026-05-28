@@ -855,6 +855,7 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                 rotation=float(user_input.get("rotation", 0)),
                 area_description=user_input.get("area_description", ""),
                 is_doorbell=user_input.get("is_doorbell", False),
+                has_audio=user_input.get("has_audio", False),
                 ptz_up=_clean_text(user_input.get("ptz_up", "")),
                 ptz_down=_clean_text(user_input.get("ptz_down", "")),
                 ptz_left=_clean_text(user_input.get("ptz_left", "")),
@@ -878,6 +879,7 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
             ),
             vol.Optional("area_description", default=""): TextSelector(TextSelectorConfig(multiline=True)),
             vol.Optional("is_doorbell", default=False): BooleanSelector(),
+            vol.Optional("has_audio", default=False): BooleanSelector(),
         }
         ptz_selector = EntitySelectorConfig(domain=["button", "script"])
         _add_optional_entity_selector(schema, "ptz_up", None, ptz_selector)
@@ -889,7 +891,7 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
             step_id="add_camera_placement",
             data_schema=vol.Schema(schema),
             description_placeholders={
-                "tip": "Use the Camera Map card on your dashboard for visual placement. "
+                "tip": "Use the Camera Map card on your dashboard for visual placement and audio verification. "
                        "This form is for basic setup only."
             },
         )
@@ -1616,19 +1618,12 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
             step_id="add_audio_file",
             data_schema=vol.Schema(
                 {
-                    vol.Required("name"): TextSelector(TextSelectorConfig(
-                        prefix="Name (shown to agent)"
-                    )),
-                    vol.Required("media_id"): TextSelector(TextSelectorConfig(
-                        prefix="Media ID or URL (e.g. media-source://media_source/local/sounds/scream.mp3)"
-                    )),
+                    vol.Required("name"): TextSelector(),
+                    vol.Required("media_id"): TextSelector(),
                     vol.Optional("description", default=""): TextSelector(TextSelectorConfig(
                         multiline=True,
-                        prefix="Description (context for the agent, e.g. 'A scary scream sound')"
                     )),
-                    vol.Optional("category", default=""): TextSelector(TextSelectorConfig(
-                        prefix="Category (e.g. Halloween, Alerts, Doorbells)"
-                    )),
+                    vol.Optional("category", default=""): TextSelector(),
                     vol.Optional("media_type", default="music"): SelectSelector(
                         SelectSelectorConfig(
                             options=[
