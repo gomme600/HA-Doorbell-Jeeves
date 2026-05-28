@@ -109,7 +109,7 @@ CONF_REOLINK_MIC_URL = "reolink_mic_url"  # Cached working URL for mic input
 # ─── Defaults ─────────────────────────────────────────────────────────────────
 
 DEFAULT_PROVIDER = PROVIDER_GEMINI
-DEFAULT_MODEL_GEMINI = "gemini-2.5-flash-native-audio-dialog"
+DEFAULT_MODEL_GEMINI = "gemini-2.5-flash-native-audio-latest"
 DEFAULT_MODEL_OPENAI = "gpt-4o-realtime-preview"
 DEFAULT_TOOL_MODEL_GEMINI = "gemini-3.1-flash-lite"
 DEFAULT_TOOL_MODEL_OPENAI = "gpt-4.1"

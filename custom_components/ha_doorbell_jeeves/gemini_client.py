@@ -121,15 +121,17 @@ class GeminiLiveClient(BaseRealtimeClient):
             )
             self._session = await self._session_cm.__aenter__()
             await self._inject_reference_images()
-            # Re-trigger greeting on new session
+            # Send a continuation prompt (not full greeting — visitor already
+            # heard part of it). This avoids the greeting repeating.
             await self._session.send_client_content(
                 turns=[types.Content(role="user", parts=[types.Part(text=(
-                    "[SYSTEM] A visitor is at the doorbell. "
-                    "Start speaking your greeting immediately."
+                    "[SYSTEM] You were greeting a visitor but the connection dropped. "
+                    "Continue naturally — do NOT repeat your greeting. "
+                    "Just listen for the visitor's response."
                 ))])],
                 turn_complete=True,
             )
-            _LOGGER.warning("Gemini reconnected successfully — greeting re-sent")
+            _LOGGER.warning("Gemini reconnected — continuation prompt sent")
             return True
         except Exception:
             _LOGGER.exception("Gemini reconnect failed")
@@ -266,7 +268,7 @@ class GeminiLiveClient(BaseRealtimeClient):
     async def _receive_loop(self) -> None:
         turns_completed = 0
         reconnect_attempts = 0
-        max_reconnects = 2
+        max_reconnects = 5
         try:
             # NOTE: In the GenAI SDK, session.receive() can complete after a turn.
             # Re-enter receive() to keep the live session open across turns.
@@ -284,10 +286,13 @@ class GeminiLiveClient(BaseRealtimeClient):
                         # Early disconnect — try to reconnect if within first turn
                         if turns_completed == 0 and reconnect_attempts < max_reconnects:
                             reconnect_attempts += 1
+                            # Increasing delay to avoid rapid reconnect loops
+                            delay = 0.5 * reconnect_attempts
                             _LOGGER.warning(
-                                "Early Gemini disconnect (attempt %d/%d) — reconnecting...",
-                                reconnect_attempts, max_reconnects,
+                                "Early Gemini disconnect (attempt %d/%d) — reconnecting in %.1fs...",
+                                reconnect_attempts, max_reconnects, delay,
                             )
+                            await asyncio.sleep(delay)
                             if await self._reconnect_session():
                                 consecutive_empty_iters = 0
                                 continue
