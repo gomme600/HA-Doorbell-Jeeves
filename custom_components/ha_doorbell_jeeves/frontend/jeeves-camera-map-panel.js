@@ -10,14 +10,19 @@
 
 class JeevesCameraMapPanel extends HTMLElement {
   static getConfigElement() { return null; }
-  static getStubConfig() { return { type: "custom:jeeves-camera-map-panel" }; }
+  static getStubConfig() { return {}; }
 
   setConfig(config) {
+    if (!config || typeof config !== "object") {
+      throw new Error("Invalid configuration");
+    }
     this._config = config;
     if (!this.shadowRoot) {
       this.attachShadow({ mode: "open" });
     }
   }
+
+  getCardSize() { return 6; }
 
   set hass(hass) {
     this._hass = hass;
