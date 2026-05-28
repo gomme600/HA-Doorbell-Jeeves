@@ -53,6 +53,7 @@ class GeminiLiveClient(BaseRealtimeClient):
         self._conversation_turns: list[dict[str, str]] = []
         self._recap_future: asyncio.Future[str] | None = None
         self._pending_tool_image: tuple[str, str] | None = None
+        self._tool_call_pending = False
 
     @property
     def connected(self) -> bool:
@@ -139,6 +140,7 @@ class GeminiLiveClient(BaseRealtimeClient):
 
     async def disconnect(self) -> None:
         self._connected = False
+        self._tool_call_pending = False
         if self._receive_task and not self._receive_task.done():
             self._receive_task.cancel()
             try:
@@ -159,6 +161,8 @@ class GeminiLiveClient(BaseRealtimeClient):
     async def send_audio(self, pcm_bytes: bytes) -> None:
         if not self._session or not self._connected:
             return
+        if self._tool_call_pending:
+            return
         try:
             await self._session.send_realtime_input(
                 audio=types.Blob(
@@ -172,6 +176,8 @@ class GeminiLiveClient(BaseRealtimeClient):
     async def send_image(self, image_base64: str, mime_type: str = "image/jpeg") -> None:
         """Send an image frame to the live session via realtime video input."""
         if not self._session or not self._connected:
+            return
+        if self._tool_call_pending:
             return
         try:
             image_bytes = base64.b64decode(image_base64)
@@ -383,28 +389,33 @@ class GeminiLiveClient(BaseRealtimeClient):
             await self._handle_tool_call(tool_call)
 
     async def _handle_tool_call(self, tool_call: Any) -> None:
-        function_responses: list[types.FunctionResponse] = []
-        for fc in tool_call.function_calls:
-            try:
-                result = await self._on_tool_call(fc.name, fc.args or {})
-            except Exception:
-                result = {"error": f"Tool '{fc.name}' execution failed"}
-            function_responses.append(
-                types.FunctionResponse(id=fc.id, name=fc.name, response=result)
-            )
-        if self._session and self._connected:
-            try:
-                await self._session.send_tool_response(
-                    function_responses=function_responses
-                )
-            except Exception:
-                _LOGGER.exception("Failed to send tool response")
-            # Inject pending tool image AFTER the tool response so the model
-            # correlates the image with the tool call context
-            if self._pending_tool_image:
-                image_b64, mime_type = self._pending_tool_image
-                self._pending_tool_image = None
+        self._tool_call_pending = True
+        try:
+            function_responses: list[types.FunctionResponse] = []
+            for fc in tool_call.function_calls:
                 try:
-                    await self.send_image(image_b64, mime_type=mime_type)
+                    result = await self._on_tool_call(fc.name, fc.args or {})
                 except Exception:
-                    _LOGGER.exception("Failed to send tool image")
+                    result = {"error": f"Tool '{fc.name}' execution failed"}
+                function_responses.append(
+                    types.FunctionResponse(id=fc.id, name=fc.name, response=result)
+                )
+            if self._session and self._connected:
+                try:
+                    await self._session.send_tool_response(
+                        function_responses=function_responses
+                    )
+                except Exception:
+                    _LOGGER.exception("Failed to send tool response")
+        finally:
+            self._tool_call_pending = False
+
+        # Inject pending tool image AFTER the tool response so the model
+        # correlates the image with the tool call context
+        if self._session and self._connected and self._pending_tool_image:
+            image_b64, mime_type = self._pending_tool_image
+            self._pending_tool_image = None
+            try:
+                await self.send_image(image_b64, mime_type=mime_type)
+            except Exception:
+                _LOGGER.exception("Failed to send tool image")
