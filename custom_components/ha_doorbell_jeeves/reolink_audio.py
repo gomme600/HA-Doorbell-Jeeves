@@ -126,17 +126,29 @@ def _get_go2rtc_session(hass: HomeAssistant) -> aiohttp.ClientSession | None:
     try:
         go2rtc_data = hass.data.get("go2rtc")
         if go2rtc_data:
-            # Try various attribute names (varies by HA version)
-            for attr in ("session", "_session", "client_session"):
-                sess = getattr(go2rtc_data, attr, None)
+            if isinstance(go2rtc_data, str):
+                # In newer HA, hass.data["go2rtc"] might just be an entry_id string.
+                # Access the config entry's runtime_data for the actual server info.
+                _LOGGER.debug("go2rtc hass.data is a string (likely entry_id): %s", go2rtc_data[:50])
+            else:
+                # Try Go2RtcConfig dataclass (url + session)
+                url = getattr(go2rtc_data, "url", None)
+                sess = getattr(go2rtc_data, "session", None)
                 if sess and isinstance(sess, aiohttp.ClientSession):
                     return sess
-            # Log what we found for debugging
-            attrs = [a for a in dir(go2rtc_data) if not a.startswith("__")]
-            _LOGGER.warning(
-                "go2rtc data found but no session attr. Type=%s, attrs=%s",
-                type(go2rtc_data).__name__, attrs[:15],
-            )
+                # Try alternative attribute names
+                for attr in ("_session", "client_session"):
+                    sess = getattr(go2rtc_data, attr, None)
+                    if sess and isinstance(sess, aiohttp.ClientSession):
+                        return sess
+
+        # Try accessing via go2rtc config entry runtime_data
+        for entry in hass.config_entries.async_entries("go2rtc"):
+            rd = getattr(entry, "runtime_data", None)
+            if rd:
+                sess = getattr(rd, "_session", None)
+                if sess and isinstance(sess, aiohttp.ClientSession):
+                    return sess
     except (AttributeError, KeyError, TypeError) as exc:
         _LOGGER.debug("go2rtc session lookup failed: %s", exc)
     return None
@@ -744,7 +756,8 @@ class ReolinkAudioHandler:
         """
         # --- Try go2rtc internal RTSP first (bypasses camera auth issues) ---
         if self._camera_unique_id:
-            go2rtc_url = f"rtsp://127.0.0.1:8554/{self._camera_unique_id}"
+            # HA's managed go2rtc uses port 18554 for RTSP (127.0.0.1 only)
+            go2rtc_url = f"rtsp://127.0.0.1:18554/{self._camera_unique_id}"
             _LOGGER.warning("Audio input: trying go2rtc RTSP → %s", go2rtc_url)
             proc = await self._try_ffmpeg_rtsp(go2rtc_url)
             if proc:
