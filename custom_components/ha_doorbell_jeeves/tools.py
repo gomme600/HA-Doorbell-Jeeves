@@ -40,6 +40,7 @@ from .const import (
     TOOL_GET_CALENDAR,
     TOOL_GET_HISTORY,
     TOOL_GET_LLMVISION_EVENTS,
+    TOOL_PLAY_AUDIO,
     TOOL_PTZ_MOVE,
     TOOL_PTZ_RETURN,
     TOOL_SEARCH_EVENTS,
@@ -247,6 +248,20 @@ def build_system_context(
         for cal in calendar_entities:
             lines.append(f"• {cal.name} [{cal.entity_id}]: {cal.description}")
         lines.append("Use the 'get_calendar_events' tool to check upcoming events.")
+
+    # Audio files (playable sounds)
+    if store.audio_files:
+        lines.append("\n--- AUDIO FILES (you can play these over speakers/cameras) ---")
+        lines.append("Use the 'play_audio' tool to play any of these sounds:")
+        by_cat: dict[str, list[str]] = {}
+        for af in store.audio_files:
+            cat = af.category or "General"
+            by_cat.setdefault(cat, [])
+            desc = f" — {af.description}" if af.description else ""
+            by_cat[cat].append(f"• {af.name} (id: {af.id}){desc}")
+        for cat, items in by_cat.items():
+            lines.append(f"  [{cat}]")
+            lines.extend(f"    {item}" for item in items)
 
     # History/search capability (always available if entities exist)
     if readable_entities:
@@ -721,6 +736,46 @@ def build_gemini_tools(
             },
         ))
 
+    # ─── Play audio file ──────────────────────────────────────────────────────
+    if store.audio_files:
+        audio_ids = [af.id for af in store.audio_files]
+        # Build target list: all media_player entities + cameras with audio
+        target_entities = [
+            e.entity_id for e in store.managed_entities
+            if e.entity_id.startswith("media_player.")
+        ]
+        # Include cameras with 2-way audio
+        for cp in store.camera_placements:
+            if cp.has_audio and cp.entity_id not in target_entities:
+                target_entities.append(cp.entity_id)
+        declarations.append(types.FunctionDeclaration(
+            name=TOOL_PLAY_AUDIO,
+            description=(
+                "Play a pre-configured audio file/sound over a speaker or camera. "
+                "Use this to play sound effects, alerts, music, or themed audio "
+                "during interactions. The audio plays on the specified target device."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "audio_id": {
+                        "type": "string",
+                        "description": "Which audio file to play",
+                        "enum": audio_ids,
+                    },
+                    "target_entity_id": {
+                        "type": "string",
+                        "description": (
+                            "Which speaker/camera to play on. "
+                            "Use a media_player entity or a camera with 2-way audio."
+                        ),
+                        "enum": target_entities if target_entities else None,
+                    },
+                },
+                "required": ["audio_id"],
+            },
+        ))
+
     if not declarations:
         return []
     return [types.Tool(function_declarations=declarations)]
@@ -846,6 +901,40 @@ def build_openai_tools(
                     },
                 },
                 "required": ["camera_entity_id"],
+            },
+        })
+
+    # Play audio file
+    if store.audio_files:
+        audio_ids = [af.id for af in store.audio_files]
+        target_entities = [
+            e.entity_id for e in store.managed_entities
+            if e.entity_id.startswith("media_player.")
+        ]
+        for cp in store.camera_placements:
+            if cp.has_audio and cp.entity_id not in target_entities:
+                target_entities.append(cp.entity_id)
+        tools.append({
+            "type": "function",
+            "name": TOOL_PLAY_AUDIO,
+            "description": (
+                "Play a pre-configured audio file/sound over a speaker or camera."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "audio_id": {
+                        "type": "string",
+                        "description": "Which audio file to play",
+                        "enum": audio_ids,
+                    },
+                    "target_entity_id": {
+                        "type": "string",
+                        "description": "Speaker or camera to play on",
+                        "enum": target_entities if target_entities else None,
+                    },
+                },
+                "required": ["audio_id"],
             },
         })
 
@@ -1118,6 +1207,10 @@ async def execute_tool_call(
         if function_name == "extend_session":
             return _execute_extend_session(arguments, config)
 
+        # Play audio file
+        if function_name == TOOL_PLAY_AUDIO:
+            return await _execute_play_audio(hass, store, arguments, config)
+
         # Recall memories
         if function_name == "recall_memories":
             return await _execute_recall_memories(hass, store, arguments, config)
@@ -1293,6 +1386,79 @@ async def _execute_ptz_return(
         }
     except Exception as err:
         return {"error": f"PTZ return failed: {err}"}
+
+
+async def _execute_play_audio(
+    hass: HomeAssistant, store: DataStore, arguments: dict[str, Any],
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Play a configured audio file over a speaker or camera."""
+    audio_id = arguments.get("audio_id", "")
+    target = arguments.get("target_entity_id", "")
+
+    # Find the audio file
+    audio_file = None
+    for af in store.audio_files:
+        if af.id == audio_id:
+            audio_file = af
+            break
+    if not audio_file:
+        return {"error": f"Audio file '{audio_id}' not found."}
+
+    # Determine target entity
+    if not target:
+        # Default to the configured media player or doorbell camera
+        from .const import CONF_MEDIA_PLAYER_ENTITY  # noqa: PLC0415
+        target = (config or {}).get(CONF_MEDIA_PLAYER_ENTITY, "")
+    if not target:
+        return {"error": "No target speaker specified and no default configured."}
+
+    # Play the audio
+    try:
+        media_id = audio_file.media_id
+        media_type = audio_file.media_type
+
+        if target.startswith("media_player."):
+            await hass.services.async_call(
+                "media_player", "play_media",
+                {
+                    "entity_id": target,
+                    "media_content_id": media_id,
+                    "media_content_type": media_type,
+                },
+                blocking=True,
+            )
+        elif target.startswith("camera."):
+            # For cameras, use media_player.play_media if available via proxy
+            # or fall back to a generic approach
+            await hass.services.async_call(
+                "media_player", "play_media",
+                {
+                    "entity_id": target,
+                    "media_content_id": media_id,
+                    "media_content_type": media_type,
+                },
+                blocking=True,
+            )
+        else:
+            await hass.services.async_call(
+                "media_player", "play_media",
+                {
+                    "entity_id": target,
+                    "media_content_id": media_id,
+                    "media_content_type": media_type,
+                },
+                blocking=True,
+            )
+
+        _LOGGER.info("Playing audio '%s' on %s (media_id=%s)", audio_file.name, target, media_id)
+        return {
+            "success": True,
+            "message": f"Playing '{audio_file.name}' on {target}.",
+        }
+    except Exception as err:
+        _LOGGER.warning("Failed to play audio '%s' on %s: %s", audio_id, target, err)
+        return {"error": f"Failed to play audio: {err}"}
 
 
 async def _execute_get_calendar(

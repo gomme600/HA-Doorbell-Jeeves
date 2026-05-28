@@ -15,6 +15,7 @@ from .const import (
     STORAGE_VERSION,
 )
 from .models import (
+    AudioFile,
     CameraPlacement,
     KnownIdentity,
     ManagedEntity,
@@ -48,6 +49,7 @@ class DataStore:
         self.start_triggers: list[StartTrigger] = []
         self.task_instructions: list[TaskInstruction] = []
         self.camera_placements: list[CameraPlacement] = []
+        self.audio_files: list[AudioFile] = []
         self.known_identities: list[KnownIdentity] = []
 
     async def async_load(self) -> None:
@@ -71,6 +73,10 @@ class DataStore:
             self.camera_placements = [
                 CameraPlacement.from_dict(c)
                 for c in entity_data.get("camera_placements", [])
+            ]
+            self.audio_files = [
+                AudioFile.from_dict(a)
+                for a in entity_data.get("audio_files", [])
             ]
 
         # Identities
@@ -98,6 +104,7 @@ class DataStore:
             "start_triggers": [t.to_dict() for t in self.start_triggers],
             CONF_TASK_INSTRUCTIONS: [t.to_dict() for t in self.task_instructions],
             "camera_placements": [c.to_dict() for c in self.camera_placements],
+            "audio_files": [a.to_dict() for a in self.audio_files],
         }
         await self._entity_store.async_save(data)
 

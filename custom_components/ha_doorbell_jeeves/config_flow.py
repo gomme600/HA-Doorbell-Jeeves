@@ -1224,6 +1224,15 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
             desc_parts.append(
                 "**🔔 Notifications:**\n" + "\n".join(f"• {target.name} ({target.service})" for target in store.notification_targets)
             )
+        if store.audio_files:
+            by_cat: dict[str, list[str]] = {}
+            for af in store.audio_files:
+                cat = af.category or "General"
+                by_cat.setdefault(cat, []).append(af.name)
+            audio_lines = []
+            for cat, names in by_cat.items():
+                audio_lines.append(f"  *{cat}:* " + ", ".join(names))
+            desc_parts.append("**🔊 Audio Files:**\n" + "\n".join(audio_lines))
         desc = (
             "\n\n".join(desc_parts)
             if desc_parts
@@ -1239,9 +1248,11 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                 "add_action",
                 "edit_action",
                 "add_notification",
+                "add_audio_file",
                 "remove_entity",
                 "remove_action",
                 "remove_notification",
+                "remove_audio_file",
                 "init",
             ],
             description_placeholders={"entity_summary": desc},
@@ -1567,6 +1578,88 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
             data_schema=vol.Schema(
                 {
                     vol.Required("service"): SelectSelector(
+                        SelectSelectorConfig(options=options, mode=SelectSelectorMode.DROPDOWN)
+                    )
+                }
+            ),
+        )
+
+    async def async_step_add_audio_file(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Add an audio file the agent can play over speakers."""
+        from .models import AudioFile  # noqa: PLC0415
+
+        if user_input is not None:
+            store = await self._async_get_store()
+            # Generate a slug ID from the name
+            slug = re.sub(r"[^a-z0-9]+", "-", user_input["name"].lower()).strip("-")
+            if not slug:
+                slug = f"audio-{len(store.audio_files)}"
+            # Ensure unique
+            existing_ids = {af.id for af in store.audio_files}
+            base_slug = slug
+            counter = 1
+            while slug in existing_ids:
+                slug = f"{base_slug}-{counter}"
+                counter += 1
+            audio_file = AudioFile(
+                id=slug,
+                name=user_input["name"],
+                description=user_input.get("description", ""),
+                media_id=user_input["media_id"],
+                media_type=user_input.get("media_type", "music"),
+                category=user_input.get("category", ""),
+            )
+            store.audio_files.append(audio_file)
+            await store.async_save_entities()
+            return await self.async_step_entities()
+        return self.async_show_form(
+            step_id="add_audio_file",
+            data_schema=vol.Schema(
+                {
+                    vol.Required("name"): TextSelector(TextSelectorConfig(
+                        prefix="Name (shown to agent)"
+                    )),
+                    vol.Required("media_id"): TextSelector(TextSelectorConfig(
+                        prefix="Media ID or URL (e.g. media-source://media_source/local/sounds/scream.mp3)"
+                    )),
+                    vol.Optional("description", default=""): TextSelector(TextSelectorConfig(
+                        multiline=True,
+                        prefix="Description (context for the agent, e.g. 'A scary scream sound')"
+                    )),
+                    vol.Optional("category", default=""): TextSelector(TextSelectorConfig(
+                        prefix="Category (e.g. Halloween, Alerts, Doorbells)"
+                    )),
+                    vol.Optional("media_type", default="music"): SelectSelector(
+                        SelectSelectorConfig(
+                            options=[
+                                {"value": "music", "label": "Music/Audio"},
+                                {"value": "sound", "label": "Sound Effect"},
+                            ],
+                            mode=SelectSelectorMode.DROPDOWN,
+                        )
+                    ),
+                }
+            ),
+        )
+
+    async def async_step_remove_audio_file(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Remove an audio file."""
+        store = await self._async_get_store()
+        options = [
+            {"value": af.id, "label": f"{af.name} ({af.category or 'General'})"}
+            for af in store.audio_files
+        ]
+        if not options:
+            return await self.async_step_entities()
+        if user_input is not None:
+            store.audio_files = [af for af in store.audio_files if af.id != user_input["audio_id"]]
+            await store.async_save_entities()
+            return await self.async_step_entities()
+        return self.async_show_form(
+            step_id="remove_audio_file",
+            data_schema=vol.Schema(
+                {
+                    vol.Required("audio_id"): SelectSelector(
                         SelectSelectorConfig(options=options, mode=SelectSelectorMode.DROPDOWN)
                     )
                 }

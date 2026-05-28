@@ -311,6 +311,43 @@ class CameraPlacement:
 
 
 @dataclass
+class AudioFile:
+    """An audio file the agent can play over speakers/cameras.
+
+    media_id: HA media content ID (e.g. media-source://media_source/local/halloween/scream.mp3)
+              or a URL (http://...) or a local path (/media/sounds/doorbell.mp3)
+    """
+
+    id: str  # unique slug (e.g. "halloween-scream")
+    name: str  # friendly name shown to agent (e.g. "Scary Scream")
+    description: str = ""  # context for agent (e.g. "A loud scream, good for scaring visitors")
+    media_id: str = ""  # HA media content ID or URL
+    media_type: str = "music"  # HA media content type (music, sound, etc.)
+    category: str = ""  # optional grouping (e.g. "Halloween", "Alerts")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "description": self.description,
+            "media_id": self.media_id,
+            "media_type": self.media_type,
+            "category": self.category,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "AudioFile":
+        return cls(
+            id=data.get("id", ""),
+            name=data.get("name", ""),
+            description=data.get("description", ""),
+            media_id=data.get("media_id", ""),
+            media_type=data.get("media_type", "music"),
+            category=data.get("category", ""),
+        )
+
+
+@dataclass
 class AuditEntry:
     """Immutable audit log entry."""
 

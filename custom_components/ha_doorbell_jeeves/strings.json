@@ -239,9 +239,11 @@
           "add_action": "\u26a1 Add Action",
           "edit_action": "\ud83d\udee0\ufe0f Edit Action",
           "add_notification": "\ud83d\udd14 Add Notification Target",
+          "add_audio_file": "\ud83d\udd0a Add Audio File",
           "remove_entity": "\u2796 Remove Entity",
           "remove_action": "\ud83d\uddd1\ufe0f Remove Action",
           "remove_notification": "\ud83d\uddd1\ufe0f Remove Notification Target",
+          "remove_audio_file": "\ud83d\uddd1\ufe0f Remove Audio File",
           "init": "\u2190 Back to Menu"
         }
       },
@@ -318,6 +320,23 @@
         "title": "Remove Notification Target",
         "data": {
           "service": "Notification to Remove"
+        }
+      },
+      "add_audio_file": {
+        "title": "Add Audio File",
+        "description": "Add an audio file the AI agent can play over speakers or cameras. Use this for sound effects, alerts, themed audio (e.g., Halloween sounds), or any audio you want the agent to trigger during conversations.",
+        "data": {
+          "name": "Name",
+          "media_id": "Media Content ID or URL",
+          "description": "Description (for the AI agent)",
+          "category": "Category",
+          "media_type": "Media Type"
+        }
+      },
+      "remove_audio_file": {
+        "title": "Remove Audio File",
+        "data": {
+          "audio_id": "Audio File to Remove"
         }
       },
       "security": {
