@@ -70,7 +70,8 @@ class JeevesCardJSView(HomeAssistantView):
             self._content = b"\n".join(parts)
         return web.Response(
             body=self._content,
-            content_type="application/javascript; charset=utf-8",
+            content_type="application/javascript",
+            charset="utf-8",
             headers={"Cache-Control": "no-store"},
         )
 
