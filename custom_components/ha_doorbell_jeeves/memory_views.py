@@ -49,16 +49,28 @@ class JeevesCardJSView(HomeAssistantView):
         if self._content is None:
             loop = asyncio.get_running_loop()
             parts: list[bytes] = []
-            for path in _ALL_CARD_JS_PATHS:
+            for i, path in enumerate(_ALL_CARD_JS_PATHS):
                 try:
                     data = await loop.run_in_executor(None, path.read_bytes)
-                    parts.append(data)
+                    # Wrap each card in an IIFE with error handling so one
+                    # card's error doesn't prevent others from loading
+                    wrapped = (
+                        f'/* --- Jeeves card: {path.name} --- */\n'
+                        f'(function() {{\n'
+                        f'  console.info("[Jeeves] Loading {path.name}...");\n'
+                        f'  try {{\n'
+                    ).encode() + data + (
+                        f'\n    console.info("[Jeeves] {path.name} loaded OK");\n'
+                        f'  }} catch(_e) {{ console.error("[Jeeves] Error in {path.name}:", _e); }}\n'
+                        f'}})();\n'
+                    ).encode()
+                    parts.append(wrapped)
                 except OSError:
                     pass
-            self._content = b"\n;\n".join(parts)
+            self._content = b"\n".join(parts)
         return web.Response(
             body=self._content,
-            content_type="application/javascript",
+            content_type="application/javascript; charset=utf-8",
             headers={"Cache-Control": "no-store"},
         )
 
