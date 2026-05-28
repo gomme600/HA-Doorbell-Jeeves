@@ -772,6 +772,8 @@ class ReolinkAudioHandler:
             if proc:
                 _LOGGER.warning("✓ RTSP audio input connected (ffmpeg PID=%d)", proc.pid)
                 self._listen_active = True
+                self._discovered_mic_method = "rtsp"
+                self._discovered_mic_url = rtsp_url
                 self._input_processor_task = asyncio.create_task(
                     self._ffmpeg_audio_read_loop(proc, "RTSP")
                 )
@@ -928,6 +930,8 @@ class ReolinkAudioHandler:
             # Connected!
             _LOGGER.warning("✓ %s audio input connected (ffmpeg PID=%d)", label, proc.pid)
             self._listen_active = True
+            self._discovered_mic_method = label.lower().replace("-", "_")
+            self._discovered_mic_url = url
             self._input_processor_task = asyncio.create_task(
                 self._ffmpeg_audio_read_loop(proc, label)
             )

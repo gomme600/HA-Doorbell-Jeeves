@@ -615,32 +615,25 @@ class JeevesSessionManager:
         cached_method = config.get(CONF_REOLINK_MIC_METHOD, "")
         cached_url = config.get(CONF_REOLINK_MIC_URL, "")
 
-        # If no cached method, run a quick probe now and save for future sessions
-        if not cached_method:
-            from .reolink_audio import probe_audio_input_method  # noqa: PLC0415
-            reolink_config = get_reolink_config(self.hass, config.get(CONF_REOLINK_ENTRY_ID, ""))
-            if reolink_config and reolink_config.get("host"):
-                try:
-                    cached_method, cached_url = await probe_audio_input_method(
-                        host=reolink_config["host"],
-                        username=reolink_config.get("username", ""),
-                        password=reolink_config.get("password", ""),
-                        rtsp_port=reolink_config.get("rtsp_port", 554),
-                    )
-                    if cached_method != "none":
-                        # Save to config entry for future sessions
-                        new_options = dict(self.entry.options)
-                        new_options[CONF_REOLINK_MIC_METHOD] = cached_method
-                        new_options[CONF_REOLINK_MIC_URL] = cached_url
-                        self.hass.config_entries.async_update_entry(self.entry, options=new_options)
-                        _LOGGER.warning("Audio probe: cached method='%s' for future sessions", cached_method)
-                except Exception:
-                    _LOGGER.warning("Audio probe during session start failed", exc_info=True)
-
         self._audio_handler._cached_mic_method = cached_method
         self._audio_handler._cached_mic_url = cached_url
         await self._audio_handler.start()
         _LOGGER.info("Reolink audio handler active (stream=%s)", stream_name)
+
+        # If no cached method was available, save what the handler discovered
+        # for future sessions (the handler's fallback path found a working URL)
+        if not cached_method and self._audio_handler._listen_active:
+            discovered_url = getattr(self._audio_handler, "_discovered_mic_url", "")
+            discovered_method = getattr(self._audio_handler, "_discovered_mic_method", "")
+            if discovered_method and discovered_url:
+                new_options = dict(self.entry.options)
+                new_options[CONF_REOLINK_MIC_METHOD] = discovered_method
+                new_options[CONF_REOLINK_MIC_URL] = discovered_url
+                self.hass.config_entries.async_update_entry(self.entry, options=new_options)
+                _LOGGER.warning(
+                    "Audio: cached discovered method='%s' for future sessions",
+                    discovered_method,
+                )
 
         # --- Human Takeover Detection (both methods can run simultaneously) ---
 
