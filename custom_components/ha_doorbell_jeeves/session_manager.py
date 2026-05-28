@@ -1016,6 +1016,7 @@ class JeevesSessionManager:
         _LOGGER.info("Switching active camera to: %s", camera_entity_id)
         result: dict[str, Any] = {
             "video_switched": False,
+            "initial_frame_sent": False,
             "audio_switched": False,
             "audio_message": "Audio was not changed.",
         }
@@ -1029,6 +1030,9 @@ class JeevesSessionManager:
 
         # Update the config to point to the new camera
         self._config[CONF_CAMERA_ENTITY] = camera_entity_id
+        self._config[CONF_GO2RTC_STREAM_NAME] = camera_entity_id
+        self._config[CONF_GO2RTC_INPUT_STREAM_NAME] = camera_entity_id
+        self._config[CONF_GO2RTC_OUTPUT_STREAM_NAME] = camera_entity_id
         if self._audio_handler and self._audio_handler.is_active:
             self._audio_handler._camera_entity_id = camera_entity_id
 
@@ -1038,13 +1042,31 @@ class JeevesSessionManager:
             self._vision_task = asyncio.create_task(self._vision_loop(camera_entity_id, fps))
             result["video_switched"] = True
             _LOGGER.info("Vision loop restarted with camera: %s", camera_entity_id)
+            try:
+                image = await ha_camera_get_image(self.hass, camera_entity_id, timeout=5)
+                if image and image.content:
+                    max_w = self._config.get(CONF_FRAME_MAX_WIDTH, DEFAULT_FRAME_MAX_WIDTH)
+                    max_h = self._config.get(CONF_FRAME_MAX_HEIGHT, DEFAULT_FRAME_MAX_HEIGHT)
+                    quality = self._config.get(CONF_FRAME_QUALITY, DEFAULT_FRAME_QUALITY)
+                    processed = await self.hass.async_add_executor_job(
+                        process_frame, image.content, max_w, max_h, quality
+                    )
+                    frame_b64 = base64.b64encode(processed).decode("ascii")
+                    await self._client.send_image(frame_b64, mime_type="image/jpeg")
+                    result["initial_frame_sent"] = True
+                    _LOGGER.info("Sent immediate frame after switching to %s", camera_entity_id)
+            except Exception:
+                _LOGGER.warning("Could not send immediate frame for switched camera", exc_info=True)
 
         store = getattr(self, "store", None)
         placements = getattr(store, "camera_placements", []) if store else []
         placement = next((cp for cp in placements if cp.entity_id == camera_entity_id), None)
         if self._config.get(CONF_AUDIO_MODE) == AUDIO_MODE_REOLINK:
             if placement and placement.has_audio:
-                await self._restart_reolink_audio_for_camera(camera_entity_id, placement)
+                try:
+                    await self._restart_reolink_audio_for_camera(camera_entity_id, placement)
+                except Exception:
+                    _LOGGER.exception("Failed to restart audio for switched camera %s", camera_entity_id)
                 result["audio_switched"] = bool(self._audio_handler and self._audio_handler.is_active)
                 result["audio_message"] = (
                     "Two-way audio was switched to the selected camera."
