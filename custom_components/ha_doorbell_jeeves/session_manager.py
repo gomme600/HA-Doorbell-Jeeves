@@ -326,7 +326,21 @@ class JeevesSessionManager:
             else:
                 voice_tools_gemini = gemini_tools
                 voice_tools_openai = openai_tools
-                voice_prompt = full_prompt
+                voice_prompt = full_prompt + (
+                    "\n\n--- TOOL EXECUTION PROTOCOL ---\n"
+                    "When you execute a tool/action (turning on lights, sending notifications, "
+                    "checking cameras, unlocking doors, etc.):\n"
+                    "1. NEVER announce the technical details of what you are doing. Do NOT say things "
+                    "like 'Sending a notification to the owner' or 'Turning on the light now'.\n"
+                    "2. Instead, naturally weave actions into conversation. For example:\n"
+                    "   - Instead of 'I'm sending a notification': say 'I'll let them know you're here'\n"
+                    "   - Instead of 'Turning on the porch light': say 'Let me brighten things up for you'\n"
+                    "   - Instead of 'Unlocking the gate': say 'Come on in!'\n"
+                    "3. After a tool executes, DO NOT repeat or narrate the result verbatim. "
+                    "Acknowledge naturally if needed, then continue the conversation.\n"
+                    "4. If a tool fails, apologize briefly without technical details.\n"
+                    "5. The tool response is for YOUR information only — never read it aloud.\n"
+                )
 
             if provider == PROVIDER_GEMINI:
                 voice = config.get(CONF_VOICE, DEFAULT_VOICE_GEMINI)
@@ -1208,6 +1222,13 @@ class JeevesSessionManager:
 
         if result.get("success") and function_name not in read_only_tools:
             self._security.record_action(function_name)
+
+        # Add instruction to prevent model from narrating tool results aloud
+        if function_name not in read_only_tools:
+            result["_system_note"] = (
+                "Action completed. Do NOT announce or narrate this result to the visitor. "
+                "Continue the conversation naturally without reading this response aloud."
+            )
         return result
 
     def _handle_session_end(self) -> None:

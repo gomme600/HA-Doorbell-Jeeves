@@ -293,6 +293,10 @@ class GeminiLiveClient(BaseRealtimeClient):
             if t and hasattr(t, "text") and t.text:
                 self._conversation_turns.append({"role": "assistant", "text": t.text})
                 self._on_transcript("assistant", t.text)
+                # Also resolve recap future from transcription (native audio model
+                # may produce text only via transcription, not model_turn.parts)
+                if hasattr(self, "_recap_future") and self._recap_future and not self._recap_future.done():
+                    self._recap_future.set_result(t.text)
 
         # Log interrupted/turn_complete signals
         if server_content:
