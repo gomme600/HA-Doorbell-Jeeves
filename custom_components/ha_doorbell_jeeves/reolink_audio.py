@@ -742,8 +742,24 @@ class ReolinkAudioHandler:
 
         Returns True if ffmpeg successfully connected to the RTSP stream.
         """
+        # --- Try go2rtc internal RTSP first (bypasses camera auth issues) ---
+        if self._camera_unique_id:
+            go2rtc_url = f"rtsp://127.0.0.1:8554/{self._camera_unique_id}"
+            _LOGGER.warning("Audio input: trying go2rtc RTSP → %s", go2rtc_url)
+            proc = await self._try_ffmpeg_rtsp(go2rtc_url)
+            if proc:
+                _LOGGER.warning("✓ go2rtc RTSP audio input connected (PID=%d)", proc.pid)
+                self._listen_active = True
+                self._discovered_mic_method = "go2rtc"
+                self._discovered_mic_url = go2rtc_url
+                self._input_processor_task = asyncio.create_task(
+                    self._ffmpeg_audio_read_loop(proc, "go2rtc-RTSP")
+                )
+                return True
+            _LOGGER.warning("go2rtc RTSP failed — trying direct camera RTSP")
+
         if not self._reolink_host or not self._reolink_user or not self._reolink_pass:
-            _LOGGER.info("No RTSP credentials — skipping RTSP audio input")
+            _LOGGER.info("No RTSP credentials — skipping direct RTSP audio input")
             return False
 
         # Build multiple RTSP URLs to try (different path formats)
