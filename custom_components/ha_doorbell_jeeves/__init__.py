@@ -539,19 +539,34 @@ def _register_ws_commands(hass: HomeAssistant) -> None:
     async def ws_list_available_cameras(
         hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
     ) -> None:
-        """List camera entities available for placement (from managed entities)."""
+        """List camera entities available for placement (doorbell + managed cameras)."""
         manager = _get_manager_from_msg(hass, msg)
         if not manager:
             connection.send_error(msg["id"], "not_found", "No Jeeves entry found")
             return
         cameras = []
+        seen: set[str] = set()
+
+        # Include the primary doorbell camera
+        doorbell_cam = manager.config.get(CONF_CAMERA_ENTITY, "")
+        if doorbell_cam and doorbell_cam not in seen:
+            state = hass.states.get(doorbell_cam)
+            cameras.append({
+                "entity_id": doorbell_cam,
+                "name": state.attributes.get("friendly_name", doorbell_cam) if state else doorbell_cam,
+                "description": "Primary doorbell camera",
+            })
+            seen.add(doorbell_cam)
+
+        # Include all managed camera entities
         for entity in manager.store.managed_entities:
-            if entity.entity_id.startswith("camera."):
+            if entity.entity_id.startswith("camera.") and entity.entity_id not in seen:
                 cameras.append({
                     "entity_id": entity.entity_id,
                     "name": entity.name,
                     "description": entity.description,
                 })
+                seen.add(entity.entity_id)
         connection.send_result(msg["id"], {"cameras": cameras})
 
     websocket_api.async_register_command(hass, ws_list_placements)

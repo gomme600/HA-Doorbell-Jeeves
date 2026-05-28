@@ -122,13 +122,13 @@ def build_system_context(
     # Camera placement map (spatial context)
     if store.camera_placements:
         lines.append("\n--- CAMERA PLACEMENT MAP (spatial layout of the property) ---")
-        lines.append("The house is represented as a rectangle. Cameras are placed around it:")
+        lines.append("Cameras are placed around the property. Directions indicate where they point:")
         for cp in store.camera_placements:
             ptz_label = " [PTZ]" if cp.has_ptz else ""
             doorbell_label = " [DOORBELL]" if cp.is_doorbell else ""
             lines.append(
-                f"• {cp.name} [{cp.entity_id}]: {cp.side} side, "
-                f"facing {cp.facing}{ptz_label}{doorbell_label}"
+                f"• {cp.name} [{cp.entity_id}]: "
+                f"facing {cp.facing_direction}{ptz_label}{doorbell_label}"
             )
             if cp.area_description:
                 lines.append(f"  Covers: {cp.area_description}")

@@ -206,17 +206,20 @@ class KnownIdentity:
 class CameraPlacement:
     """Camera placement on the property map for spatial awareness.
 
-    Position is relative to a house rectangle:
-    - side: "north", "south", "east", "west" (which side of the house)
-    - offset: 0.0 to 1.0 (position along that side, 0=left/top, 1=right/bottom)
-    - facing: "away", "along_left", "along_right" (direction camera faces)
+    Position uses free placement:
+    - x: 0.0 to 1.0 (horizontal position on map, 0=left, 1=right)
+    - y: 0.0 to 1.0 (vertical position on map, 0=top, 1=bottom)
+    - rotation: 0 to 360 degrees (direction camera faces, 0=up/north)
     """
 
     entity_id: str
     name: str
-    side: str  # north, south, east, west
-    offset: float = 0.5  # position along side
-    facing: str = "away"  # away, along_left, along_right
+    x: float = 0.5  # horizontal position (0-1)
+    y: float = 0.5  # vertical position (0-1)
+    rotation: float = 0.0  # degrees, 0=north, 90=east, 180=south, 270=west
+    side: str = ""  # legacy, kept for backward compat
+    offset: float = 0.5  # legacy
+    facing: str = ""  # legacy
     area_description: str = ""  # e.g., "Front garden, driveway, mailbox"
     is_doorbell: bool = False
     # PTZ capabilities (entity IDs for PTZ controls)
@@ -230,6 +233,9 @@ class CameraPlacement:
         return {
             "entity_id": self.entity_id,
             "name": self.name,
+            "x": self.x,
+            "y": self.y,
+            "rotation": self.rotation,
             "side": self.side,
             "offset": self.offset,
             "facing": self.facing,
@@ -244,12 +250,35 @@ class CameraPlacement:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "CameraPlacement":
+        # Migrate legacy side/offset to x/y if needed
+        x = data.get("x")
+        y = data.get("y")
+        rotation = data.get("rotation", 0.0)
+        if x is None or y is None:
+            # Convert old side/offset format to x/y
+            side = data.get("side", "north")
+            offset = data.get("offset", 0.5)
+            if side == "north":
+                x, y = offset, 0.1
+                rotation = 180.0
+            elif side == "south":
+                x, y = offset, 0.9
+                rotation = 0.0
+            elif side == "west":
+                x, y = 0.1, offset
+                rotation = 90.0
+            else:  # east
+                x, y = 0.9, offset
+                rotation = 270.0
         return cls(
             entity_id=data["entity_id"],
             name=data.get("name", ""),
-            side=data.get("side", "north"),
+            x=float(x),
+            y=float(y),
+            rotation=float(rotation),
+            side=data.get("side", ""),
             offset=data.get("offset", 0.5),
-            facing=data.get("facing", "away"),
+            facing=data.get("facing", ""),
             area_description=data.get("area_description", ""),
             is_doorbell=data.get("is_doorbell", False),
             ptz_up=data.get("ptz_up", ""),
@@ -263,6 +292,13 @@ class CameraPlacement:
     def has_ptz(self) -> bool:
         """Check if this camera has any PTZ controls configured."""
         return bool(self.ptz_up or self.ptz_down or self.ptz_left or self.ptz_right)
+
+    @property
+    def facing_direction(self) -> str:
+        """Get human-readable facing direction from rotation angle."""
+        dirs = ["north", "northeast", "east", "southeast", "south", "southwest", "west", "northwest"]
+        idx = round(self.rotation / 45) % 8
+        return dirs[idx]
 
 
 @dataclass
