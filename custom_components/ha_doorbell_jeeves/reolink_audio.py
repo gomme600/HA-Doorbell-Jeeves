@@ -490,11 +490,17 @@ class ReolinkAudioHandler:
         if cached_method and cached_url:
             # Fast path: use the pre-probed working method directly
             _LOGGER.warning("Audio input: using cached method '%s'", cached_method)
+            # For go2rtc methods, ensure the stream is active first
+            if "go2rtc" in cached_method:
+                await self._ensure_go2rtc_stream_active()
             started = await self._start_ffmpeg_with_url(cached_url, cached_method.upper())
             if started:
                 _LOGGER.warning("Audio input: %s connected (cached)", cached_method)
                 return
-            _LOGGER.warning("Audio input: cached method '%s' failed — falling back to probe", cached_method)
+            # Clear stale cache so we don't keep trying a broken method
+            _LOGGER.warning("Audio input: cached method '%s' failed — clearing cache", cached_method)
+            self._cached_mic_method = ""
+            self._cached_mic_url = ""
 
         # Slow fallback: probe all methods (only if no cache or cache failed)
         # Create a second Baichuan connection for Preview fallback
@@ -509,15 +515,41 @@ class ReolinkAudioHandler:
             ffmpeg_started = await self._start_ffmpeg_fallback_input()
             if ffmpeg_started:
                 _LOGGER.warning("Audio input: using ffmpeg fallback (FLV/RTMP)")
-            elif bc:
-                preview_ok = await self._start_preview_stream()
-                if preview_ok:
-                    _LOGGER.warning(
-                        "Audio input: using Baichuan Preview (sparse ~1fps, "
-                        "speech recognition may be degraded)"
-                    )
-                else:
-                    _LOGGER.warning("Audio input: ALL methods failed — mic disabled")
+            else:
+                # Try go2rtc HTTP stream (uses HA's authenticated go2rtc session)
+                go2rtc_url = await self._get_go2rtc_http_stream_url()
+                if go2rtc_url:
+                    _LOGGER.warning("Audio input: trying go2rtc HTTP → %s", go2rtc_url)
+                    go2rtc_ok = await self._start_ffmpeg_with_url(go2rtc_url, "go2rtc-HTTP")
+                    if go2rtc_ok:
+                        self._discovered_mic_method = "go2rtc_http"
+                        self._discovered_mic_url = go2rtc_url
+                        _LOGGER.warning("Audio input: using go2rtc HTTP stream")
+                    else:
+                        go2rtc_url = None
+
+                if not go2rtc_url:
+                    # Try HA's internal HLS stream (higher latency but reliable)
+                    hls_url = await self._get_ha_hls_stream_url()
+                    if hls_url:
+                        _LOGGER.warning("Audio input: trying HA HLS → %s", hls_url)
+                        hls_ok = await self._start_ffmpeg_with_url(hls_url, "HA-HLS")
+                        if hls_ok:
+                            self._discovered_mic_method = "ha_hls"
+                            self._discovered_mic_url = hls_url
+                            _LOGGER.warning("Audio input: using HA HLS stream")
+                        else:
+                            hls_url = None
+
+                    if not hls_url and bc:
+                        preview_ok = await self._start_preview_stream()
+                        if preview_ok:
+                            _LOGGER.warning(
+                                "Audio input: using Baichuan Preview (sparse ~1fps, "
+                                "speech recognition may be degraded)"
+                            )
+                        else:
+                            _LOGGER.warning("Audio input: ALL methods failed — mic disabled")
 
         _LOGGER.warning(
             "Reolink audio handler started (host=%s, baichuan=%s, mic_input=%s)",
@@ -742,6 +774,53 @@ class ReolinkAudioHandler:
         )
         return True
 
+    async def _ensure_go2rtc_stream_active(self) -> None:
+        """Ensure the camera's go2rtc stream is active before connecting.
+
+        go2rtc lazily initializes streams — they only exist when a client is
+        viewing the camera. We trigger stream creation by calling the camera
+        entity's async_create_stream() which registers and starts the source
+        in go2rtc. This makes the stream available on go2rtc's RTSP port.
+        """
+        camera_entity_id = self._camera_entity_id
+        if not camera_entity_id:
+            return
+
+        try:
+            from homeassistant.helpers.entity_component import EntityComponent
+
+            camera_comp: EntityComponent | None = self._hass.data.get("camera")
+            if not camera_comp or not hasattr(camera_comp, "get_entity"):
+                return
+
+            entity = camera_comp.get_entity(camera_entity_id)
+            if not entity:
+                return
+
+            # async_create_stream registers the source in go2rtc and starts it
+            if hasattr(entity, "async_create_stream"):
+                stream = await entity.async_create_stream()
+                if stream and hasattr(stream, "start"):
+                    await stream.start()
+                    _LOGGER.info(
+                        "Triggered go2rtc stream start for %s", camera_entity_id
+                    )
+                    # Give go2rtc a moment to connect to the camera source
+                    await asyncio.sleep(1.0)
+                    return
+
+            # Fallback: call stream_source() which also triggers registration
+            if hasattr(entity, "stream_source"):
+                source = await entity.stream_source()
+                if source:
+                    _LOGGER.info(
+                        "Got stream source for %s (go2rtc should register it)",
+                        camera_entity_id,
+                    )
+                    await asyncio.sleep(0.5)
+        except Exception as exc:
+            _LOGGER.debug("Could not trigger go2rtc stream: %s", exc)
+
     async def _start_rtsp_audio_input(self) -> bool:
         """Start continuous audio capture via ffmpeg reading from RTSP.
 
@@ -756,6 +835,9 @@ class ReolinkAudioHandler:
         """
         # --- Try go2rtc internal RTSP first (bypasses camera auth issues) ---
         if self._camera_unique_id:
+            # Ensure go2rtc has the stream registered and active
+            await self._ensure_go2rtc_stream_active()
+
             # HA's managed go2rtc uses port 18554 for RTSP (127.0.0.1 only)
             go2rtc_url = f"rtsp://127.0.0.1:18554/{self._camera_unique_id}"
             _LOGGER.warning("Audio input: trying go2rtc RTSP → %s", go2rtc_url)
@@ -775,6 +857,10 @@ class ReolinkAudioHandler:
             _LOGGER.info("No RTSP credentials — skipping direct RTSP audio input")
             return False
 
+        # Try getting the authenticated stream source from the camera entity first
+        # This uses the Reolink integration's own credentials which may differ
+        camera_stream_url = await self._get_camera_stream_source()
+
         # Build multiple RTSP URLs to try (different path formats)
         encoded_pass = quote(self._reolink_pass, safe="")
         port = getattr(self, "_reolink_rtsp_port", 554) or 554
@@ -788,6 +874,10 @@ class ReolinkAudioHandler:
             f"{base}/h264Preview_01_main",
             f"{base}/h265Preview_01_sub",
         ]
+
+        # Prioritize camera entity's stream source (has correct auth)
+        if camera_stream_url and camera_stream_url not in urls_to_try:
+            urls_to_try.insert(0, camera_stream_url)
 
         # Also include the API-discovered URL if different
         api_url = getattr(self, "_reolink_rtsp_url", None)
@@ -3953,12 +4043,15 @@ class ReolinkAudioHandler:
         This works even when go2rtc's RTSP port isn't exposed because
         the API runs on the same port as the REST endpoints.
 
-        If the stream isn't registered yet (lazy init), we register it
-        using the camera's RTSP URL that go2rtc will manage itself.
+        If the stream isn't registered yet (lazy init), we first try to
+        trigger it via HA's camera entity, then fall back to REST API registration.
         """
         stream_name = await self._resolve_go2rtc_stream_name()
         if not stream_name:
             return None
+
+        # Ensure stream is active in go2rtc (trigger via camera entity)
+        await self._ensure_go2rtc_stream_active()
 
         base_url = await _discover_go2rtc_url(self._hass)
         if not base_url:
