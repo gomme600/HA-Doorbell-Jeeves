@@ -936,7 +936,7 @@ class JeevesSessionManager:
                 ),
             )
 
-            model = self._config.get("model", "gemini-2.5-flash-native-audio-latest")
+            model = self._config.get(CONF_MODEL, DEFAULT_MODEL_GEMINI)
             async with client.aio.live.connect(model=model, config=config) as session:
                 # Send audio at real-time rate
                 CHUNK = 4096

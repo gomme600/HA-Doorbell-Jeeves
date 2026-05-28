@@ -247,6 +247,49 @@ class JeevesMemoryTimelineCard extends HTMLElement {
     return "";
   }
 
+  async _signImageUrls() {
+    // Sign all image URLs using HA's auth/sign_path WebSocket call
+    if (!this.shadowRoot || !this._hass) return;
+    const imgs = this.shadowRoot.querySelectorAll("img[data-sign-url]");
+    if (!imgs.length) return;
+
+    // Cache signed URLs for 5 minutes to avoid re-signing on every render
+    if (!this._signedUrlCache) this._signedUrlCache = new Map();
+    const now = Date.now();
+
+    for (const img of imgs) {
+      const path = img.getAttribute("data-sign-url");
+      if (!path) continue;
+
+      const cached = this._signedUrlCache.get(path);
+      if (cached && cached.expires > now) {
+        img.src = cached.url;
+        img.removeAttribute("data-sign-url");
+        continue;
+      }
+
+      try {
+        const result = await this._hass.callWS({
+          type: "auth/sign_path",
+          path: path,
+          expires: 300,
+        });
+        if (result && result.path) {
+          img.src = result.path;
+          this._signedUrlCache.set(path, { url: result.path, expires: now + 240000 });
+        }
+      } catch (err) {
+        // Fallback: try with access token as query param
+        const token = this._hass.auth && this._hass.auth.data && this._hass.auth.data.access_token;
+        if (token) {
+          const sep = path.includes("?") ? "&" : "?";
+          img.src = `${path}${sep}access_token=${token}`;
+        }
+      }
+      img.removeAttribute("data-sign-url");
+    }
+  }
+
   _outcomeColor(outcome) {
     const key = (outcome || "unknown").toLowerCase();
     const rgb = OUTCOME_COLORS[key] || OUTCOME_COLORS.unknown;
@@ -416,6 +459,9 @@ class JeevesMemoryTimelineCard extends HTMLElement {
         card.classList.toggle("expanded");
       });
     });
+
+    // Sign image URLs for authenticated access
+    this._signImageUrls();
   }
 
   _renderEntry(entry, index) {
@@ -450,7 +496,7 @@ class JeevesMemoryTimelineCard extends HTMLElement {
             </div>
             <div class="summary-text">${this._esc(summary)}</div>
             ${duration ? `<div class="meta-row"><ha-icon icon="mdi:clock-outline" class="meta-icon"></ha-icon><span>${duration}</span></div>` : ""}
-            ${imageUrl ? `<img class="${imgClass}" loading="lazy" src="${this._esc(imageUrl)}" alt="Snapshot of ${this._esc(visitor)}">` : ""}
+            ${imageUrl ? `<img class="${imgClass}" loading="lazy" data-sign-url="${this._esc(imageUrl)}" alt="Snapshot of ${this._esc(visitor)}">` : ""}
           </div>
         </div>
       </div>
