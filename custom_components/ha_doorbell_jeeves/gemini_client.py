@@ -239,9 +239,21 @@ class GeminiLiveClient(BaseRealtimeClient):
             consecutive_empty_iters = 0
             while self._connected and self._session:
                 saw_message = False
-                async for response in self._session.receive():
-                    saw_message = True
-                    await self._process(response)
+                try:
+                    async for response in self._session.receive():
+                        saw_message = True
+                        await self._process(response)
+                except Exception as recv_err:
+                    err_str = str(recv_err)
+                    _LOGGER.warning("Gemini receive() raised: %s (turns=%d)", err_str[:200], turns_completed)
+                    if "close" in err_str.lower() or "1008" in err_str or "not implemented" in err_str.lower():
+                        _LOGGER.warning("Gemini server closed connection (policy/model issue)")
+                        break
+                    if not self._connected:
+                        break
+                    # Transient error — try re-entering
+                    await asyncio.sleep(0.2)
+                    continue
 
                 if not self._connected:
                     break

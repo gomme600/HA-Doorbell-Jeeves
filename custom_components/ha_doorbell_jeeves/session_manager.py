@@ -1102,6 +1102,8 @@ class JeevesSessionManager:
         """Send an initial trigger message so the AI starts speaking immediately."""
         if not self._client:
             return
+        # Block tool calls during greeting phase — forces AI to speak first
+        self._greeting_phase = True
         trigger_msg = (
             "[SYSTEM] A visitor just rang the doorbell. "
             "START SPEAKING YOUR GREETING IMMEDIATELY — do NOT call any tools first. "
@@ -1126,6 +1128,10 @@ class JeevesSessionManager:
         if not hasattr(self, "_audio_out_count"):
             self._audio_out_count = 0
         self._audio_out_count += 1
+        # End greeting phase once AI actually produces audio
+        if getattr(self, "_greeting_phase", False):
+            self._greeting_phase = False
+            _LOGGER.warning("Greeting phase ended — tools now unblocked")
         if self._audio_out_count <= 3:
             _LOGGER.warning(
                 "Audio output from AI: %d bytes (chunk #%d)",
@@ -1198,6 +1204,10 @@ class JeevesSessionManager:
             pass
 
     async def _handle_tool_call(self, function_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        # During greeting phase, block tool calls to force the AI to speak first
+        if getattr(self, "_greeting_phase", False):
+            _LOGGER.warning("Tool call %s blocked during greeting phase — forcing speech first", function_name)
+            return {"error": "You must speak your greeting FIRST before using any tools. Speak now."}
         _LOGGER.warning("Tool call: %s(%s)", function_name, arguments)
         self._security.log_event("tool_call_request", function_name, {"arguments": arguments})
         self.hass.bus.async_fire(
