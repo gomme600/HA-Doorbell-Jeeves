@@ -198,34 +198,42 @@ async def _register_frontend_resources(hass: HomeAssistant) -> None:
 async def _ensure_lovelace_resources(hass: HomeAssistant, urls: list[str]) -> None:
     """Ensure our JS files are registered as Lovelace resources for the card picker."""
     try:
-        from homeassistant.components.lovelace import (  # noqa: PLC0415
-            ResourceStorageCollection,
-        )
-        from homeassistant.components.lovelace.const import RESOURCE_SCHEMA  # noqa: PLC0415
-
-        # Access the lovelace resources collection
-        ll_resources: ResourceStorageCollection | None = hass.data.get("lovelace_resources")
+        # Access the lovelace resources collection via hass.data
+        ll_resources = hass.data.get("lovelace_resources")
         if ll_resources is None:
             _LOGGER.debug("Lovelace resources collection not available, skipping auto-register")
             return
 
         # Get existing resource URLs (strip query params for comparison)
-        existing_urls: set[str] = set()
+        existing: dict[str, dict] = {}
         for item in ll_resources.async_items():
-            existing_url = item.get("url", "").split("?")[0]
-            existing_urls.add(existing_url)
+            base_url = item.get("url", "").split("?")[0]
+            if f"/api/{DOMAIN}/" in base_url:
+                existing[base_url] = item
 
-        # Register any missing resources
+        # Register or update our resources
         for url in urls:
             base_url = url.split("?")[0]
-            if base_url not in existing_urls:
+            if base_url in existing:
+                # Update existing resource URL (cache-busting)
+                old_item = existing[base_url]
+                if old_item.get("url") != url:
+                    try:
+                        await ll_resources.async_update_item(
+                            old_item["id"], {"url": url, "res_type": "module"}
+                        )
+                        _LOGGER.debug("Updated Lovelace resource: %s", url)
+                    except Exception:  # noqa: BLE001
+                        pass
+            else:
+                # Create new resource
                 try:
                     await ll_resources.async_create_item({"res_type": "module", "url": url})
-                    _LOGGER.info("Auto-registered Lovelace resource: %s", base_url)
+                    _LOGGER.info("Auto-registered Lovelace resource: %s", url)
                 except Exception:  # noqa: BLE001
                     _LOGGER.debug("Could not auto-register Lovelace resource: %s", base_url)
-    except (ImportError, AttributeError, KeyError):
-        _LOGGER.debug("Could not access Lovelace resources for auto-registration")
+    except (ImportError, AttributeError, KeyError, TypeError) as exc:
+        _LOGGER.debug("Could not access Lovelace resources for auto-registration: %s", exc)
 
 
 async def _setup_reolink(hass: HomeAssistant, entry: ConfigEntry, config: dict[str, Any]) -> None:

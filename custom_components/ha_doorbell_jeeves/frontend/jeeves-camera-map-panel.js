@@ -10,13 +10,13 @@
 
 class JeevesCameraMapPanel extends HTMLElement {
   static getConfigElement() { return null; }
-  static getStubConfig() { return {}; }
+  static getStubConfig(hass) { return { title: "Camera Map" }; }
 
   setConfig(config) {
     if (!config || typeof config !== "object") {
       throw new Error("Invalid configuration");
     }
-    this._config = config;
+    this._config = { title: "Camera Map", ...config };
     if (!this.shadowRoot) {
       this.attachShadow({ mode: "open" });
     }

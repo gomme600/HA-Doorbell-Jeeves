@@ -87,16 +87,28 @@ class JeevesEventsTimelineCard extends HTMLElement {
     return document.createElement("jeeves-events-timeline-card-editor");
   }
 
-  static getStubConfig() {
-    return { type: "custom:jeeves-events-timeline-card", title: "Important Events", max_items: 50 };
+  static getStubConfig(hass) {
+    let entity = "";
+    if (hass && hass.states) {
+      const found = Object.keys(hass.states).find(
+        (e) => e.startsWith("sensor.") && e.includes("events_feed")
+      );
+      if (found) entity = found;
+    }
+    return { entity, title: "Important Events", max_items: 50 };
   }
 
   setConfig(config) {
-    this._config = { max_items: 50, ...config };
+    if (!config || typeof config !== "object") {
+      throw new Error("Invalid configuration");
+    }
+    this._config = { entity: "", max_items: 50, title: "Important Events", ...config };
     if (!this.shadowRoot) {
       this.attachShadow({ mode: "open" });
     }
   }
+
+  getCardSize() { return 5; }
 
   set hass(hass) {
     this._hass = hass;
