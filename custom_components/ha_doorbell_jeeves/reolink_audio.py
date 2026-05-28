@@ -26,7 +26,7 @@ _LOGGER = logging.getLogger(__name__)
 # User/addon go2rtc typically runs on port 1984
 GO2RTC_PORTS = [11984, 1984]
 GO2RTC_BASE: str | None = None  # Resolved at runtime
-MAX_AI_PCM_BUFFER_BYTES = 240_000  # ~5s of 24kHz mono 16-bit PCM
+MAX_AI_PCM_BUFFER_BYTES = 480_000  # ~10s of 24kHz mono 16-bit PCM
 
 # Reolink RTSP URL patterns
 REOLINK_RTSP_MAIN = "rtsp://{user}:{password}@{host}:554/h264Preview_01_main"
@@ -649,7 +649,7 @@ class ReolinkAudioHandler:
         )
 
         # Wait briefly to see if connection succeeds (RTSP DESCRIBE + SETUP)
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(1.0)
         if proc.returncode is not None:
             stderr_data = b""
             try:
@@ -664,7 +664,7 @@ class ReolinkAudioHandler:
             return None
 
         # Wait more to confirm data is actually flowing
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(1.5)
         if proc.returncode is not None:
             stderr_data = b""
             try:
