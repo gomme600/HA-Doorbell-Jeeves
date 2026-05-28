@@ -548,7 +548,7 @@ def _register_ws_commands(hass: HomeAssistant) -> None:
         seen: set[str] = set()
 
         # Include the primary doorbell camera
-        doorbell_cam = manager.config.get(CONF_CAMERA_ENTITY, "")
+        doorbell_cam = manager._config.get(CONF_CAMERA_ENTITY, "")
         if doorbell_cam and doorbell_cam not in seen:
             state = hass.states.get(doorbell_cam)
             cameras.append({
