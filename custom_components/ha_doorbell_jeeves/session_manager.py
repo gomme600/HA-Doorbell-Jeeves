@@ -600,7 +600,9 @@ class JeevesSessionManager:
 
         camera_entity = config.get(CONF_CAMERA_ENTITY, "")
         self._audio_handler = ReolinkAudioHandler(
-            self.hass, stream_name, on_audio_received=_on_doorbell_audio
+            self.hass, stream_name,
+            on_audio_received=_on_doorbell_audio,
+            on_takeover=_on_human_takeover,
         )
         self._audio_handler._camera_entity_id = camera_entity
         self._audio_handler._reolink_entry_id = config.get(CONF_REOLINK_ENTRY_ID, "")
@@ -1079,8 +1081,11 @@ class JeevesSessionManager:
             return
         trigger_msg = (
             "[SYSTEM] A visitor just rang the doorbell. "
-            "Greet them now according to your instructions. "
-            "If you can see them in the camera feed, describe or acknowledge them naturally."
+            "START SPEAKING YOUR GREETING IMMEDIATELY — do NOT call any tools first. "
+            "A camera frame is being sent to you right now — use it to identify the visitor "
+            "if you recognize them, but do NOT wait or call view_camera. "
+            "You can use tools AFTER you have started speaking. "
+            "Speak now."
         )
         try:
             # Pre-close echo gate with generous initial hold: AI will start

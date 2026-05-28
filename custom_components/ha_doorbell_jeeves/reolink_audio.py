@@ -244,10 +244,12 @@ class ReolinkAudioHandler:
         hass: HomeAssistant,
         stream_name: str,
         on_audio_received: Any,  # Callable[[bytes], Awaitable[None]]
+        on_takeover: Any = None,  # Callable[[], Awaitable[None]] — called when app takes speaker
     ) -> None:
         self._hass = hass
         self._stream_name = stream_name
         self._on_audio_received_raw = on_audio_received
+        self._on_takeover = on_takeover
         # Wrap callback with gain amplification for low-level doorbell mics
         # Reolink doorbells produce very low PCM levels (~RMS 20-50 raw).
         # Gemini VAD needs RMS ~3000-5000. With 128x gain: 20*128=2560, 50*128=6400.
@@ -354,6 +356,10 @@ class ReolinkAudioHandler:
     async def start(self) -> None:
         """Start 2-way audio: output via Baichuan, input via RTSP/ffmpeg.
 
+        Speaker output pipeline starts FIRST (fast: ~1s) so the AI greeting
+        can play as soon as possible. Mic input discovery runs afterward
+        (can take 10-15s due to RTSP fallback probing).
+
         Audio input priority:
           1. ffmpeg with RTSP URL (continuous audio, best quality)
           2. ffmpeg with FLV/RTMP URL (continuous, fallback)
@@ -369,15 +375,19 @@ class ReolinkAudioHandler:
 
         self._active = True
 
-        # Create Baichuan connection — needed for speaker output (CMD 201/202)
-        # and as fallback for mic input (CMD 3 Preview).
+        # --- SPEAKER OUTPUT FIRST (fast path, ~1s) ---
+        # Start the output pipeline immediately so AI audio can reach the
+        # speaker as soon as it's available. This only needs a Baichuan
+        # connection + TalkAbility query — no slow RTSP probing.
+        await self._start_output_pipeline()
+
+        # --- Audio INPUT: runs after output is ready ---
+        # Create a second Baichuan connection for Preview fallback
         bc = await self._get_baichuan_object()
         if bc:
             self._baichuan = bc
 
-        # --- Audio INPUT: prefer ffmpeg/RTSP for continuous audio ---
-        # The native Baichuan Preview stream only provides ~1 audio frame/second
-        # which is insufficient for speech recognition. RTSP gives continuous audio.
+        # Try mic input sources (this is slow: RTSP probing can take 10-15s)
         rtsp_started = await self._start_rtsp_audio_input()
         if rtsp_started:
             _LOGGER.warning("Audio input: using ffmpeg/RTSP (continuous audio)")
@@ -396,9 +406,6 @@ class ReolinkAudioHandler:
                     )
                 else:
                     _LOGGER.warning("Audio input: ALL methods failed — mic disabled")
-
-        # Start Baichuan talk output pipeline (speaker)
-        await self._start_output_pipeline()
 
         _LOGGER.warning(
             "Reolink audio handler started (host=%s, baichuan=%s, mic_input=%s)",
@@ -1164,6 +1171,8 @@ class ReolinkAudioHandler:
         # On-demand talk: track when last audio was sent to detect silence
         TALK_RELEASE_DELAY = 1.5  # Release speaker after 1.5s of silence
         last_audio_sent_time = 0.0
+        consecutive_send_failures = 0
+        TAKEOVER_FAILURE_THRESHOLD = 3  # After 3 consecutive send failures, assume app takeover
 
         try:
             while self._active:
@@ -1262,16 +1271,30 @@ class ReolinkAudioHandler:
                         await self._send_talk_binary(channel, payload)
                         chunks_sent += 1
                         last_audio_sent_time = time_mod.monotonic()
+                        consecutive_send_failures = 0
                         if chunks_sent == 1:
                             _LOGGER.warning("✓ First ADPCM payload sent to doorbell speaker!")
                             expected_stream_end = now + play_duration
                         elif chunks_sent % 50 == 0:
                             _LOGGER.warning("Audio output progress: %d payloads sent", chunks_sent)
                     except Exception as exc:
-                        if chunks_sent <= 3:
-                            _LOGGER.warning("Baichuan talk send error: %s", exc)
+                        consecutive_send_failures += 1
+                        if consecutive_send_failures <= 3:
+                            _LOGGER.warning(
+                                "Baichuan talk send error (#%d): %s",
+                                consecutive_send_failures, exc,
+                            )
                         # Talk session may have been stolen by Reolink app
                         self._talk_held = False
+                        if consecutive_send_failures >= TAKEOVER_FAILURE_THRESHOLD:
+                            _LOGGER.warning(
+                                "Speaker takeover detected (%d consecutive send failures) "
+                                "— Reolink app likely connected",
+                                consecutive_send_failures,
+                            )
+                            if self._on_takeover:
+                                self._hass.async_create_task(self._on_takeover())
+                            return  # Exit output loop — session will be stopped
                         continue
 
                     if now > expected_stream_end:
