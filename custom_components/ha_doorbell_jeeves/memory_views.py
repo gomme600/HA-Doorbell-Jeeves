@@ -17,6 +17,7 @@ from .memory import SessionMemory
 from .session_manager import JeevesSessionManager
 
 _CARD_JS_PATH = Path(__file__).parent / "frontend" / "jeeves-memory-timeline-card.js"
+_CAMERA_MAP_JS_PATH = Path(__file__).parent / "frontend" / "jeeves-camera-map-panel.js"
 
 
 def memory_image_url(entry_id: str, memory_id: str) -> str:
@@ -103,6 +104,7 @@ def register_memory_views(hass: HomeAssistant) -> None:
     hass.http.register_view(JeevesEventImageView(hass))
     hass.http.register_view(JeevesCardJSView())
     hass.http.register_view(JeevesEventsCardJSView())
+    hass.http.register_view(JeevesCameraMapJSView())
 
 
 _EVENTS_CARD_JS_PATH = Path(__file__).parent / "frontend" / "jeeves-events-timeline-card.js"
@@ -166,3 +168,24 @@ class JeevesEventImageView(HomeAssistantView):
                 )
 
         raise web.HTTPNotFound(text="Event not found")
+
+
+class JeevesCameraMapJSView(HomeAssistantView):
+    """Serve the interactive camera map panel JS."""
+
+    url = f"/api/{DOMAIN}/camera_map_js"
+    name = f"api:{DOMAIN}:camera_map_js"
+    requires_auth = False
+
+    def __init__(self) -> None:
+        self._content: bytes | None = None
+
+    async def get(self, request: web.Request) -> web.Response:
+        if self._content is None:
+            loop = asyncio.get_running_loop()
+            self._content = await loop.run_in_executor(None, _CAMERA_MAP_JS_PATH.read_bytes)
+        return web.Response(
+            body=self._content,
+            content_type="application/javascript",
+            headers={"Cache-Control": "no-cache"},
+        )

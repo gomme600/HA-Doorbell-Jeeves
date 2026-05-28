@@ -173,7 +173,29 @@ async def _register_frontend_resources(hass: HomeAssistant) -> None:
 
     js_url = f"{card_js_url()}?v={file_hash}"
     add_extra_js_url(hass, js_url)
-    _LOGGER.debug("Registered memory timeline card resource: %s", js_url)
+
+    # Events timeline card
+    events_js = Path(__file__).parent / "frontend" / "jeeves-events-timeline-card.js"
+    try:
+        content = await loop.run_in_executor(None, events_js.read_bytes)
+        events_hash = hashlib.md5(content).hexdigest()[:8]  # noqa: S324
+    except OSError:
+        events_hash = "1"
+    add_extra_js_url(hass, f"/api/{DOMAIN}/events_card_js?v={events_hash}")
+
+    # Camera map panel
+    map_js = Path(__file__).parent / "frontend" / "jeeves-camera-map-panel.js"
+    try:
+        content = await loop.run_in_executor(None, map_js.read_bytes)
+        map_hash = hashlib.md5(content).hexdigest()[:8]  # noqa: S324
+    except OSError:
+        map_hash = "1"
+    add_extra_js_url(hass, f"/api/{DOMAIN}/camera_map_js?v={map_hash}")
+
+    # Register WebSocket commands for camera map
+    _register_ws_commands(hass)
+
+    _LOGGER.debug("Registered frontend resources (memory, events, camera_map)")
 
 
 async def _setup_reolink(hass: HomeAssistant, entry: ConfigEntry, config: dict[str, Any]) -> None:
@@ -430,3 +452,90 @@ def _register_services(hass: HomeAssistant) -> None:
             vol.Required("name"): cv.string,
         }),
     )
+
+
+# ─── WebSocket API for Camera Map ─────────────────────────────────────────────
+
+
+def _register_ws_commands(hass: HomeAssistant) -> None:
+    """Register WebSocket commands for the interactive camera map panel."""
+    from homeassistant.components import websocket_api  # noqa: PLC0415
+
+    from .models import CameraPlacement  # noqa: PLC0415
+
+    @websocket_api.websocket_command({
+        vol.Required("type"): f"{DOMAIN}/camera_placements/list",
+        vol.Optional("entry_id"): str,
+    })
+    @websocket_api.async_response
+    async def ws_list_placements(
+        hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
+    ) -> None:
+        """List all camera placements."""
+        manager = _get_manager_from_msg(hass, msg)
+        if not manager:
+            connection.send_error(msg["id"], "not_found", "No Jeeves entry found")
+            return
+        placements = [cp.to_dict() for cp in manager.store.camera_placements]
+        connection.send_result(msg["id"], {"placements": placements})
+
+    @websocket_api.websocket_command({
+        vol.Required("type"): f"{DOMAIN}/camera_placements/save",
+        vol.Optional("entry_id"): str,
+        vol.Required("placements"): list,
+    })
+    @websocket_api.async_response
+    async def ws_save_placements(
+        hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
+    ) -> None:
+        """Save all camera placements (replaces entire list)."""
+        manager = _get_manager_from_msg(hass, msg)
+        if not manager:
+            connection.send_error(msg["id"], "not_found", "No Jeeves entry found")
+            return
+        manager.store.camera_placements = [
+            CameraPlacement.from_dict(p) for p in msg["placements"]
+        ]
+        await manager.store.async_save_entities()
+        connection.send_result(msg["id"], {"success": True})
+
+    @websocket_api.websocket_command({
+        vol.Required("type"): f"{DOMAIN}/camera_placements/cameras",
+        vol.Optional("entry_id"): str,
+    })
+    @websocket_api.async_response
+    async def ws_list_available_cameras(
+        hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
+    ) -> None:
+        """List camera entities available for placement (from managed entities)."""
+        manager = _get_manager_from_msg(hass, msg)
+        if not manager:
+            connection.send_error(msg["id"], "not_found", "No Jeeves entry found")
+            return
+        cameras = []
+        for entity in manager.store.managed_entities:
+            if entity.entity_id.startswith("camera."):
+                cameras.append({
+                    "entity_id": entity.entity_id,
+                    "name": entity.name,
+                    "description": entity.description,
+                })
+        connection.send_result(msg["id"], {"cameras": cameras})
+
+    websocket_api.async_register_command(hass, ws_list_placements)
+    websocket_api.async_register_command(hass, ws_save_placements)
+    websocket_api.async_register_command(hass, ws_list_available_cameras)
+
+
+def _get_manager_from_msg(hass: HomeAssistant, msg: dict) -> JeevesSessionManager | None:
+    """Resolve a session manager from a WS message (uses entry_id or first available)."""
+    managers = hass.data.get(DOMAIN, {})
+    entry_id = msg.get("entry_id")
+    if entry_id:
+        manager = managers.get(entry_id)
+        return manager if isinstance(manager, JeevesSessionManager) else None
+    # Return first available manager
+    for m in managers.values():
+        if isinstance(m, JeevesSessionManager):
+            return m
+    return None

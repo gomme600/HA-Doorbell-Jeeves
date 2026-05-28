@@ -698,10 +698,10 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                 "general",
                 "dual_model",
                 "vision",
-                "camera_map",
                 "audio",
                 "timeline",
                 "entities",
+                "camera_map",
                 "security",
                 "triggers",
                 "task_instructions",
@@ -829,7 +829,7 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
         store = await self._async_get_store()
         placements: list[CameraPlacement] = getattr(store, CONF_CAMERA_PLACEMENTS)
         items = [
-            f"{placement.name} ({placement.entity_id}) — {placement.side} {placement.offset:.1f}, facing {placement.facing}"
+            f"{placement.name} ({placement.entity_id}) — {placement.side} side, facing {placement.facing}"
             for placement in placements
         ]
         return self.async_show_menu(
@@ -838,6 +838,8 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
             description_placeholders={
                 "camera_summary": "**Mapped Cameras:**\n"
                 + ("\n".join(f"• {item}" for item in items) if items else "None configured")
+                + "\n\n💡 **Tip:** For a visual drag-and-drop editor, add the "
+                + "`custom:jeeves-camera-map-panel` card to your dashboard."
             },
         )
 
