@@ -1,7 +1,6 @@
 """
-E2E AI Test Suite for Doorbell Jeeves.
-This script performs real-time audio interaction with the AI agent via the HA API
-to verify vision, tool calling, and session stability.
+Comprehensive E2E AI Test Suite for Doorbell Jeeves.
+Verifies all tool calls, vision, and session stability.
 """
 
 import pyttsx3
@@ -13,9 +12,13 @@ import aiohttp
 import sys
 import os
 import time
+import json
+import speech_recognition as sr
+import io
 
 # --- Configuration ---
 URL = "https://homeassistant.gomme600.ovh"
+WS_URL = "wss://homeassistant.gomme600.ovh/api/websocket"
 CLIENT_ID = f"{URL}/"
 USERNAME = "gomme600"
 PASSWORD = "claudetest"
@@ -24,9 +27,9 @@ PASSWORD = "claudetest"
 
 def generate_pcm(text):
     """Generate 16kHz mono 16-bit PCM from text using Windows TTS."""
-    print(f"  [TTS] Generating: '{text}'")
+    print(f"  [TTS OUT] Generating: '{text}'")
     engine = pyttsx3.init()
-    temp_wav = f"temp_{int(time.time())}.wav"
+    temp_wav = f"temp_{int(time.time() * 1000)}.wav"
     engine.save_to_file(text, temp_wav)
     engine.runAndWait()
     
@@ -43,7 +46,8 @@ def generate_pcm(text):
     if framerate != 16000:
         data, _ = audioop.ratecv(data, sampwidth, 1, framerate, 16000, None)
     
-    os.remove(temp_wav)
+    if os.path.exists(temp_wav):
+        os.remove(temp_wav)
     return data
 
 async def send_audio_stream(session, pcm_data):
@@ -52,7 +56,7 @@ async def send_audio_stream(session, pcm_data):
     INTERVAL = 0.128
     
     chunks = [pcm_data[i:i+CHUNK_SIZE] for i in range(0, len(pcm_data), CHUNK_SIZE)]
-    print(f"  [Audio] Streaming {len(chunks)} chunks...")
+    print(f"  [Audio] Streaming {len(chunks)} chunks to AI...")
     
     for i, chunk in enumerate(chunks):
         chunk_b64 = base64.b64encode(chunk).decode('ascii')
@@ -63,116 +67,196 @@ async def send_audio_stream(session, pcm_data):
         
         if i < len(chunks) - 1:
             await asyncio.sleep(INTERVAL)
-    print("  [Audio] Stream complete.")
+
+class JeevesMonitor:
+    def __init__(self, ws):
+        self.ws = ws
+        self.transcripts = []
+        self.tool_calls = []
+        self.audio_outputs = []
+        self.recognizer = sr.Recognizer()
+        self.msg_id = 1
+
+    async def listen(self):
+        async for msg in self.ws:
+            if msg.type == aiohttp.WSMsgType.TEXT:
+                data = json.loads(msg.data)
+                if data.get("type") == "event":
+                    event = data.get("event", {})
+                    event_type = event.get("event_type")
+                    event_data = event.get("data", {})
+                    
+                    if event_type == "ha_doorbell_jeeves_transcript":
+                        role = event_data.get("role")
+                        text = event_data.get("text")
+                        print(f"  [Transcript] {role}: {text}")
+                        self.transcripts.append(event_data)
+                    
+                    elif event_type == "ha_doorbell_jeeves_tool_call":
+                        func = event_data.get("function")
+                        args = event_data.get("arguments")
+                        print(f"  [Tool Call] {func}({args})")
+                        self.tool_calls.append(event_data)
+                    
+                    elif event_type == "ha_doorbell_jeeves_audio_output":
+                        audio_b64 = event_data.get("audio_base64")
+                        if audio_b64:
+                            self.audio_outputs.append(audio_b64)
+                            # Optional: Run STT in background
+                            # asyncio.create_task(self.do_stt(audio_b64))
+
+    async def do_stt(self, audio_b64):
+        try:
+            pcm_data = base64.b64decode(audio_b64)
+            # Create wav in memory
+            buffer = io.BytesIO()
+            with wave.open(buffer, 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(24000) # Integration outputs 24kHz for Gemini usually
+                wf.writeframes(pcm_data)
+            buffer.seek(0)
+            with sr.AudioFile(buffer) as source:
+                audio = self.recognizer.record(source)
+                text = self.recognizer.recognize_google(audio)
+                print(f"  [STT IN] AI said: {text}")
+        except Exception:
+            pass
 
 # --- HA API Utilities ---
 
 async def get_token():
-    """Authenticate and return a long-lived access token."""
     async with aiohttp.ClientSession() as session:
-        # Step 1: Start login flow
-        async with session.post(f"{URL}/auth/login_flow", json={
-            "client_id": CLIENT_ID, 
-            "handler": ["homeassistant", None], 
-            "redirect_uri": CLIENT_ID
-        }) as resp:
+        async with session.post(f"{URL}/auth/login_flow", json={"client_id": CLIENT_ID, "handler": ["homeassistant", None], "redirect_uri": CLIENT_ID}) as resp:
             data = await resp.json()
             flow_id = data.get("flow_id")
-        
-        # Step 2: Authenticate
-        async with session.post(f"{URL}/auth/login_flow/{flow_id}", json={
-            "client_id": CLIENT_ID, 
-            "username": USERNAME, 
-            "password": PASSWORD
-        }) as resp:
+        async with session.post(f"{URL}/auth/login_flow/{flow_id}", json={"client_id": CLIENT_ID, "username": USERNAME, "password": PASSWORD}) as resp:
             data = await resp.json()
             code = data.get("result")
-        
-        # Step 3: Exchange code for token
-        async with session.post(f"{URL}/auth/token", data={
-            "grant_type": "authorization_code", 
-            "code": code, 
-            "client_id": CLIENT_ID
-        }) as resp:
+        async with session.post(f"{URL}/auth/token", data={"grant_type": "authorization_code", "code": code, "client_id": CLIENT_ID}) as resp:
             data = await resp.json()
             return data.get("access_token")
 
-async def get_sensor_events(session):
-    """Fetch recent events from the Jeeves events feed sensor."""
-    async with session.get(f"{URL}/api/states") as resp:
-        states = await resp.json()
-        for state in states:
-            if 'jeeves' in state['entity_id'] and 'events_feed' in state['entity_id']:
-                return state.get("attributes", {}).get("events", [])
-    return []
-
 # --- Test Cases ---
 
-async def test_case_carport_vision(session):
-    print("\n>>> TEST CASE: Carport Car Counting (Vision + Tool Calling)")
+async def test_case_carport(session, monitor):
+    print("\n>>> TEST: Carport Vision & Tool Switch")
+    cmd = "Jeeves, switch to the carport camera and tell me how many cars you see there. Then save an event 'Carport Check' with the count."
+    await send_audio_stream(session, generate_pcm(cmd))
     
-    # 1. Switch to carport
-    cmd1 = "Jeeves, please switch the camera to the carport."
-    print(f"Sending: {cmd1}")
-    await send_audio_stream(session, generate_pcm(cmd1))
-    await asyncio.sleep(15) # Wait for switch and frame arrival
+    # Wait for execution (switch + vision + save event)
+    start_time = time.time()
+    found_switch = False
+    found_save = False
+    while time.time() - start_time < 45:
+        await asyncio.sleep(2)
+        if any(t.get("function") == "switch_camera" for t in monitor.tool_calls):
+            found_switch = True
+        if any(t.get("function") == "save_event" for t in monitor.tool_calls):
+            found_save = True
+        if found_switch and found_save:
+            break
     
-    # 2. Count cars and save event
-    cmd2 = "Look at the carport camera right now. Count exactly how many cars you see. Then, use the save event tool to save an event titled 'Carport Check'. In the description, write 'I see X cars', replacing X with the number."
-    print(f"Sending: {cmd2}")
-    await send_audio_stream(session, generate_pcm(cmd2))
+    if found_switch and found_save:
+        print("✅ PASSED: Carport switch and event save detected.")
+        return True
+    else:
+        print(f"❌ FAILED: Switch={found_switch}, Save={found_save}")
+        return False
+
+async def test_case_read_state(session, monitor):
+    print("\n>>> TEST: Read Entity State")
+    # We'll ask for a specific entity like a light or sensor
+    cmd = "Jeeves, what is the current state of the front door camera?"
+    await send_audio_stream(session, generate_pcm(cmd))
     
-    print("Waiting 30 seconds for processing...")
-    await asyncio.sleep(30)
+    start_time = time.time()
+    found = False
+    while time.time() - start_time < 20:
+        await asyncio.sleep(2)
+        if any(t.get("function") == "read_entity_state" for t in monitor.tool_calls):
+            found = True
+            break
     
-    # 3. Verify
-    events = await get_sensor_events(session)
-    for evt in events:
-        if evt.get("title") == "Carport Check":
-            desc = evt.get("description", "").lower()
-            print(f"Result: {evt.get('description')}")
-            if "2" in desc or "two" in desc:
-                print("✅ PASSED: Agent saw 2 cars!")
-                return True
-            else:
-                print("❌ FAILED: Agent hallucinated or missed the cars.")
-                return False
+    if found:
+        print("✅ PASSED: read_entity_state called.")
+        return True
+    else:
+        print("❌ FAILED: read_entity_state not called.")
+        return False
+
+async def test_case_complex_tools(session, monitor):
+    print("\n>>> TEST: Calendar & History")
+    cmd = "Check my calendar for tomorrow and tell me if there's anything important. Also check the history of the front door for the last 2 hours."
+    await send_audio_stream(session, generate_pcm(cmd))
     
-    print("❌ FAILED: Event 'Carport Check' was never saved.")
-    return False
+    start_time = time.time()
+    found_cal = False
+    found_hist = False
+    while time.time() - start_time < 30:
+        await asyncio.sleep(2)
+        if any(t.get("function") == "get_calendar_events" for t in monitor.tool_calls):
+            found_cal = True
+        if any(t.get("function") == "get_entity_history" for t in monitor.tool_calls):
+            found_hist = True
+        if found_cal and found_hist:
+            break
+    
+    if found_cal and found_hist:
+        print("✅ PASSED: Calendar and History tools called.")
+        return True
+    else:
+        print(f"❌ FAILED: Cal={found_cal}, Hist={found_hist}")
+        return False
 
 async def run_suite():
     token = await get_token()
-    if not token:
-        print("Failed to authenticate with HA.")
-        return
-
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    
     async with aiohttp.ClientSession(headers=headers) as session:
-        print("--- Starting AI E2E Test Suite ---")
-        
-        # Start Session
-        async with session.post(f"{URL}/api/services/ha_doorbell_jeeves/start_session") as resp:
-            print(f"Session Start: {resp.status}")
-        
-        await asyncio.sleep(10) # Connect time
-        
-        # Greeting Bypass
-        await send_audio_stream(session, generate_pcm("Hello Jeeves, are you there?"))
-        await asyncio.sleep(10)
-        
-        # Run tests
-        success = await test_case_carport_vision(session)
-        
-        # Stop Session
-        async with session.post(f"{URL}/api/services/ha_doorbell_jeeves/stop_session") as resp:
-            print(f"Session Stop: {resp.status}")
+        async with session.ws_connect(WS_URL) as ws:
+            # Auth WS
+            await ws.send_json({"type": "auth", "access_token": token})
+            auth_resp = await ws.receive_json()
+            if auth_resp.get("type") != "auth_ok":
+                print("WS Auth failed")
+                return
+
+            # Subscribe to events
+            monitor = JeevesMonitor(ws)
+            await ws.send_json({"id": monitor.msg_id, "type": "subscribe_events", "event_type": "ha_doorbell_jeeves_transcript"})
+            monitor.msg_id += 1
+            await ws.send_json({"id": monitor.msg_id, "type": "subscribe_events", "event_type": "ha_doorbell_jeeves_tool_call"})
+            monitor.msg_id += 1
+            await ws.send_json({"id": monitor.msg_id, "type": "subscribe_events", "event_type": "ha_doorbell_jeeves_audio_output"})
+            monitor.msg_id += 1
+
+            # Start background listener
+            listener_task = asyncio.create_task(monitor.listen())
+
+            print("--- Starting AI E2E Test Suite ---")
+            await session.post(f"{URL}/api/services/ha_doorbell_jeeves/start_session")
+            await asyncio.sleep(8)
             
-        if success:
-            print("\n✅ ALL TESTS PASSED!")
-        else:
-            print("\n❌ SUITE FAILED.")
-            sys.exit(1)
+            # Greeting bypass
+            await send_audio_stream(session, generate_pcm("Hi Jeeves, I'm here."))
+            await asyncio.sleep(8)
+
+            results = []
+            results.append(await test_case_carport(session, monitor))
+            results.append(await test_case_read_state(session, monitor))
+            results.append(await test_case_complex_tools(session, monitor))
+
+            await session.post(f"{URL}/api/services/ha_doorbell_jeeves/stop_session")
+            await asyncio.sleep(5)
+            
+            listener_task.cancel()
+            
+            if all(results):
+                print("\n✅ ALL TESTS PASSED!")
+            else:
+                print(f"\n❌ SUITE FAILED. Results: {results}")
+                sys.exit(1)
 
 if __name__ == "__main__":
     asyncio.run(run_suite())

@@ -1729,6 +1729,14 @@ class JeevesSessionManager:
             or self._transcript_history[-1]["text"] != text
         ):
             self._transcript_history.append({"role": role, "text": text})
+            self.hass.bus.async_fire(
+                "ha_doorbell_jeeves_transcript",
+                {
+                    "entry_id": self.entry.entry_id,
+                    "role": role,
+                    "text": text,
+                },
+            )
         if self._tool_router and self._tool_router.is_active:
             self._tool_router.add_transcript(role, text)
 
