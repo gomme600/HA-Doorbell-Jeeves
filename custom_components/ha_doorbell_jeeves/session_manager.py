@@ -1005,12 +1005,14 @@ class JeevesSessionManager:
         # Update the config to point to the new camera
         self._config[CONF_CAMERA_ENTITY] = camera_entity_id
 
+        # Keep Reolink audio discovery aligned with the active camera.
+        if self._audio_handler and self._audio_handler.is_active:
+            self._audio_handler._camera_entity_id = camera_entity_id
+
         # Restart vision loop with new camera
         if self._client and self._active:
-            from .vision import VisionLoop  # noqa: PLC0415
-            if hasattr(self, "_vision_loop"):
-                self._vision_loop.camera_entity_id = camera_entity_id
-            self._vision_task = asyncio.create_task(self._run_vision_loop())
+            fps = float(self._config.get(CONF_VISION_FPS, DEFAULT_VISION_FPS))
+            self._vision_task = asyncio.create_task(self._vision_loop(camera_entity_id, fps))
             _LOGGER.info("Vision loop restarted with camera: %s", camera_entity_id)
 
     async def _ptz_auto_return(self) -> None:
@@ -1018,8 +1020,7 @@ class JeevesSessionManager:
         if not self._ptz_moved_cameras:
             return
 
-        from .store import DataStore  # noqa: PLC0415
-        store: DataStore = self._store
+        store = self.store
 
         for camera_id in list(self._ptz_moved_cameras):
             placement = None

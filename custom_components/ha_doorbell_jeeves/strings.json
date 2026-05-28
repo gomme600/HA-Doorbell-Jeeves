@@ -69,11 +69,11 @@
         "title": "Camera Map",
         "description": "Manage spatial camera placements used for property awareness and PTZ navigation. {camera_summary}",
         "menu_options": {
-          "add_camera_placement": "\u2795 Add Camera Placement",
-          "edit_camera_placement": "\u270f\ufe0f Edit Camera Placement",
-          "verify_camera_audio": "\ud83d\udd0a Verify 2-Way Audio",
-          "remove_camera_placement": "\u2796 Remove Camera Placement",
-          "init": "\u2190 Back to Menu"
+          "add_camera_placement": "➕ Add Camera Placement",
+          "edit_camera_placement": "✏️ Edit Camera Placement",
+          "verify_camera_audio": "🔊 Verify 2-Way Audio",
+          "remove_camera_placement": "➖ Remove Camera Placement",
+          "init": "← Back to Menu"
         }
       },
       "add_camera_placement": {
@@ -138,9 +138,9 @@
         "title": "Task Instructions",
         "description": "Manage extra prompt instructions appended to Jeeves for specific duties. {instruction_summary}",
         "menu_options": {
-          "add_task_instruction": "\u2795 Add Instruction",
-          "remove_task_instruction": "\u2796 Remove Instruction",
-          "init": "\u2190 Back to Menu"
+          "add_task_instruction": "➕ Add Instruction",
+          "remove_task_instruction": "➖ Remove Instruction",
+          "init": "← Back to Menu"
         }
       },
       "add_task_instruction": {
@@ -178,7 +178,7 @@
         "menu_options": {
           "general": "General (AI model, voice, timeout)",
           "dual_model": "Dual Model (separate tool-calling model)",
-          "vision": "Camera & Vision (FPS, resolution)",
+          "vision": "Primary Camera & Vision",
           "camera_map": "Camera Map (camera placement & PTZ)",
           "audio": "Audio Setup (Reolink/manual wiring)",
           "timeline": "Timeline Integration (LLM Vision events)",
@@ -207,7 +207,7 @@
       },
       "dual_model": {
         "title": "Dual Model Architecture",
-        "description": "By default, the voice model handles tool calls natively (recommended). Enable dual-model mode only if you want a separate text model to handle tool execution instead of the voice model.\n\nThis is an advanced option \u2014 most users should leave it disabled.",
+        "description": "By default, the voice model handles tool calls natively (recommended). Enable dual-model mode only if you want a separate text model to handle tool execution instead of the voice model.\n\nThis is an advanced option — most users should leave it disabled.",
         "data": {
           "dual_model_enabled": "Enable Dual Model Mode",
           "tool_provider": "Tool Model Provider",
@@ -217,7 +217,7 @@
         }
       },
       "vision": {
-        "title": "Camera & Vision",
+        "title": "Primary Camera & Vision",
         "description": "Configure the camera feed sent to the AI. Lower resolution and FPS reduce token costs and improve response time.",
         "data": {
           "camera_entity": "Camera Entity",
@@ -238,7 +238,8 @@
         "title": "Reolink Audio Setup",
         "description": "Select which Reolink integration entry should provide two-way audio.",
         "data": {
-          "reolink_entry_id": "Reolink Device"
+          "reolink_entry_id": "Reolink Integration",
+          "verify_audio": "Verify Doorbell Audio Now"
         }
       },
       "audio_manual": {
@@ -268,28 +269,36 @@
         "title": "Entities & Actions",
         "description": "Manage the entities and actions available to the AI agent. {entity_summary}",
         "menu_options": {
-          "add_camera": "\ud83d\udcf7 Add Camera (on-demand viewing)",
-          "add_calendar": "\ud83d\udcc5 Add Calendar (schedule access)",
-          "add_entity": "\ud83c\udfe0 Add Other Entity",
-          "edit_entity": "\u270f\ufe0f Edit Entity",
-          "add_action": "\u26a1 Add Action",
-          "edit_action": "\ud83d\udee0\ufe0f Edit Action",
-          "add_notification": "\ud83d\udd14 Add Notification Target",
-          "add_audio_file": "\ud83d\udd0a Add Audio File",
-          "remove_entity": "\u2796 Remove Entity",
-          "remove_action": "\ud83d\uddd1\ufe0f Remove Action",
-          "remove_notification": "\ud83d\uddd1\ufe0f Remove Notification Target",
-          "remove_audio_file": "\ud83d\uddd1\ufe0f Remove Audio File",
-          "init": "\u2190 Back to Menu"
+          "add_camera": "📷 Add Camera (on-demand viewing)",
+          "edit_camera": "✏️ Edit Camera (Audio/PTZ)",
+          "add_calendar": "📅 Add Calendar (schedule access)",
+          "add_entity": "🏠 Add Other Entity",
+          "edit_entity": "✏️ Edit Entity",
+          "add_action": "⚡ Add Action",
+          "edit_action": "🛠️ Edit Action",
+          "add_notification": "🔔 Add Notification Target",
+          "add_audio_file": "🔊 Add Audio File",
+          "remove_entity": "➖ Remove Entity",
+          "remove_action": "🗑️ Remove Action",
+          "remove_notification": "🗑️ Remove Notification Target",
+          "remove_audio_file": "🗑️ Remove Audio File",
+          "init": "← Back to Menu"
         }
       },
       "add_camera": {
         "title": "Add Camera",
-        "description": "Add a camera the AI can view on demand. When a visitor asks about something (e.g., 'is my ball in your garden?'), the AI can check this camera live.",
+        "description": "Add a camera the AI can view on demand. Configure 2-way audio and PTZ controls here.",
         "data": {
           "entity_id": "Camera Entity",
-          "name": "Camera Name (for AI, e.g., 'Garden Camera')",
-          "description": "Description (e.g., 'Shows the back garden and lawn area')"
+          "name": "Display Name",
+          "description": "Description (what this camera covers)",
+          "has_audio": "2-Way Audio (mic + speaker)",
+          "verify_audio": "Verify Audio Now",
+          "ptz_up": "PTZ Up Control",
+          "ptz_down": "PTZ Down Control",
+          "ptz_left": "PTZ Left Control",
+          "ptz_right": "PTZ Right Control",
+          "ptz_return_to_monitor": "PTZ Return-to-Monitor Control"
         }
       },
       "add_calendar": {
@@ -298,7 +307,7 @@
         "data": {
           "entity_id": "Calendar Entity",
           "name": "Calendar Name (e.g., 'Owner's Work Schedule')",
-          "description": "Description (e.g., 'Main work and personal calendar \u2014 use to determine availability')"
+          "description": "Description (e.g., 'Main work and personal calendar — use to determine availability')"
         }
       },
       "add_entity": {
@@ -402,10 +411,10 @@
         "title": "Known Identities",
         "description": "Manage known people, animals, and objects that the AI should recognize. {identity_summary}",
         "menu_options": {
-          "add_identity": "\u2795 Add Identity",
-          "remove_identity": "\u2796 Remove Identity",
-          "identity_settings": "\u2699\ufe0f Identity Detection Settings",
-          "init": "\u2190 Back to Menu"
+          "add_identity": "➕ Add Identity",
+          "remove_identity": "➖ Remove Identity",
+          "identity_settings": "⚙️ Identity Detection Settings",
+          "init": "← Back to Menu"
         }
       },
       "add_identity": {
@@ -509,11 +518,10 @@
         "title": "Camera Map",
         "description": "Manage spatial camera placements used for property awareness and PTZ navigation. {camera_summary}",
         "menu_options": {
-          "add_camera_placement": "\u2795 Add Camera Placement",
-          "edit_camera_placement": "\u270f\ufe0f Edit Camera Placement",
-          "verify_camera_audio": "\ud83d\udd0a Verify 2-Way Audio",
-          "remove_camera_placement": "\u2796 Remove Camera Placement",
-          "init": "\u2190 Back to Menu"
+          "add_camera_placement": "➕ Add Camera Placement",
+          "edit_camera_placement": "✏️ Edit Camera Placement",
+          "remove_camera_placement": "➖ Remove Camera Placement",
+          "init": "← Back to Menu"
         }
       },
       "add_camera_placement": {
@@ -523,14 +531,7 @@
           "entity_id": "Camera Entity",
           "name": "Display Name",
           "rotation": "Facing Direction (degrees)",
-          "area_description": "Area Description (what the camera covers)",
-          "is_doorbell": "Is Doorbell Camera",
-          "has_audio": "2-Way Audio (mic + speaker)",
-          "ptz_up": "PTZ Up Control",
-          "ptz_down": "PTZ Down Control",
-          "ptz_left": "PTZ Left Control",
-          "ptz_right": "PTZ Right Control",
-          "ptz_return_to_monitor": "PTZ Return-to-Monitor Control"
+          "area_description": "Area Description (what the camera covers)"
         }
       },
       "edit_camera_placement": {
@@ -541,19 +542,12 @@
         }
       },
       "edit_camera_placement_form": {
-        "title": "Edit Camera: {camera_name}",
-        "description": "Update the camera placement settings. X/Y position is set via the dashboard card.",
+        "title": "Edit Placement: {camera_name}",
+        "description": "Update spatial placement. X/Y position is set via the dashboard card.",
         "data": {
           "name": "Display Name",
           "rotation": "Facing Direction (degrees)",
-          "area_description": "Area Description (what the camera covers)",
-          "is_doorbell": "Is Doorbell Camera",
-          "has_audio": "2-Way Audio (mic + speaker)",
-          "ptz_up": "PTZ Up Control",
-          "ptz_down": "PTZ Down Control",
-          "ptz_left": "PTZ Left Control",
-          "ptz_right": "PTZ Right Control",
-          "ptz_return_to_monitor": "PTZ Return-to-Monitor Control"
+          "area_description": "Area Description"
         }
       },
       "verify_camera_audio": {
@@ -578,9 +572,9 @@
         "title": "Task Instructions",
         "description": "Manage extra prompt instructions appended to Jeeves for specific duties. {instruction_summary}",
         "menu_options": {
-          "add_task_instruction": "\u2795 Add Instruction",
-          "remove_task_instruction": "\u2796 Remove Instruction",
-          "init": "\u2190 Back to Menu"
+          "add_task_instruction": "➕ Add Instruction",
+          "remove_task_instruction": "➖ Remove Instruction",
+          "init": "← Back to Menu"
         }
       },
       "add_task_instruction": {
@@ -596,6 +590,28 @@
         "description": "Select an instruction to remove.",
         "data": {
           "title": "Instruction"
+        }
+      },
+      "edit_camera": {
+        "title": "Edit Camera",
+        "description": "Select a camera to edit its audio, PTZ, and description settings.",
+        "data": {
+          "entity_id": "Camera to Edit"
+        }
+      },
+      "edit_camera_form": {
+        "title": "Edit Camera: {camera_name}",
+        "description": "Update camera settings. Toggle audio and configure PTZ controls.",
+        "data": {
+          "name": "Display Name",
+          "description": "Description",
+          "has_audio": "2-Way Audio (mic + speaker)",
+          "verify_audio": "Verify Audio Now",
+          "ptz_up": "PTZ Up Control",
+          "ptz_down": "PTZ Down Control",
+          "ptz_left": "PTZ Left Control",
+          "ptz_right": "PTZ Right Control",
+          "ptz_return_to_monitor": "PTZ Return-to-Monitor Control"
         }
       }
     },

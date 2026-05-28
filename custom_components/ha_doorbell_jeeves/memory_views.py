@@ -172,7 +172,10 @@ class JeevesEventImageView(HomeAssistantView):
             raise web.HTTPNotFound(text="Entry not found")
 
         event_store = manager.event_store
-        idx = int(photo_index)
+        try:
+            idx = int(photo_index)
+        except (TypeError, ValueError):
+            raise web.HTTPNotFound(text="Invalid photo index")
 
         for evt in event_store.events:
             if evt.id == event_id:

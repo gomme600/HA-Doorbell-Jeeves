@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import json
 import logging
 import time
@@ -16,6 +17,7 @@ from .const import (
     CONF_API_KEY,
     CONF_CAMERA_ENTITY,
     CONF_PIN_CODE,
+    CONF_TOOL_API_KEY,
     CONF_VALIDATOR_MODEL,
     DEFAULT_VALIDATOR_MODEL,
     EVENT_ACTION_BLOCKED,
@@ -226,7 +228,7 @@ class SecurityManager:
                              conversation_summary: str, claimed_identity: str,
                              camera_frame_b64: str | None, reference_image_b64: str | None,
                              custom_prompt: str, require_visual_match: bool) -> ValidatorDecision:
-        api_key = self._config.get(CONF_API_KEY, "")
+        api_key = self._config.get(CONF_TOOL_API_KEY) or self._config.get(CONF_API_KEY, "")
         model = self._config.get(CONF_VALIDATOR_MODEL, DEFAULT_VALIDATOR_MODEL)
 
         if not api_key:
@@ -251,12 +253,31 @@ class SecurityManager:
                 f"VISUAL MATCH REQUIRED: {require_visual_match}\n"
             )),
         ]
-        if camera_frame_b64:
-            parts.append(types.Part(inline_data=types.Blob(data=base64.b64decode(camera_frame_b64), mime_type="image/jpeg")))
-            parts.append(types.Part(text="[Current camera frame]"))
-        if reference_image_b64:
-            parts.append(types.Part(inline_data=types.Blob(data=base64.b64decode(reference_image_b64), mime_type="image/jpeg")))
-            parts.append(types.Part(text=f"[Reference image of '{claimed_identity}']"))
+        try:
+            if camera_frame_b64:
+                camera_bytes = base64.b64decode(camera_frame_b64, validate=True)
+                parts.append(
+                    types.Part(
+                        inline_data=types.Blob(data=camera_bytes, mime_type="image/jpeg")
+                    )
+                )
+                parts.append(types.Part(text="[Current camera frame]"))
+            if reference_image_b64:
+                reference_bytes = base64.b64decode(reference_image_b64, validate=True)
+                parts.append(
+                    types.Part(
+                        inline_data=types.Blob(data=reference_bytes, mime_type="image/jpeg")
+                    )
+                )
+                parts.append(types.Part(text=f"[Reference image of '{claimed_identity}']"))
+        except (binascii.Error, ValueError):
+            return ValidatorDecision(
+                action=action_id,
+                approved=False,
+                confidence=0.0,
+                reasoning="Validator input image data is invalid",
+                threat_indicators=["invalid_image_input"],
+            )
 
         try:
             response = await asyncio.to_thread(

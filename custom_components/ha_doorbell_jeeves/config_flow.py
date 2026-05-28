@@ -826,29 +826,36 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
         )
 
     async def async_step_camera_map(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Camera map: spatial placement only (x/y/rotation/area)."""
         store = await self._async_get_store()
         placements: list[CameraPlacement] = getattr(store, CONF_CAMERA_PLACEMENTS)
         items = []
         for p in placements:
-            audio_badge = " 🎙" if p.has_audio else ""
             doorbell_badge = " 🔔" if p.is_doorbell else ""
-            items.append(f"{p.name} ({p.entity_id}) — {int(p.rotation)}°{doorbell_badge}{audio_badge}")
-        menu_opts = ["add_camera_placement", "edit_camera_placement", "verify_camera_audio", "remove_camera_placement", "init"]
+            audio_badge = " 🎙" if p.has_audio else ""
+            items.append(f"{p.name} — {int(p.rotation)}°{doorbell_badge}{audio_badge}")
+        menu_opts = ["add_camera_placement", "edit_camera_placement", "remove_camera_placement", "init"]
         return self.async_show_menu(
             step_id="camera_map",
             menu_options=menu_opts,
             description_placeholders={
                 "camera_summary": "**Mapped Cameras:**\n"
                 + ("\n".join(f"• {item}" for item in items) if items else "None configured")
-                + "\n\n💡 **Tip:** For a visual drag-and-drop editor, add the "
-                + "`custom:jeeves-camera-map-panel` card to your dashboard."
+                + "\n\n💡 Use the `custom:jeeves-camera-map-panel` dashboard card for drag-and-drop placement."
+                + "\n\nAudio, PTZ, and doorbell settings are configured per-camera in **Entities & Actions → 📷 Add/Edit Camera**."
             },
         )
 
     async def async_step_add_camera_placement(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Add a camera to the spatial map (position + area only)."""
         store = await self._async_get_store()
         if user_input is not None:
             placements: list[CameraPlacement] = getattr(store, CONF_CAMERA_PLACEMENTS)
+            # Auto-detect if this is the doorbell camera
+            doorbell_entity = self._data.get(CONF_CAMERA_ENTITY, "")
+            is_doorbell = (user_input["entity_id"] == doorbell_entity) if doorbell_entity else False
+            # Preserve existing has_audio/ptz if re-adding same camera
+            existing = next((p for p in placements if p.entity_id == user_input["entity_id"]), None)
             placement = CameraPlacement(
                 entity_id=user_input["entity_id"],
                 name=user_input["name"],
@@ -856,14 +863,17 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                 y=float(user_input.get("y", 0.5)),
                 rotation=float(user_input.get("rotation", 0)),
                 area_description=user_input.get("area_description", ""),
-                is_doorbell=user_input.get("is_doorbell", False),
-                has_audio=user_input.get("has_audio", False),
-                ptz_up=_clean_text(user_input.get("ptz_up", "")),
-                ptz_down=_clean_text(user_input.get("ptz_down", "")),
-                ptz_left=_clean_text(user_input.get("ptz_left", "")),
-                ptz_right=_clean_text(user_input.get("ptz_right", "")),
-                ptz_return_to_monitor=_clean_text(user_input.get("ptz_return_to_monitor", "")),
+                is_doorbell=is_doorbell,
+                has_audio=existing.has_audio if existing else is_doorbell,
+                ptz_up=existing.ptz_up if existing else "",
+                ptz_down=existing.ptz_down if existing else "",
+                ptz_left=existing.ptz_left if existing else "",
+                ptz_right=existing.ptz_right if existing else "",
+                ptz_return_to_monitor=existing.ptz_return_to_monitor if existing else "",
             )
+            if existing:
+                placement.audio_method = existing.audio_method
+                placement.audio_url = existing.audio_url
             setattr(
                 store,
                 CONF_CAMERA_PLACEMENTS,
@@ -880,21 +890,12 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                                      unit_of_measurement="°")
             ),
             vol.Optional("area_description", default=""): TextSelector(TextSelectorConfig(multiline=True)),
-            vol.Optional("is_doorbell", default=False): BooleanSelector(),
-            vol.Optional("has_audio", default=False): BooleanSelector(),
         }
-        ptz_selector = EntitySelectorConfig(domain=["button", "script"])
-        _add_optional_entity_selector(schema, "ptz_up", None, ptz_selector)
-        _add_optional_entity_selector(schema, "ptz_down", None, ptz_selector)
-        _add_optional_entity_selector(schema, "ptz_left", None, ptz_selector)
-        _add_optional_entity_selector(schema, "ptz_right", None, ptz_selector)
-        _add_optional_entity_selector(schema, "ptz_return_to_monitor", None, ptz_selector)
         return self.async_show_form(
             step_id="add_camera_placement",
             data_schema=vol.Schema(schema),
             description_placeholders={
-                "tip": "Use the Camera Map card on your dashboard for visual placement and audio verification. "
-                       "This form is for basic setup only."
+                "tip": "Position can be fine-tuned via the dashboard Camera Map card."
             },
         )
 
@@ -927,7 +928,7 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
         )
 
     async def async_step_edit_camera_placement(self, user_input: dict[str, Any] | None = None) -> FlowResult:
-        """Edit an existing camera placement — pre-fills all current values."""
+        """Edit spatial placement for an existing camera (name, rotation, area)."""
         store = await self._async_get_store()
         placements: list[CameraPlacement] = getattr(store, CONF_CAMERA_PLACEMENTS)
 
@@ -936,7 +937,6 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
 
         # Phase 1: Select which camera to edit
         if user_input is not None and "entity_id" in user_input and "name" not in user_input:
-            # Store selection and show edit form
             self._edit_camera_entity_id = user_input["entity_id"]
             existing = next((p for p in placements if p.entity_id == user_input["entity_id"]), None)
             if not existing:
@@ -951,22 +951,14 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                 vol.Optional("area_description", default=existing.area_description or ""): TextSelector(
                     TextSelectorConfig(multiline=True)
                 ),
-                vol.Optional("is_doorbell", default=existing.is_doorbell): BooleanSelector(),
-                vol.Optional("has_audio", default=existing.has_audio): BooleanSelector(),
             }
-            ptz_selector = EntitySelectorConfig(domain=["button", "script"])
-            _add_optional_entity_selector(schema, "ptz_up", existing.ptz_up or None, ptz_selector)
-            _add_optional_entity_selector(schema, "ptz_down", existing.ptz_down or None, ptz_selector)
-            _add_optional_entity_selector(schema, "ptz_left", existing.ptz_left or None, ptz_selector)
-            _add_optional_entity_selector(schema, "ptz_right", existing.ptz_right or None, ptz_selector)
-            _add_optional_entity_selector(schema, "ptz_return_to_monitor", existing.ptz_return_to_monitor or None, ptz_selector)
             return self.async_show_form(
                 step_id="edit_camera_placement_form",
                 data_schema=vol.Schema(schema),
                 description_placeholders={"camera_name": existing.name},
             )
 
-        # Phase 1: Show selector
+        # Show selector
         options = [
             {"value": p.entity_id, "label": f"{p.name} ({p.entity_id})"}
             for p in placements
@@ -983,7 +975,7 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
         )
 
     async def async_step_edit_camera_placement_form(self, user_input: dict[str, Any] | None = None) -> FlowResult:
-        """Save the edited camera placement."""
+        """Save the edited camera spatial placement."""
         if user_input is None:
             return await self.async_step_camera_map()
 
@@ -993,111 +985,81 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
         if not entity_id:
             return await self.async_step_camera_map()
 
-        # Find existing to preserve x/y coordinates (set via dashboard card)
         existing = next((p for p in placements if p.entity_id == entity_id), None)
-        x = existing.x if existing else 0.5
-        y = existing.y if existing else 0.5
+        if not existing:
+            return await self.async_step_camera_map()
 
-        updated = CameraPlacement(
-            entity_id=entity_id,
-            name=user_input["name"],
-            x=x,
-            y=y,
-            rotation=float(user_input.get("rotation", 0)),
-            area_description=user_input.get("area_description", ""),
-            is_doorbell=user_input.get("is_doorbell", False),
-            has_audio=user_input.get("has_audio", False),
-            ptz_up=_clean_text(user_input.get("ptz_up", "")),
-            ptz_down=_clean_text(user_input.get("ptz_down", "")),
-            ptz_left=_clean_text(user_input.get("ptz_left", "")),
-            ptz_right=_clean_text(user_input.get("ptz_right", "")),
-            ptz_return_to_monitor=_clean_text(user_input.get("ptz_return_to_monitor", "")),
-        )
-        # Preserve cached audio fields if not changed
-        if existing and existing.audio_method and user_input.get("has_audio", False):
-            updated.audio_method = existing.audio_method
-            updated.audio_url = existing.audio_url
+        # Update only spatial fields, preserve all others
+        existing.name = user_input["name"]
+        existing.rotation = float(user_input.get("rotation", existing.rotation))
+        existing.area_description = user_input.get("area_description", existing.area_description)
 
-        setattr(
-            store,
-            CONF_CAMERA_PLACEMENTS,
-            [p for p in placements if p.entity_id != entity_id] + [updated],
-        )
         await store.async_save_entities()
         return await self.async_step_camera_map()
 
     async def async_step_verify_camera_audio(self, user_input: dict[str, Any] | None = None) -> FlowResult:
-        """Verify 2-way audio works for a camera by probing its stream paths."""
-        store = await self._async_get_store()
-        placements: list[CameraPlacement] = getattr(store, CONF_CAMERA_PLACEMENTS)
+        """Verify 2-way audio for a camera. Callable from entities or audio steps."""
+        camera_entity = getattr(self, "_verify_audio_entity", None) or (
+            user_input.get("entity_id") if user_input else None
+        )
+        return_step = getattr(self, "_verify_audio_return_step", "entities")
 
-        # Include doorbell camera from main config + all placements with has_audio
-        doorbell_entity = self._data.get(CONF_CAMERA_ENTITY, "")
-        audio_cameras: list[dict[str, str]] = []
-        if doorbell_entity:
-            audio_cameras.append({"value": doorbell_entity, "label": f"🔔 Doorbell ({doorbell_entity})"})
-        for p in placements:
-            if p.has_audio and p.entity_id != doorbell_entity:
-                audio_cameras.append({"value": p.entity_id, "label": f"🎙 {p.name} ({p.entity_id})"})
+        if not camera_entity:
+            # Fallback: use doorbell camera
+            camera_entity = self._data.get(CONF_CAMERA_ENTITY, "")
 
-        if not audio_cameras:
+        if not camera_entity:
             return self.async_show_form(
-                step_id="verify_camera_audio",
+                step_id="verify_camera_audio_result",
                 data_schema=vol.Schema({}),
-                errors={"base": "no_audio_cameras"},
+                description_placeholders={
+                    "result": "❌ No camera entity specified for audio verification."
+                },
             )
 
-        if user_input is not None and "entity_id" in user_input:
-            # Run audio verification
-            entity_id = user_input["entity_id"]
-            result = await self._verify_audio_stream(entity_id)
+        result = await self._verify_audio_stream(camera_entity)
 
-            if result["success"]:
-                # Cache result
-                for p in placements:
-                    if p.entity_id == entity_id:
-                        p.audio_method = result["method"]
-                        p.audio_url = result["url"]
-                        break
-                await store.async_save_entities()
+        if result["success"]:
+            # Cache result in placement if it exists
+            store = await self._async_get_store()
+            placements: list[CameraPlacement] = getattr(store, CONF_CAMERA_PLACEMENTS)
+            for p in placements:
+                if p.entity_id == camera_entity:
+                    p.audio_method = result["method"]
+                    p.audio_url = result["url"]
+                    break
+            await store.async_save_entities()
 
-                return self.async_show_form(
-                    step_id="verify_camera_audio_result",
-                    data_schema=vol.Schema({}),
-                    description_placeholders={
-                        "result": f"✅ **Audio verified!**\n\n"
-                                  f"- **Camera:** `{entity_id}`\n"
-                                  f"- **Method:** {result['method']}\n"
-                                  f"- **URL:** `{result['url'][:80]}...`\n\n"
-                                  f"2-way audio is working for this camera."
-                    },
-                )
-            else:
-                return self.async_show_form(
-                    step_id="verify_camera_audio_result",
-                    data_schema=vol.Schema({}),
-                    description_placeholders={
-                        "result": f"❌ **Audio verification failed**\n\n"
-                                  f"- **Camera:** `{entity_id}`\n"
-                                  f"- **Error:** {result['error']}\n\n"
-                                  f"Make sure go2rtc is configured or the camera supports RTSP audio backchannel."
-                    },
-                )
-
-        return self.async_show_form(
-            step_id="verify_camera_audio",
-            data_schema=vol.Schema(
-                {
-                    vol.Required("entity_id"): SelectSelector(
-                        SelectSelectorConfig(options=audio_cameras, mode=SelectSelectorMode.DROPDOWN)
-                    )
-                }
-            ),
-        )
+            return self.async_show_form(
+                step_id="verify_camera_audio_result",
+                data_schema=vol.Schema({}),
+                description_placeholders={
+                    "result": f"✅ **Audio verified!**\n\n"
+                              f"- **Camera:** `{camera_entity}`\n"
+                              f"- **Method:** {result['method']}\n\n"
+                              f"2-way audio stream is available for this camera."
+                },
+            )
+        else:
+            return self.async_show_form(
+                step_id="verify_camera_audio_result",
+                data_schema=vol.Schema({}),
+                description_placeholders={
+                    "result": f"❌ **Audio verification failed**\n\n"
+                              f"- **Camera:** `{camera_entity}`\n"
+                              f"- **Error:** {result['error']}\n\n"
+                              f"Make sure go2rtc is configured or the camera supports RTSP audio backchannel."
+                },
+            )
 
     async def async_step_verify_camera_audio_result(self, user_input: dict[str, Any] | None = None) -> FlowResult:
-        """Show verification result and return to camera map."""
-        return await self.async_step_camera_map()
+        """Show verification result and return to the step that triggered it."""
+        return_step = getattr(self, "_verify_audio_return_step", "entities")
+        if return_step == "audio_reolink":
+            return await self.async_step_audio_reolink()
+        elif return_step == "camera_map":
+            return await self.async_step_camera_map()
+        return await self.async_step_entities()
 
     async def _verify_audio_stream(self, camera_entity: str) -> dict[str, Any]:
         """Probe audio stream path for a camera entity."""
@@ -1182,6 +1144,15 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
             )
 
         if user_input is not None:
+            # Handle verify button
+            if user_input.get("verify_audio"):
+                camera_entity = self._data.get(CONF_CAMERA_ENTITY, "")
+                if camera_entity:
+                    self._verify_audio_entity = camera_entity
+                    self._verify_audio_return_step = "audio_reolink"
+                    return await self.async_step_verify_camera_audio()
+                # Fall through to show form again if no camera
+
             reolink_entry_id = _clean_text(user_input.get(CONF_REOLINK_ENTRY_ID, ""))
             if not reolink_entry_id:
                 errors[CONF_REOLINK_ENTRY_ID] = "required"
@@ -1199,7 +1170,10 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                 self._data.pop(CONF_MICROPHONE_ENTITY, None)
 
                 # Probe audio input methods and cache the best one
-                await self._probe_reolink_audio(reolink_entry_id)
+                try:
+                    await self._probe_reolink_audio(reolink_entry_id)
+                except Exception:
+                    _LOGGER.warning("Audio probe failed during save", exc_info=True)
 
                 trigger_entity = _auto_detect_reolink_trigger_entity(self.hass, reolink_entry_id)
                 if trigger_entity:
@@ -1215,7 +1189,8 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                         default=self._data.get(CONF_REOLINK_ENTRY_ID, ""),
                     ): SelectSelector(
                         SelectSelectorConfig(options=reolink_options, mode=SelectSelectorMode.DROPDOWN)
-                    )
+                    ),
+                    vol.Optional("verify_audio", default=False): BooleanSelector(),
                 }
             ),
             errors=errors,
@@ -1462,6 +1437,7 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
             step_id="entities",
             menu_options=[
                 "add_camera",
+                "edit_camera",
                 "add_calendar",
                 "add_entity",
                 "edit_entity",
@@ -1479,6 +1455,7 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
         )
 
     async def async_step_add_camera(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Add a camera with audio/PTZ settings in the Entities & Actions screen."""
         if user_input is not None:
             store = await self._async_get_store()
             existing = store.get_entity(user_input["entity_id"])
@@ -1486,27 +1463,191 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                 ManagedEntity(
                     entity_id=user_input["entity_id"],
                     name=user_input["name"],
-                    description=user_input["description"],
+                    description=user_input.get("description", "Camera feed the AI can view"),
                     actions=list(existing.actions) if existing else [],
                     security_mode=existing.security_mode if existing else SECURITY_MODE_AUTO,
                     require_visual_match=existing.require_visual_match if existing else False,
                     require_camera_feed=existing.require_camera_feed if existing else False,
                 )
             )
+            # Update camera placement with audio/PTZ settings
+            placements: list[CameraPlacement] = store.camera_placements
+            existing_placement = next((p for p in placements if p.entity_id == user_input["entity_id"]), None)
+            doorbell_entity = self._data.get(CONF_CAMERA_ENTITY, "")
+            is_doorbell = (user_input["entity_id"] == doorbell_entity) if doorbell_entity else False
+            has_audio = user_input.get("has_audio", False)
+
+            if existing_placement:
+                existing_placement.has_audio = has_audio
+                existing_placement.is_doorbell = is_doorbell
+                existing_placement.ptz_up = _clean_text(user_input.get("ptz_up", ""))
+                existing_placement.ptz_down = _clean_text(user_input.get("ptz_down", ""))
+                existing_placement.ptz_left = _clean_text(user_input.get("ptz_left", ""))
+                existing_placement.ptz_right = _clean_text(user_input.get("ptz_right", ""))
+                existing_placement.ptz_return_to_monitor = _clean_text(user_input.get("ptz_return_to_monitor", ""))
+                # Clear cached audio if toggled off
+                if not has_audio:
+                    existing_placement.audio_method = ""
+                    existing_placement.audio_url = ""
+            else:
+                # Create a new placement entry (spatial placement defaults, user can adjust via map)
+                placements.append(CameraPlacement(
+                    entity_id=user_input["entity_id"],
+                    name=user_input["name"],
+                    x=0.5,
+                    y=0.5,
+                    rotation=0,
+                    area_description=user_input.get("description", ""),
+                    is_doorbell=is_doorbell,
+                    has_audio=has_audio,
+                    ptz_up=_clean_text(user_input.get("ptz_up", "")),
+                    ptz_down=_clean_text(user_input.get("ptz_down", "")),
+                    ptz_left=_clean_text(user_input.get("ptz_left", "")),
+                    ptz_right=_clean_text(user_input.get("ptz_right", "")),
+                    ptz_return_to_monitor=_clean_text(user_input.get("ptz_return_to_monitor", "")),
+                ))
+            await store.async_save_entities()
+
+            # If verify was requested, run it
+            if user_input.get("verify_audio") and has_audio:
+                self._verify_audio_entity = user_input["entity_id"]
+                self._verify_audio_return_step = "entities"
+                return await self.async_step_verify_camera_audio()
+
             return await self.async_step_entities()
+
+        schema: dict[Any, Any] = {
+            vol.Required("entity_id"): EntitySelector(EntitySelectorConfig(domain="camera")),
+            vol.Required("name"): TextSelector(),
+            vol.Required(
+                "description",
+                default="Camera feed the AI can view to check this area",
+            ): TextSelector(TextSelectorConfig(multiline=True)),
+            vol.Optional("has_audio", default=False): BooleanSelector(),
+            vol.Optional("verify_audio", default=False): BooleanSelector(),
+        }
+        ptz_selector = EntitySelectorConfig(domain=["button", "script"])
+        _add_optional_entity_selector(schema, "ptz_up", None, ptz_selector)
+        _add_optional_entity_selector(schema, "ptz_down", None, ptz_selector)
+        _add_optional_entity_selector(schema, "ptz_left", None, ptz_selector)
+        _add_optional_entity_selector(schema, "ptz_right", None, ptz_selector)
+        _add_optional_entity_selector(schema, "ptz_return_to_monitor", None, ptz_selector)
         return self.async_show_form(
             step_id="add_camera",
+            data_schema=vol.Schema(schema),
+        )
+
+    async def async_step_edit_camera(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Edit an existing camera's audio/PTZ settings."""
+        store = await self._async_get_store()
+        cameras = [e for e in store.managed_entities if e.entity_id.startswith("camera.")]
+
+        if not cameras:
+            return await self.async_step_entities()
+
+        # Phase 1: Select camera
+        if user_input is not None and "entity_id" in user_input and "name" not in user_input:
+            self._edit_camera_entity_id = user_input["entity_id"]
+            entity = store.get_entity(user_input["entity_id"])
+            if not entity:
+                return await self.async_step_entities()
+
+            placements: list[CameraPlacement] = store.camera_placements
+            placement = next((p for p in placements if p.entity_id == user_input["entity_id"]), None)
+
+            schema: dict[Any, Any] = {
+                vol.Required("name", default=entity.name): TextSelector(),
+                vol.Required("description", default=entity.description): TextSelector(TextSelectorConfig(multiline=True)),
+                vol.Optional("has_audio", default=placement.has_audio if placement else False): BooleanSelector(),
+                vol.Optional("verify_audio", default=False): BooleanSelector(),
+            }
+            ptz_selector = EntitySelectorConfig(domain=["button", "script"])
+            _add_optional_entity_selector(schema, "ptz_up", (placement.ptz_up if placement else None) or None, ptz_selector)
+            _add_optional_entity_selector(schema, "ptz_down", (placement.ptz_down if placement else None) or None, ptz_selector)
+            _add_optional_entity_selector(schema, "ptz_left", (placement.ptz_left if placement else None) or None, ptz_selector)
+            _add_optional_entity_selector(schema, "ptz_right", (placement.ptz_right if placement else None) or None, ptz_selector)
+            _add_optional_entity_selector(schema, "ptz_return_to_monitor", (placement.ptz_return_to_monitor if placement else None) or None, ptz_selector)
+            return self.async_show_form(
+                step_id="edit_camera_form",
+                data_schema=vol.Schema(schema),
+                description_placeholders={"camera_name": entity.name},
+            )
+
+        # Show selector
+        options = [
+            {"value": c.entity_id, "label": f"{c.name} ({c.entity_id})"}
+            for c in cameras
+        ]
+        return self.async_show_form(
+            step_id="edit_camera",
             data_schema=vol.Schema(
                 {
-                    vol.Required("entity_id"): EntitySelector(EntitySelectorConfig(domain="camera")),
-                    vol.Required("name"): TextSelector(),
-                    vol.Required(
-                        "description",
-                        default="Camera feed the AI can view to check this area",
-                    ): TextSelector(TextSelectorConfig(multiline=True)),
+                    vol.Required("entity_id"): SelectSelector(
+                        SelectSelectorConfig(options=options, mode=SelectSelectorMode.DROPDOWN)
+                    )
                 }
             ),
         )
+
+    async def async_step_edit_camera_form(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Save edited camera settings."""
+        if user_input is None:
+            return await self.async_step_entities()
+
+        entity_id = getattr(self, "_edit_camera_entity_id", None)
+        if not entity_id:
+            return await self.async_step_entities()
+
+        store = await self._async_get_store()
+        entity = store.get_entity(entity_id)
+        if entity:
+            entity.name = user_input["name"]
+            entity.description = user_input.get("description", entity.description)
+            await store.async_save_entities()
+
+        # Update placement
+        placements: list[CameraPlacement] = store.camera_placements
+        placement = next((p for p in placements if p.entity_id == entity_id), None)
+        has_audio = user_input.get("has_audio", False)
+        doorbell_entity = self._data.get(CONF_CAMERA_ENTITY, "")
+        is_doorbell = (entity_id == doorbell_entity) if doorbell_entity else False
+
+        if placement:
+            placement.has_audio = has_audio
+            placement.is_doorbell = is_doorbell
+            placement.ptz_up = _clean_text(user_input.get("ptz_up", ""))
+            placement.ptz_down = _clean_text(user_input.get("ptz_down", ""))
+            placement.ptz_left = _clean_text(user_input.get("ptz_left", ""))
+            placement.ptz_right = _clean_text(user_input.get("ptz_right", ""))
+            placement.ptz_return_to_monitor = _clean_text(user_input.get("ptz_return_to_monitor", ""))
+            if not has_audio:
+                placement.audio_method = ""
+                placement.audio_url = ""
+        else:
+            placements.append(CameraPlacement(
+                entity_id=entity_id,
+                name=user_input["name"],
+                x=0.5,
+                y=0.5,
+                rotation=0,
+                area_description=user_input.get("description", ""),
+                is_doorbell=is_doorbell,
+                has_audio=has_audio,
+                ptz_up=_clean_text(user_input.get("ptz_up", "")),
+                ptz_down=_clean_text(user_input.get("ptz_down", "")),
+                ptz_left=_clean_text(user_input.get("ptz_left", "")),
+                ptz_right=_clean_text(user_input.get("ptz_right", "")),
+                ptz_return_to_monitor=_clean_text(user_input.get("ptz_return_to_monitor", "")),
+            ))
+        await store.async_save_entities()
+
+        # Verify audio if requested
+        if user_input.get("verify_audio") and has_audio:
+            self._verify_audio_entity = entity_id
+            self._verify_audio_return_step = "entities"
+            return await self.async_step_verify_camera_audio()
+
+        return await self.async_step_entities()
 
     async def async_step_add_calendar(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         if user_input is not None:

@@ -51,6 +51,7 @@ class OpenAIRealtimeClient(BaseRealtimeClient):
         self._receive_task: asyncio.Task[None] | None = None
         self._connected = False
         self._conversation_turns: list[dict[str, str]] = []
+        self._pending_tool_image: tuple[str, str] | None = None
 
     @property
     def connected(self) -> bool:
@@ -230,6 +231,11 @@ class OpenAIRealtimeClient(BaseRealtimeClient):
                         "output": json.dumps(result),
                     }
                 )
+                pending_tool_image = self._pending_tool_image
+                self._pending_tool_image = None
+                if pending_tool_image:
+                    image_b64, mime_type = pending_tool_image
+                    await self.send_image(image_b64, mime_type=mime_type)
                 await self._ws.response.create()
             except Exception:
                 _LOGGER.exception("Failed to send function output")

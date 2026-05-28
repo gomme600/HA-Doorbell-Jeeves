@@ -748,6 +748,15 @@ def build_gemini_tools(
         for cp in store.camera_placements:
             if cp.has_audio and cp.entity_id not in target_entities:
                 target_entities.append(cp.entity_id)
+        target_entity_property: dict[str, Any] = {
+            "type": "string",
+            "description": (
+                "Which speaker/camera to play on. "
+                "Use a media_player entity or a camera with 2-way audio."
+            ),
+        }
+        if target_entities:
+            target_entity_property["enum"] = target_entities
         declarations.append(types.FunctionDeclaration(
             name=TOOL_PLAY_AUDIO,
             description=(
@@ -763,14 +772,7 @@ def build_gemini_tools(
                         "description": "Which audio file to play",
                         "enum": audio_ids,
                     },
-                    "target_entity_id": {
-                        "type": "string",
-                        "description": (
-                            "Which speaker/camera to play on. "
-                            "Use a media_player entity or a camera with 2-way audio."
-                        ),
-                        "enum": target_entities if target_entities else None,
-                    },
+                    "target_entity_id": target_entity_property,
                 },
                 "required": ["audio_id"],
             },
@@ -914,6 +916,12 @@ def build_openai_tools(
         for cp in store.camera_placements:
             if cp.has_audio and cp.entity_id not in target_entities:
                 target_entities.append(cp.entity_id)
+        target_entity_property: dict[str, Any] = {
+            "type": "string",
+            "description": "Speaker or camera to play on",
+        }
+        if target_entities:
+            target_entity_property["enum"] = target_entities
         tools.append({
             "type": "function",
             "name": TOOL_PLAY_AUDIO,
@@ -928,11 +936,7 @@ def build_openai_tools(
                         "description": "Which audio file to play",
                         "enum": audio_ids,
                     },
-                    "target_entity_id": {
-                        "type": "string",
-                        "description": "Speaker or camera to play on",
-                        "enum": target_entities if target_entities else None,
-                    },
+                    "target_entity_id": target_entity_property,
                 },
                 "required": ["audio_id"],
             },
@@ -1405,13 +1409,28 @@ async def _execute_play_audio(
     if not audio_file:
         return {"error": f"Audio file '{audio_id}' not found."}
 
+    from .const import CONF_MEDIA_PLAYER_ENTITY  # noqa: PLC0415
+
+    allowed_targets = {
+        entity.entity_id
+        for entity in store.managed_entities
+        if entity.entity_id.startswith("media_player.")
+    }
+    allowed_targets.update(
+        placement.entity_id for placement in store.camera_placements if placement.has_audio
+    )
+    default_target = (config or {}).get(CONF_MEDIA_PLAYER_ENTITY, "")
+    if default_target:
+        allowed_targets.add(default_target)
+
     # Determine target entity
     if not target:
-        # Default to the configured media player or doorbell camera
-        from .const import CONF_MEDIA_PLAYER_ENTITY  # noqa: PLC0415
-        target = (config or {}).get(CONF_MEDIA_PLAYER_ENTITY, "")
+        # Default to the configured media player if available
+        target = default_target
     if not target:
         return {"error": "No target speaker specified and no default configured."}
+    if target not in allowed_targets:
+        return {"error": f"Target '{target}' is not an allowed audio output."}
 
     # Play the audio
     try:
@@ -2193,11 +2212,14 @@ def _execute_extend_session(
     arguments: dict[str, Any], config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Extend session timeout — returns instruction for session manager."""
-    extra = arguments.get("extra_seconds", 60)
+    try:
+        extra = int(arguments.get("extra_seconds", 60))
+    except (TypeError, ValueError):
+        extra = 60
     reason = arguments.get("reason", "")
 
     # Clamp to reasonable range
-    extra = max(30, min(300, int(extra)))
+    extra = max(30, min(300, extra))
 
     return {
         "success": True,
@@ -2214,7 +2236,11 @@ async def _execute_recall_memories(
     from .const import DOMAIN  # noqa: PLC0415
 
     query = arguments.get("query", "")
-    hours_back = min(int(arguments.get("hours_back", 72)), 720)
+    try:
+        hours_back = int(arguments.get("hours_back", 72))
+    except (TypeError, ValueError):
+        hours_back = 72
+    hours_back = max(1, min(hours_back, 720))
 
     entry_id = (config or {}).get("_entry_id", "")
     if entry_id and DOMAIN in hass.data:
