@@ -72,7 +72,7 @@ class GeminiLiveClient(BaseRealtimeClient):
             None, lambda: genai.Client(api_key=self._api_key)
         )
 
-        live_config = types.LiveConnectConfig(
+        self._live_config = types.LiveConnectConfig(
             response_modalities=["AUDIO"],
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
@@ -94,7 +94,7 @@ class GeminiLiveClient(BaseRealtimeClient):
         )
 
         self._session_cm = self._client.aio.live.connect(
-            model=self._model, config=live_config,
+            model=self._model, config=self._live_config,
         )
         self._session = await self._session_cm.__aenter__()
         self._connected = True
@@ -102,6 +102,38 @@ class GeminiLiveClient(BaseRealtimeClient):
         await self._inject_reference_images()
         self._receive_task = asyncio.create_task(self._receive_loop())
         _LOGGER.info("Gemini Live connected (model=%s, voice=%s)", self._model, self._voice)
+
+    async def _reconnect_session(self) -> bool:
+        """Tear down current session and open a new one (same config). Returns True on success."""
+        try:
+            if self._session_cm:
+                try:
+                    await self._session_cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
+            self._session = None
+            self._session_cm = None
+
+            await asyncio.sleep(0.5)  # Brief pause before retry
+
+            self._session_cm = self._client.aio.live.connect(
+                model=self._model, config=self._live_config,
+            )
+            self._session = await self._session_cm.__aenter__()
+            await self._inject_reference_images()
+            # Re-trigger greeting on new session
+            await self._session.send_client_content(
+                turns=[types.Content(role="user", parts=[types.Part(text=(
+                    "[SYSTEM] A visitor is at the doorbell. "
+                    "Start speaking your greeting immediately."
+                ))])],
+                turn_complete=True,
+            )
+            _LOGGER.warning("Gemini reconnected successfully — greeting re-sent")
+            return True
+        except Exception:
+            _LOGGER.exception("Gemini reconnect failed")
+            return False
 
     async def disconnect(self) -> None:
         self._connected = False
@@ -233,6 +265,8 @@ class GeminiLiveClient(BaseRealtimeClient):
 
     async def _receive_loop(self) -> None:
         turns_completed = 0
+        reconnect_attempts = 0
+        max_reconnects = 2
         try:
             # NOTE: In the GenAI SDK, session.receive() can complete after a turn.
             # Re-enter receive() to keep the live session open across turns.
@@ -247,6 +281,16 @@ class GeminiLiveClient(BaseRealtimeClient):
                     err_str = str(recv_err)
                     _LOGGER.warning("Gemini receive() raised: %s (turns=%d)", err_str[:200], turns_completed)
                     if "close" in err_str.lower() or "1008" in err_str or "not implemented" in err_str.lower():
+                        # Early disconnect — try to reconnect if within first turn
+                        if turns_completed == 0 and reconnect_attempts < max_reconnects:
+                            reconnect_attempts += 1
+                            _LOGGER.warning(
+                                "Early Gemini disconnect (attempt %d/%d) — reconnecting...",
+                                reconnect_attempts, max_reconnects,
+                            )
+                            if await self._reconnect_session():
+                                consecutive_empty_iters = 0
+                                continue
                         _LOGGER.warning("Gemini server closed connection (policy/model issue)")
                         break
                     if not self._connected:
@@ -266,6 +310,16 @@ class GeminiLiveClient(BaseRealtimeClient):
 
                 consecutive_empty_iters += 1
                 if consecutive_empty_iters >= 3:
+                    # Early empty-stream disconnect — try to reconnect
+                    if turns_completed == 0 and reconnect_attempts < max_reconnects:
+                        reconnect_attempts += 1
+                        _LOGGER.warning(
+                            "Empty-stream Gemini disconnect (attempt %d/%d) — reconnecting...",
+                            reconnect_attempts, max_reconnects,
+                        )
+                        if await self._reconnect_session():
+                            consecutive_empty_iters = 0
+                            continue
                     _LOGGER.warning("Gemini receive stream ended repeatedly with no events (turns=%d)", turns_completed)
                     break
                 await asyncio.sleep(0.1)
