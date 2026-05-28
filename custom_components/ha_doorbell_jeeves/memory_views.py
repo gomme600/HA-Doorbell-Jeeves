@@ -17,7 +17,11 @@ from .memory import SessionMemory
 from .session_manager import JeevesSessionManager
 
 _CARD_JS_PATH = Path(__file__).parent / "frontend" / "jeeves-memory-timeline-card.js"
+_EVENTS_CARD_JS_PATH = Path(__file__).parent / "frontend" / "jeeves-events-timeline-card.js"
 _CAMERA_MAP_JS_PATH = Path(__file__).parent / "frontend" / "jeeves-camera-map-panel.js"
+
+# All frontend JS files bundled together via the single card_js endpoint
+_ALL_CARD_JS_PATHS = [_CARD_JS_PATH, _EVENTS_CARD_JS_PATH, _CAMERA_MAP_JS_PATH]
 
 
 def memory_image_url(entry_id: str, memory_id: str) -> str:
@@ -31,7 +35,7 @@ def card_js_url() -> str:
 
 
 class JeevesCardJSView(HomeAssistantView):
-    """Serve the memory timeline card JS with correct MIME type."""
+    """Serve ALL Jeeves card JS bundled together with correct MIME type."""
 
     url = f"/api/{DOMAIN}/card_js"
     name = f"api:{DOMAIN}:card_js"
@@ -41,14 +45,21 @@ class JeevesCardJSView(HomeAssistantView):
         self._content: bytes | None = None
 
     async def get(self, request: web.Request) -> web.Response:
-        """Return the card JavaScript with correct content type."""
+        """Return all card JavaScript bundled together."""
         if self._content is None:
             loop = asyncio.get_running_loop()
-            self._content = await loop.run_in_executor(None, _CARD_JS_PATH.read_bytes)
+            parts: list[bytes] = []
+            for path in _ALL_CARD_JS_PATHS:
+                try:
+                    data = await loop.run_in_executor(None, path.read_bytes)
+                    parts.append(data)
+                except OSError:
+                    pass
+            self._content = b"\n;\n".join(parts)
         return web.Response(
             body=self._content,
             content_type="application/javascript",
-            headers={"Cache-Control": "no-cache"},
+            headers={"Cache-Control": "no-store"},
         )
 
 
@@ -105,9 +116,6 @@ def register_memory_views(hass: HomeAssistant) -> None:
     hass.http.register_view(JeevesCardJSView())
     hass.http.register_view(JeevesEventsCardJSView())
     hass.http.register_view(JeevesCameraMapJSView())
-
-
-_EVENTS_CARD_JS_PATH = Path(__file__).parent / "frontend" / "jeeves-events-timeline-card.js"
 
 
 class JeevesEventsCardJSView(HomeAssistantView):

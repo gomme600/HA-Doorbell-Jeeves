@@ -152,7 +152,12 @@ async def _async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None
 
 
 async def _register_frontend_resources(hass: HomeAssistant) -> None:
-    """Register frontend resources used by optional Lovelace cards."""
+    """Register frontend resources used by optional Lovelace cards.
+
+    All card JS (memory timeline, events timeline, camera map) is served as a
+    single bundled file from /api/ha_doorbell_jeeves/card_js to ensure reliable
+    loading across all dashboard types.
+    """
     import hashlib  # noqa: PLC0415
     from pathlib import Path  # noqa: PLC0415
 
@@ -162,78 +167,67 @@ async def _register_frontend_resources(hass: HomeAssistant) -> None:
 
     loop = asyncio.get_running_loop()
 
-    # Helper to compute cache-busting hash for a JS file
-    async def _hash(filename: str) -> str:
+    # Compute combined hash of all JS files for cache-busting
+    hasher = hashlib.md5()  # noqa: S324
+    for filename in [
+        "jeeves-memory-timeline-card.js",
+        "jeeves-events-timeline-card.js",
+        "jeeves-camera-map-panel.js",
+    ]:
         js_file = Path(__file__).parent / "frontend" / filename
         try:
             content = await loop.run_in_executor(None, js_file.read_bytes)
-            return hashlib.md5(content).hexdigest()[:8]  # noqa: S324
+            hasher.update(content)
         except OSError:
-            return "1"
+            pass
+    file_hash = hasher.hexdigest()[:8]
 
-    # Build URL list for all JS resources
-    memory_hash = await _hash("jeeves-memory-timeline-card.js")
-    events_hash = await _hash("jeeves-events-timeline-card.js")
-    map_hash = await _hash("jeeves-camera-map-panel.js")
+    # Single bundled URL for all cards
+    bundle_url = f"{card_js_url()}?v={file_hash}"
 
-    js_urls = [
-        f"{card_js_url()}?v={memory_hash}",
-        f"/api/{DOMAIN}/events_card_js?v={events_hash}",
-        f"/api/{DOMAIN}/camera_map_js?v={map_hash}",
-    ]
+    # Register via add_extra_js_url (loads on every page)
+    add_extra_js_url(hass, bundle_url)
 
-    # Register via add_extra_js_url (loads on every page, ensures custom elements are defined)
-    for url in js_urls:
-        add_extra_js_url(hass, url)
-
-    # Also auto-register as Lovelace resources so cards appear in the card picker
-    await _ensure_lovelace_resources(hass, js_urls)
+    # Also ensure it's registered as a Lovelace resource for the card picker
+    await _ensure_lovelace_resources(hass, bundle_url)
 
     # Register WebSocket commands for camera map
     _register_ws_commands(hass)
 
-    _LOGGER.debug("Registered frontend resources (memory, events, camera_map)")
+    _LOGGER.debug("Registered frontend bundle: %s", bundle_url)
 
 
-async def _ensure_lovelace_resources(hass: HomeAssistant, urls: list[str]) -> None:
-    """Ensure our JS files are registered as Lovelace resources for the card picker."""
+async def _ensure_lovelace_resources(hass: HomeAssistant, bundle_url: str) -> None:
+    """Ensure our bundled JS is registered as a Lovelace resource."""
     try:
-        # Access the lovelace resources collection via hass.data
         ll_resources = hass.data.get("lovelace_resources")
         if ll_resources is None:
-            _LOGGER.debug("Lovelace resources collection not available, skipping auto-register")
             return
 
-        # Get existing resource URLs (strip query params for comparison)
-        existing: dict[str, dict] = {}
-        for item in ll_resources.async_items():
-            base_url = item.get("url", "").split("?")[0]
-            if f"/api/{DOMAIN}/" in base_url:
-                existing[base_url] = item
+        base_url = bundle_url.split("?")[0]
 
-        # Register or update our resources
-        for url in urls:
-            base_url = url.split("?")[0]
-            if base_url in existing:
-                # Update existing resource URL (cache-busting)
-                old_item = existing[base_url]
-                if old_item.get("url") != url:
+        # Check existing resources - update or create
+        for item in ll_resources.async_items():
+            item_base = item.get("url", "").split("?")[0]
+            if item_base == base_url:
+                # Update version if needed
+                if item.get("url") != bundle_url:
                     try:
                         await ll_resources.async_update_item(
-                            old_item["id"], {"url": url, "res_type": "module"}
+                            item["id"], {"url": bundle_url, "res_type": "module"}
                         )
-                        _LOGGER.debug("Updated Lovelace resource: %s", url)
                     except Exception:  # noqa: BLE001
                         pass
-            else:
-                # Create new resource
-                try:
-                    await ll_resources.async_create_item({"res_type": "module", "url": url})
-                    _LOGGER.info("Auto-registered Lovelace resource: %s", url)
-                except Exception:  # noqa: BLE001
-                    _LOGGER.debug("Could not auto-register Lovelace resource: %s", base_url)
-    except (ImportError, AttributeError, KeyError, TypeError) as exc:
-        _LOGGER.debug("Could not access Lovelace resources for auto-registration: %s", exc)
+                return
+
+        # Not found — create it
+        try:
+            await ll_resources.async_create_item({"res_type": "module", "url": bundle_url})
+            _LOGGER.info("Auto-registered Lovelace resource: %s", bundle_url)
+        except Exception:  # noqa: BLE001
+            pass
+    except (AttributeError, KeyError, TypeError):
+        pass
 
 
 async def _setup_reolink(hass: HomeAssistant, entry: ConfigEntry, config: dict[str, Any]) -> None:
