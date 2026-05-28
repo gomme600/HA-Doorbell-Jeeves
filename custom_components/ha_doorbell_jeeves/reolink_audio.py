@@ -2618,135 +2618,139 @@ class ReolinkAudioHandler:
 
         Opens the go2rtc stream.mp4 endpoint using HA's authenticated session,
         then pipes the response body into ffmpeg for PCM decoding.
+        Automatically reconnects if the connection drops.
         """
         CHUNK_SIZE = 640  # 20ms of 16kHz mono s16le
         chunks_sent = 0
         first_logged = False
 
-        # Start ffmpeg reading from stdin (pipe), outputting PCM
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats",
-            "-f", "mp4", "-i", "pipe:0",
-            "-vn",  # No video
-            "-acodec", "pcm_s16le",
-            "-ar", str(AUDIO_INPUT_SAMPLE_RATE),
-            "-ac", "1",
-            "-f", "s16le",
-            "pipe:1",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _LOGGER.warning(
-            "go2rtc proxy: ffmpeg started (PID=%d), connecting to stream...",
-            proc.pid,
-        )
+        while self._active and self._listen_active:
+            # Start ffmpeg reading from stdin (pipe), outputting PCM
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats",
+                "-f", "mp4", "-i", "pipe:0",
+                "-vn",  # No video
+                "-acodec", "pcm_s16le",
+                "-ar", str(AUDIO_INPUT_SAMPLE_RATE),
+                "-ac", "1",
+                "-f", "s16le",
+                "pipe:1",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _LOGGER.warning(
+                "go2rtc proxy: ffmpeg started (PID=%d), connecting to stream...",
+                proc.pid,
+            )
 
-        try:
-            async with session.get(
-                stream_url,
-                timeout=aiohttp.ClientTimeout(total=None, connect=10),
-            ) as resp:
-                if resp.status != 200:
+            try:
+                async with session.get(
+                    stream_url,
+                    timeout=aiohttp.ClientTimeout(total=None, connect=10),
+                ) as resp:
+                    if resp.status != 200:
+                        _LOGGER.warning(
+                            "go2rtc proxy: stream returned %d, retrying in 3s...", resp.status
+                        )
+                        await asyncio.sleep(3)
+                        continue
+
                     _LOGGER.warning(
-                        "go2rtc proxy: stream returned %d", resp.status
+                        "go2rtc proxy: connected (content-type=%s)",
+                        resp.content_type,
                     )
-                    return
 
-                _LOGGER.warning(
-                    "go2rtc proxy: connected (content-type=%s)",
-                    resp.content_type,
-                )
-
-                # Stream response body → ffmpeg stdin
-                # Read output from ffmpeg stdout in parallel
-                async def _feed_ffmpeg() -> None:
-                    """Feed HTTP response into ffmpeg stdin."""
-                    try:
-                        async for chunk in resp.content.iter_chunked(8192):
-                            if not self._active or not self._listen_active:
-                                break
-                            proc.stdin.write(chunk)
-                            await proc.stdin.drain()
-                    except (BrokenPipeError, ConnectionResetError, OSError):
-                        pass
-                    finally:
+                    # Stream response body → ffmpeg stdin
+                    # Read output from ffmpeg stdout in parallel
+                    async def _feed_ffmpeg() -> None:
+                        """Feed HTTP response into ffmpeg stdin."""
                         try:
-                            proc.stdin.close()
-                        except Exception:
+                            async for chunk in resp.content.iter_chunked(8192):
+                                if not self._active or not self._listen_active:
+                                    break
+                                proc.stdin.write(chunk)
+                                await proc.stdin.drain()
+                        except (BrokenPipeError, ConnectionResetError, OSError):
+                            pass
+                        finally:
+                            try:
+                                proc.stdin.close()
+                            except Exception:
+                                pass
+
+                    feed_task = asyncio.create_task(_feed_ffmpeg())
+
+                    try:
+                        while self._active and self._listen_active and proc.returncode is None:
+                            try:
+                                pcm_data = await asyncio.wait_for(
+                                    proc.stdout.readexactly(CHUNK_SIZE), timeout=5.0
+                                )
+                            except asyncio.IncompleteReadError as err:
+                                pcm_data = err.partial
+                                if not pcm_data:
+                                    break
+                            except asyncio.TimeoutError:
+                                # Check if ffmpeg is still alive
+                                if proc.returncode is not None:
+                                    break
+                                continue
+
+                            if not first_logged:
+                                first_logged = True
+                                _LOGGER.warning(
+                                    "✓ First audio from go2rtc proxy (%d bytes PCM @ %dHz)",
+                                    len(pcm_data), AUDIO_INPUT_SAMPLE_RATE,
+                                )
+
+                            chunks_sent += 1
+                            if chunks_sent % 500 == 0:
+                                _LOGGER.info(
+                                    "go2rtc proxy: %d chunks sent to AI", chunks_sent
+                                )
+
+                            await self._on_audio_received(pcm_data)
+                    finally:
+                        feed_task.cancel()
+                        try:
+                            await feed_task
+                        except (asyncio.CancelledError, Exception):
                             pass
 
-                feed_task = asyncio.create_task(_feed_ffmpeg())
-
-                try:
-                    while self._active and self._listen_active and proc.returncode is None:
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                _LOGGER.warning("go2rtc proxy stream error: %s", exc)
+                await asyncio.sleep(2)
+            finally:
+                if proc and proc.returncode is None:
+                    try:
+                        proc.terminate()
+                        await asyncio.wait_for(proc.wait(), timeout=3)
+                    except Exception:
                         try:
-                            pcm_data = await asyncio.wait_for(
-                                proc.stdout.readexactly(CHUNK_SIZE), timeout=5.0
-                            )
-                        except asyncio.IncompleteReadError as err:
-                            pcm_data = err.partial
-                            if not pcm_data:
-                                break
-                        except asyncio.TimeoutError:
-                            # Check if ffmpeg is still alive
-                            if proc.returncode is not None:
-                                break
-                            continue
-
-                        if not first_logged:
-                            first_logged = True
+                            proc.kill()
+                        except Exception:
+                            pass
+                # Read stderr for debugging
+                if proc:
+                    try:
+                        stderr_data = await asyncio.wait_for(
+                            proc.stderr.read(2000), timeout=2
+                        )
+                        if stderr_data:
                             _LOGGER.warning(
-                                "✓ First audio from go2rtc proxy (%d bytes PCM @ %dHz)",
-                                len(pcm_data), AUDIO_INPUT_SAMPLE_RATE,
+                                "go2rtc proxy ffmpeg stderr: %s",
+                                stderr_data.decode(errors="replace").strip()[:300],
                             )
-
-                        chunks_sent += 1
-                        if chunks_sent % 500 == 0:
-                            _LOGGER.info(
-                                "go2rtc proxy: %d chunks sent to AI", chunks_sent
-                            )
-
-                        await self._on_audio_received(pcm_data)
-                finally:
-                    feed_task.cancel()
-                    try:
-                        await feed_task
-                    except (asyncio.CancelledError, Exception):
-                        pass
-
-        except asyncio.CancelledError:
-            pass
-        except Exception as exc:
-            _LOGGER.warning("go2rtc proxy stream error: %s", exc)
-        finally:
-            if proc and proc.returncode is None:
-                try:
-                    proc.terminate()
-                    await asyncio.wait_for(proc.wait(), timeout=3)
-                except Exception:
-                    try:
-                        proc.kill()
                     except Exception:
                         pass
-            # Read stderr for debugging
-            if proc:
-                try:
-                    stderr_data = await asyncio.wait_for(
-                        proc.stderr.read(2000), timeout=2
-                    )
-                    if stderr_data:
-                        _LOGGER.warning(
-                            "go2rtc proxy ffmpeg stderr: %s",
-                            stderr_data.decode(errors="replace").strip()[:300],
-                        )
-                except Exception:
-                    pass
 
-            self._listen_active = False
-            _LOGGER.warning(
-                "go2rtc proxy: stopped (sent %d chunks to AI)", chunks_sent
-            )
+        self._listen_active = False
+        _LOGGER.warning(
+            "go2rtc proxy: stopped (sent %d chunks to AI)", chunks_sent
+        )
 
     def _install_talk_data_received_hook(self) -> bool:
         """Hook data_received on the talk connection to intercept CMD 202 mic audio.

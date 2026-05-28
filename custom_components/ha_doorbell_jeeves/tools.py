@@ -2117,37 +2117,44 @@ async def _execute_save_event(
     if not event_store:
         return {"error": "Event store not available"}
 
-    event = ImportantEvent(
-        id="",
-        timestamp=0,
-        title=title,
-        description=description,
-        severity=severity,
-    )
-    event_id = await event_store.async_add_event(event)
+    try:
+        event = ImportantEvent(
+            id="",
+            timestamp=0.0,
+            title=title,
+            description=description,
+            severity=severity,
+        )
+        event_id = await event_store.async_add_event(event)
 
-    # Send notification to all configured notification targets
-    for target in store.notification_targets:
-        try:
-            service_parts = target.service.split(".", 1)
-            if len(service_parts) == 2:
-                await hass.services.async_call(
-                    service_parts[0], service_parts[1],
-                    {
-                        "message": f"📋 {title}\n{description[:200]}",
-                        "title": f"🔔 Jeeves: {severity.upper()} Event",
-                        "data": {"push": {"interruption-level": "time-sensitive" if severity == "urgent" else "active"}},
-                    },
-                    blocking=False,
-                )
-        except Exception:
-            _LOGGER.debug("Failed to notify %s about event", target.service)
+        # Send notification to all configured notification targets
+        for target in store.notification_targets:
+            try:
+                service_parts = target.service.split(".", 1)
+                if len(service_parts) == 2:
+                    await hass.services.async_call(
+                        service_parts[0], service_parts[1],
+                        {
+                            "message": f"📋 {title}\n{description[:200]}",
+                            "title": f"🔔 Jeeves: {severity.upper()} Event",
+                            "data": {"push": {"interruption-level": "time-sensitive" if severity == "urgent" else "active"}},
+                        },
+                        blocking=False,
+                    )
+            except Exception:
+                _LOGGER.debug("Failed to notify %s about event", target.service)
 
-    return {
-        "success": True,
-        "event_id": event_id,
-        "message": f"Event saved and homeowners notified: '{title}'",
-    }
+        return {
+            "success": True,
+            "event_id": event_id,
+            "message": f"Event saved and homeowners notified: '{title}'",
+        }
+    except Exception as err:
+        _LOGGER.exception("Failed to save important event")
+        return {
+            "success": False,
+            "error": f"Failed to save event to database: {err}"
+        }
 
 
 async def _execute_attach_event_photo(

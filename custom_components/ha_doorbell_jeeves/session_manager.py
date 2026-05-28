@@ -1026,6 +1026,10 @@ class JeevesSessionManager:
         self._config[CONF_GO2RTC_INPUT_STREAM_NAME] = camera_entity_id
         self._config[CONF_GO2RTC_OUTPUT_STREAM_NAME] = camera_entity_id
         if self._audio_handler and self._audio_handler.is_active:
+            await self._audio_handler.stop()
+            self._audio_handler._camera_entity_id = camera_entity_id
+            await self._audio_handler.start()
+        elif self._audio_handler:
             self._audio_handler._camera_entity_id = camera_entity_id
 
         # Restart vision loop with new camera
