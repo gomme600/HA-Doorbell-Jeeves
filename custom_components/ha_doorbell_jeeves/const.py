@@ -47,6 +47,8 @@ CONF_LLMVISION_CAMERAS = "llmvision_cameras"
 CONF_LLMVISION_CATEGORIES = "llmvision_categories"
 
 CONF_SYSTEM_PROMPT = "system_prompt"
+CONF_TASK_INSTRUCTIONS = "task_instructions"  # List of {title, text} instruction blocks
+CONF_MAX_SESSION_TIMEOUT = "max_session_timeout"
 
 # Entity & Action management (stored in .storage, not config entry)
 CONF_MANAGED_ENTITIES = "managed_entities"
@@ -118,6 +120,7 @@ DEFAULT_TOOL_MODEL_OPENAI = "gpt-4.1"
 DEFAULT_TEXT_MODEL_GEMINI = "gemini-3.1-flash-lite"
 DEFAULT_VISION_FPS = 1.0
 DEFAULT_SESSION_TIMEOUT = 120
+DEFAULT_MAX_SESSION_TIMEOUT = 600  # 10 minutes max
 DEFAULT_SILENCE_TIMEOUT = 30.0
 DEFAULT_CHIME_DELAY = 3.0
 DEFAULT_MEMORY_RETENTION_DAYS = 30
@@ -202,10 +205,19 @@ SERVICE_REMOVE_ACTION = "remove_action"
 SERVICE_ADD_IDENTITY = "add_identity"
 SERVICE_REMOVE_IDENTITY = "remove_identity"
 
+# ─── Camera Placement & PTZ ───────────────────────────────────────────────────
+
+CONF_CAMERA_PLACEMENTS = "camera_placements"  # List of CameraPlacement dicts
+CAMERA_SIDES = ["north", "south", "east", "west"]
+CAMERA_FACINGS = ["away", "along_left", "along_right"]
+
 # ─── Smart Tool Constants ─────────────────────────────────────────────────────
 
 # Tool names for domain-specific capabilities
 TOOL_VIEW_CAMERA = "view_camera"
+TOOL_SWITCH_CAMERA = "switch_camera"
+TOOL_PTZ_MOVE = "ptz_move"
+TOOL_PTZ_RETURN = "ptz_return_to_monitor"
 TOOL_GET_CALENDAR = "get_calendar_events"
 TOOL_GET_HISTORY = "get_entity_history"
 TOOL_SEARCH_EVENTS = "search_events"

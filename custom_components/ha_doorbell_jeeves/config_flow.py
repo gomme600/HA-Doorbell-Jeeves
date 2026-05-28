@@ -37,12 +37,15 @@ from .const import (
     AUDIO_OUTPUT_EVENT,
     AUDIO_OUTPUT_GO2RTC,
     AUDIO_OUTPUT_MEDIA_PLAYER,
+    CAMERA_FACINGS,
+    CAMERA_SIDES,
     CONF_API_BASE_URL,
     CONF_API_KEY,
     CONF_AUDIO_MANUAL_MODE,
     CONF_AUDIO_MODE,
     CONF_AUDIO_OUTPUT_MODE,
     CONF_CAMERA_ENTITY,
+    CONF_CAMERA_PLACEMENTS,
     CONF_DEFAULT_SECURITY_MODE,
     CONF_DUAL_MODEL_ENABLED,
     CONF_FACE_SENSOR_ENTITY,
@@ -71,6 +74,7 @@ from .const import (
     CONF_SESSION_TIMEOUT,
     CONF_STOP_ENTITIES,
     CONF_SYSTEM_PROMPT,
+    CONF_TASK_INSTRUCTIONS,
     CONF_TEXT_MODEL,
     CONF_TOOL_API_KEY,
     CONF_TOOL_BASE_URL,
@@ -110,7 +114,7 @@ from .const import (
     SECURITY_MODE_AUTO,
     SECURITY_MODES,
 )
-from .models import EntityAction, ManagedEntity, NotificationTarget
+from .models import CameraPlacement, EntityAction, ManagedEntity, NotificationTarget, TaskInstruction
 from .store import DataStore
 
 _LOGGER = logging.getLogger(__name__)
@@ -694,11 +698,13 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                 "general",
                 "dual_model",
                 "vision",
+                "camera_map",
                 "audio",
                 "timeline",
                 "entities",
                 "security",
                 "triggers",
+                "task_instructions",
                 "identities",
                 "prompt",
             ],
@@ -815,6 +821,111 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                         CONF_FRAME_QUALITY,
                         default=self._data.get(CONF_FRAME_QUALITY, DEFAULT_FRAME_QUALITY),
                     ): NumberSelector(NumberSelectorConfig(min=10, max=100, step=5, mode=NumberSelectorMode.SLIDER)),
+                }
+            ),
+        )
+
+    async def async_step_camera_map(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        store = await self._async_get_store()
+        placements: list[CameraPlacement] = getattr(store, CONF_CAMERA_PLACEMENTS)
+        items = [
+            f"{placement.name} ({placement.entity_id}) — {placement.side} {placement.offset:.1f}, facing {placement.facing}"
+            for placement in placements
+        ]
+        return self.async_show_menu(
+            step_id="camera_map",
+            menu_options=["add_camera_placement", "remove_camera_placement", "init"],
+            description_placeholders={
+                "camera_summary": "**Mapped Cameras:**\n"
+                + ("\n".join(f"• {item}" for item in items) if items else "None configured")
+            },
+        )
+
+    async def async_step_add_camera_placement(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        store = await self._async_get_store()
+        if user_input is not None:
+            placements: list[CameraPlacement] = getattr(store, CONF_CAMERA_PLACEMENTS)
+            placement = CameraPlacement(
+                entity_id=user_input["entity_id"],
+                name=user_input["name"],
+                side=user_input["side"],
+                offset=float(user_input["offset"]),
+                facing=user_input["facing"],
+                area_description=user_input.get("area_description", ""),
+                is_doorbell=user_input.get("is_doorbell", False),
+                ptz_up=_clean_text(user_input.get("ptz_up", "")),
+                ptz_down=_clean_text(user_input.get("ptz_down", "")),
+                ptz_left=_clean_text(user_input.get("ptz_left", "")),
+                ptz_right=_clean_text(user_input.get("ptz_right", "")),
+                ptz_return_to_monitor=_clean_text(user_input.get("ptz_return_to_monitor", "")),
+            )
+            setattr(
+                store,
+                CONF_CAMERA_PLACEMENTS,
+                [item for item in placements if item.entity_id != placement.entity_id] + [placement],
+            )
+            await store.async_save_entities()
+            return await self.async_step_camera_map()
+
+        schema: dict[Any, Any] = {
+            vol.Required("entity_id"): EntitySelector(EntitySelectorConfig(domain="camera")),
+            vol.Required("name"): TextSelector(),
+            vol.Required("side", default=CAMERA_SIDES[0]): SelectSelector(
+                SelectSelectorConfig(
+                    options=[{"value": side, "label": side.title()} for side in CAMERA_SIDES],
+                    mode=SelectSelectorMode.DROPDOWN,
+                )
+            ),
+            vol.Required("offset", default=0.5): NumberSelector(
+                NumberSelectorConfig(min=0, max=1, step=0.1, mode=NumberSelectorMode.SLIDER)
+            ),
+            vol.Required("facing", default=CAMERA_FACINGS[0]): SelectSelector(
+                SelectSelectorConfig(
+                    options=[
+                        {"value": facing, "label": facing.replace("_", " ").title()}
+                        for facing in CAMERA_FACINGS
+                    ],
+                    mode=SelectSelectorMode.DROPDOWN,
+                )
+            ),
+            vol.Optional("area_description", default=""): TextSelector(TextSelectorConfig(multiline=True)),
+            vol.Optional("is_doorbell", default=False): BooleanSelector(),
+        }
+        ptz_selector = EntitySelectorConfig(domain=["button", "script"])
+        _add_optional_entity_selector(schema, "ptz_up", None, ptz_selector)
+        _add_optional_entity_selector(schema, "ptz_down", None, ptz_selector)
+        _add_optional_entity_selector(schema, "ptz_left", None, ptz_selector)
+        _add_optional_entity_selector(schema, "ptz_right", None, ptz_selector)
+        _add_optional_entity_selector(schema, "ptz_return_to_monitor", None, ptz_selector)
+        return self.async_show_form(
+            step_id="add_camera_placement",
+            data_schema=vol.Schema(schema),
+        )
+
+    async def async_step_remove_camera_placement(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        store = await self._async_get_store()
+        placements: list[CameraPlacement] = getattr(store, CONF_CAMERA_PLACEMENTS)
+        options = [
+            {"value": placement.entity_id, "label": f"{placement.name} ({placement.entity_id})"}
+            for placement in placements
+        ]
+        if not options:
+            return await self.async_step_camera_map()
+        if user_input is not None:
+            setattr(
+                store,
+                CONF_CAMERA_PLACEMENTS,
+                [placement for placement in placements if placement.entity_id != user_input["entity_id"]],
+            )
+            await store.async_save_entities()
+            return await self.async_step_camera_map()
+        return self.async_show_form(
+            step_id="remove_camera_placement",
+            data_schema=vol.Schema(
+                {
+                    vol.Required("entity_id"): SelectSelector(
+                        SelectSelectorConfig(options=options, mode=SelectSelectorMode.DROPDOWN)
+                    )
                 }
             ),
         )
@@ -1559,6 +1670,70 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                 )
             ] = NumberSelector(NumberSelectorConfig(min=0.5, max=10.0, step=0.5, mode=NumberSelectorMode.SLIDER))
         return self.async_show_form(step_id="triggers", data_schema=vol.Schema(schema))
+
+    async def async_step_task_instructions(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        store = await self._async_get_store()
+        instructions: list[TaskInstruction] = getattr(store, CONF_TASK_INSTRUCTIONS)
+        items = [instruction.title for instruction in instructions]
+        return self.async_show_menu(
+            step_id="task_instructions",
+            menu_options=["add_task_instruction", "remove_task_instruction", "init"],
+            description_placeholders={
+                "instruction_summary": "**Current Instructions:**\n"
+                + ("\n".join(f"• {item}" for item in items) if items else "None configured")
+            },
+        )
+
+    async def async_step_add_task_instruction(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        store = await self._async_get_store()
+        if user_input is not None:
+            instructions: list[TaskInstruction] = getattr(store, CONF_TASK_INSTRUCTIONS)
+            instruction = TaskInstruction(
+                title=_clean_text(user_input["title"]),
+                text=user_input["text"],
+            )
+            setattr(
+                store,
+                CONF_TASK_INSTRUCTIONS,
+                [item for item in instructions if item.title.lower() != instruction.title.lower()]
+                + [instruction],
+            )
+            await store.async_save_entities()
+            return await self.async_step_task_instructions()
+        return self.async_show_form(
+            step_id="add_task_instruction",
+            data_schema=vol.Schema(
+                {
+                    vol.Required("title"): TextSelector(),
+                    vol.Required("text"): TextSelector(TextSelectorConfig(multiline=True)),
+                }
+            ),
+        )
+
+    async def async_step_remove_task_instruction(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        store = await self._async_get_store()
+        instructions: list[TaskInstruction] = getattr(store, CONF_TASK_INSTRUCTIONS)
+        options = [{"value": instruction.title, "label": instruction.title} for instruction in instructions]
+        if not options:
+            return await self.async_step_task_instructions()
+        if user_input is not None:
+            setattr(
+                store,
+                CONF_TASK_INSTRUCTIONS,
+                [instruction for instruction in instructions if instruction.title != user_input["title"]],
+            )
+            await store.async_save_entities()
+            return await self.async_step_task_instructions()
+        return self.async_show_form(
+            step_id="remove_task_instruction",
+            data_schema=vol.Schema(
+                {
+                    vol.Required("title"): SelectSelector(
+                        SelectSelectorConfig(options=options, mode=SelectSelectorMode.DROPDOWN)
+                    )
+                }
+            ),
+        )
 
     async def async_step_identities(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         from .models import KnownIdentity  # noqa: PLC0415

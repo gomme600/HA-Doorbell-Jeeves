@@ -100,4 +100,69 @@ class JeevesMemoryImageView(HomeAssistantView):
 def register_memory_views(hass: HomeAssistant) -> None:
     """Register integration HTTP views once per Home Assistant instance."""
     hass.http.register_view(JeevesMemoryImageView(hass))
+    hass.http.register_view(JeevesEventImageView(hass))
     hass.http.register_view(JeevesCardJSView())
+    hass.http.register_view(JeevesEventsCardJSView())
+
+
+_EVENTS_CARD_JS_PATH = Path(__file__).parent / "frontend" / "jeeves-events-timeline-card.js"
+
+
+class JeevesEventsCardJSView(HomeAssistantView):
+    """Serve the events timeline card JS."""
+
+    url = f"/api/{DOMAIN}/events_card_js"
+    name = f"api:{DOMAIN}:events_card_js"
+    requires_auth = False
+
+    def __init__(self) -> None:
+        self._content: bytes | None = None
+
+    async def get(self, request: web.Request) -> web.Response:
+        if self._content is None:
+            loop = asyncio.get_running_loop()
+            self._content = await loop.run_in_executor(None, _EVENTS_CARD_JS_PATH.read_bytes)
+        return web.Response(
+            body=self._content,
+            content_type="application/javascript",
+            headers={"Cache-Control": "no-cache"},
+        )
+
+
+class JeevesEventImageView(HomeAssistantView):
+    """Serve stored event photos."""
+
+    url = f"/api/{DOMAIN}/event_image/{{entry_id}}/{{event_id}}/{{photo_index}}"
+    name = f"api:{DOMAIN}:event_image"
+    requires_auth = True
+
+    def __init__(self, hass: HomeAssistant) -> None:
+        self._hass = hass
+
+    async def get(
+        self, request: web.Request, entry_id: str, event_id: str, photo_index: str
+    ) -> web.StreamResponse:
+        """Return a JPEG photo for the requested event."""
+        managers = self._hass.data.get(DOMAIN, {})
+        manager = managers.get(entry_id)
+        if not isinstance(manager, JeevesSessionManager):
+            raise web.HTTPNotFound(text="Entry not found")
+
+        event_store = manager.event_store
+        idx = int(photo_index)
+
+        for evt in event_store.events:
+            if evt.id == event_id:
+                if idx < 0 or idx >= len(evt.photos):
+                    raise web.HTTPNotFound(text="Photo index out of range")
+                try:
+                    image_bytes = base64.b64decode(evt.photos[idx], validate=True)
+                except (binascii.Error, ValueError):
+                    raise web.HTTPNotFound(text="Invalid event image")
+                return web.Response(
+                    body=image_bytes,
+                    content_type="image/jpeg",
+                    headers={"Cache-Control": "no-store"},
+                )
+
+        raise web.HTTPNotFound(text="Event not found")

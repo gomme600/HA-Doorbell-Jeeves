@@ -64,6 +64,64 @@
           "start_entities": "Start Trigger Entities",
           "stop_entities": "Stop Trigger Entities"
         }
+      },
+      "camera_map": {
+        "title": "Camera Map",
+        "description": "Manage spatial camera placements used for property awareness and PTZ navigation. {camera_summary}",
+        "menu_options": {
+          "add_camera_placement": "\u2795 Add Camera Placement",
+          "remove_camera_placement": "\u2796 Remove Camera Placement",
+          "init": "\u2190 Back to Menu"
+        }
+      },
+      "add_camera_placement": {
+        "title": "Add Camera Placement",
+        "description": "Map a camera to the property layout. Re-adding the same camera updates its placement.",
+        "data": {
+          "entity_id": "Camera Entity",
+          "name": "Display Name",
+          "side": "House Side",
+          "offset": "Position Along Side",
+          "facing": "Facing Direction",
+          "area_description": "Area Description",
+          "is_doorbell": "Is Doorbell Camera",
+          "ptz_up": "PTZ Up Control",
+          "ptz_down": "PTZ Down Control",
+          "ptz_left": "PTZ Left Control",
+          "ptz_right": "PTZ Right Control",
+          "ptz_return_to_monitor": "PTZ Return-to-Monitor Control"
+        }
+      },
+      "remove_camera_placement": {
+        "title": "Remove Camera Placement",
+        "description": "Select a mapped camera to remove from the property layout.",
+        "data": {
+          "entity_id": "Camera Placement"
+        }
+      },
+      "task_instructions": {
+        "title": "Task Instructions",
+        "description": "Manage extra prompt instructions appended to Jeeves for specific duties. {instruction_summary}",
+        "menu_options": {
+          "add_task_instruction": "\u2795 Add Instruction",
+          "remove_task_instruction": "\u2796 Remove Instruction",
+          "init": "\u2190 Back to Menu"
+        }
+      },
+      "add_task_instruction": {
+        "title": "Add Task Instruction",
+        "description": "Add or replace a titled instruction block appended to the system prompt.",
+        "data": {
+          "title": "Instruction Title",
+          "text": "Instruction Text"
+        }
+      },
+      "remove_task_instruction": {
+        "title": "Remove Task Instruction",
+        "description": "Select an instruction to remove.",
+        "data": {
+          "title": "Instruction"
+        }
       }
     },
     "error": {
@@ -85,11 +143,13 @@
           "general": "General (AI model, voice, timeout)",
           "dual_model": "Dual Model (separate tool-calling model)",
           "vision": "Camera & Vision (FPS, resolution)",
+          "camera_map": "Camera Map (camera placement & PTZ)",
           "audio": "Audio Setup (Reolink/manual wiring)",
           "timeline": "Timeline Integration (LLM Vision events)",
           "entities": "Entities & Actions (devices the AI controls)",
           "security": "Security (PIN, validation policies)",
           "triggers": "Triggers (auto-start/stop conditions)",
+          "task_instructions": "Task Instructions (extra prompt blocks)",
           "identities": "Known Identities (people, animals)",
           "prompt": "System Prompt"
         }
@@ -111,7 +171,7 @@
       },
       "dual_model": {
         "title": "Dual Model Architecture",
-        "description": "By default, the voice model handles tool calls natively (recommended). Enable dual-model mode only if you want a separate text model to handle tool execution instead of the voice model.\n\nThis is an advanced option — most users should leave it disabled.",
+        "description": "By default, the voice model handles tool calls natively (recommended). Enable dual-model mode only if you want a separate text model to handle tool execution instead of the voice model.\n\nThis is an advanced option \u2014 most users should leave it disabled.",
         "data": {
           "dual_model_enabled": "Enable Dual Model Mode",
           "tool_provider": "Tool Model Provider",
@@ -388,6 +448,64 @@
         "description": "Select an action to remove.",
         "data": {
           "action_ref": "Action to Remove"
+        }
+      },
+      "camera_map": {
+        "title": "Camera Map",
+        "description": "Manage spatial camera placements used for property awareness and PTZ navigation. {camera_summary}",
+        "menu_options": {
+          "add_camera_placement": "\u2795 Add Camera Placement",
+          "remove_camera_placement": "\u2796 Remove Camera Placement",
+          "init": "\u2190 Back to Menu"
+        }
+      },
+      "add_camera_placement": {
+        "title": "Add Camera Placement",
+        "description": "Map a camera to the property layout. Re-adding the same camera updates its placement.",
+        "data": {
+          "entity_id": "Camera Entity",
+          "name": "Display Name",
+          "side": "House Side",
+          "offset": "Position Along Side",
+          "facing": "Facing Direction",
+          "area_description": "Area Description",
+          "is_doorbell": "Is Doorbell Camera",
+          "ptz_up": "PTZ Up Control",
+          "ptz_down": "PTZ Down Control",
+          "ptz_left": "PTZ Left Control",
+          "ptz_right": "PTZ Right Control",
+          "ptz_return_to_monitor": "PTZ Return-to-Monitor Control"
+        }
+      },
+      "remove_camera_placement": {
+        "title": "Remove Camera Placement",
+        "description": "Select a mapped camera to remove from the property layout.",
+        "data": {
+          "entity_id": "Camera Placement"
+        }
+      },
+      "task_instructions": {
+        "title": "Task Instructions",
+        "description": "Manage extra prompt instructions appended to Jeeves for specific duties. {instruction_summary}",
+        "menu_options": {
+          "add_task_instruction": "\u2795 Add Instruction",
+          "remove_task_instruction": "\u2796 Remove Instruction",
+          "init": "\u2190 Back to Menu"
+        }
+      },
+      "add_task_instruction": {
+        "title": "Add Task Instruction",
+        "description": "Add or replace a titled instruction block appended to the system prompt.",
+        "data": {
+          "title": "Instruction Title",
+          "text": "Instruction Text"
+        }
+      },
+      "remove_task_instruction": {
+        "title": "Remove Task Instruction",
+        "description": "Select an instruction to remove.",
+        "data": {
+          "title": "Instruction"
         }
       }
     },

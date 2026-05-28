@@ -40,7 +40,10 @@ from .const import (
     TOOL_GET_CALENDAR,
     TOOL_GET_HISTORY,
     TOOL_GET_LLMVISION_EVENTS,
+    TOOL_PTZ_MOVE,
+    TOOL_PTZ_RETURN,
     TOOL_SEARCH_EVENTS,
+    TOOL_SWITCH_CAMERA,
     TOOL_VIEW_CAMERA,
 )
 from .models import ManagedEntity, NotificationTarget
@@ -114,6 +117,27 @@ def build_system_context(
         for cam in camera_entities:
             lines.append(f"• {cam.name} [{cam.entity_id}]: {cam.description}")
         lines.append("Use the 'view_camera' tool to get a live snapshot from any camera above.")
+        lines.append("Use 'switch_camera' to change which camera provides the live video/audio feed.")
+
+    # Camera placement map (spatial context)
+    if store.camera_placements:
+        lines.append("\n--- CAMERA PLACEMENT MAP (spatial layout of the property) ---")
+        lines.append("The house is represented as a rectangle. Cameras are placed around it:")
+        for cp in store.camera_placements:
+            ptz_label = " [PTZ]" if cp.has_ptz else ""
+            doorbell_label = " [DOORBELL]" if cp.is_doorbell else ""
+            lines.append(
+                f"• {cp.name} [{cp.entity_id}]: {cp.side} side, "
+                f"facing {cp.facing}{ptz_label}{doorbell_label}"
+            )
+            if cp.area_description:
+                lines.append(f"  Covers: {cp.area_description}")
+        ptz_cameras = [cp for cp in store.camera_placements if cp.has_ptz]
+        if ptz_cameras:
+            lines.append(
+                "\nPTZ cameras can be moved with 'ptz_move' tool (up/down/left/right) "
+                "and returned to monitoring position with 'ptz_return_to_monitor'."
+            )
 
     # Calendar capability
     calendar_entities = [e for e in readable_entities if e.entity_id.startswith("calendar.")]
@@ -144,6 +168,13 @@ def build_system_context(
         lines.append("\n--- NOTIFICATION TARGETS ---")
         for target in store.notification_targets:
             lines.append(f"• {target.name} (tool: notify_{_slugify(target.name)}): {target.description}")
+
+    task_instructions = store.task_instructions if hasattr(store, "task_instructions") else []
+    if task_instructions:
+        lines.append("\n--- TASK INSTRUCTIONS (follow these for specific situations) ---")
+        for instr in task_instructions:
+            lines.append(f"\n## {instr.title}")
+            lines.append(instr.text)
 
     return "\n".join(lines)
 
@@ -418,6 +449,177 @@ def build_gemini_tools(
         },
     ))
 
+    # ─── Save important event ─────────────────────────────────────────────────
+    declarations.append(types.FunctionDeclaration(
+        name="save_event",
+        description=(
+            "Save an important event for the homeowner to review later. Use this for "
+            "information that needs to be recorded: visitor contact details, delivery "
+            "instructions, suspicious activity reports, messages left by visitors, etc. "
+            "This will also send a notification to all homeowners."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "Short title (e.g., 'Delivery attempt - package too large for mailbox')",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Detailed description including all relevant info (names, numbers, instructions)",
+                },
+                "severity": {
+                    "type": "string",
+                    "description": "Event importance level",
+                    "enum": ["info", "warning", "urgent"],
+                },
+            },
+            "required": ["title", "description"],
+        },
+    ))
+
+    # ─── Attach photo to event ────────────────────────────────────────────────
+    declarations.append(types.FunctionDeclaration(
+        name="attach_event_photo",
+        description=(
+            "Attach a photo from a camera to the most recent saved event. Use this to "
+            "document visual evidence: the visitor, a suspicious person, a package, etc. "
+            "Can be called multiple times for multiple photos."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "camera_entity_id": {
+                    "type": "string",
+                    "description": "Camera to take snapshot from (use doorbell camera by default)",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "What this photo shows (e.g., 'Visitor at the door', 'Package left at step')",
+                },
+            },
+            "required": ["camera_entity_id"],
+        },
+    ))
+
+    # ─── Check owner availability ─────────────────────────────────────────────
+    declarations.append(types.FunctionDeclaration(
+        name="check_owner_availability",
+        description=(
+            "Check if any homeowner has responded to the doorbell notification. "
+            "Returns who pressed 'Coming' (on their way to the door), who pressed "
+            "'Not Available', and who hasn't responded yet. Use this to inform "
+            "visitors whether someone is coming to meet them."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {},
+        },
+    ))
+
+    # ─── Extend session timeout ───────────────────────────────────────────────
+    declarations.append(types.FunctionDeclaration(
+        name="extend_session",
+        description=(
+            "Extend the current session timeout. Use this when you need more time: "
+            "monitoring a delivery driver, watching a suspicious person, waiting for "
+            "someone to arrive, or any situation where the conversation or observation "
+            "needs to continue beyond the normal timeout."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "extra_seconds": {
+                    "type": "integer",
+                    "description": "Additional seconds to add (30-300)",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Why the session needs to be extended",
+                },
+            },
+            "required": ["extra_seconds", "reason"],
+        },
+    ))
+
+    # ─── Switch active camera (audio + video feed) ────────────────────────────
+    if camera_entities:
+        camera_ids = [e.entity_id for e in camera_entities]
+        declarations.append(types.FunctionDeclaration(
+            name=TOOL_SWITCH_CAMERA,
+            description=(
+                "Switch the live video and 2-way audio feed to a different camera. "
+                "Use this to follow a person moving around the property, monitor a "
+                "different area, or verify activity at another location. The previous "
+                "camera feed will stop and the new one will start."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "camera_entity_id": {
+                        "type": "string",
+                        "description": "The camera to switch to",
+                        "enum": camera_ids,
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why you are switching cameras (for audit log)",
+                    },
+                },
+                "required": ["camera_entity_id", "reason"],
+            },
+        ))
+
+    # ─── PTZ camera controls ──────────────────────────────────────────────────
+    ptz_cameras = [cp for cp in store.camera_placements if cp.has_ptz]
+    if ptz_cameras:
+        ptz_camera_ids = [cp.entity_id for cp in ptz_cameras]
+        declarations.append(types.FunctionDeclaration(
+            name=TOOL_PTZ_MOVE,
+            description=(
+                "Move a PTZ camera in a direction. Use this to track a person, "
+                "look at something specific, or scan an area. The camera will "
+                "move in the specified direction briefly."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "camera_entity_id": {
+                        "type": "string",
+                        "description": "Which PTZ camera to move",
+                        "enum": ptz_camera_ids,
+                    },
+                    "direction": {
+                        "type": "string",
+                        "description": "Direction to move the camera",
+                        "enum": ["up", "down", "left", "right"],
+                    },
+                },
+                "required": ["camera_entity_id", "direction"],
+            },
+        ))
+        declarations.append(types.FunctionDeclaration(
+            name=TOOL_PTZ_RETURN,
+            description=(
+                "Return a PTZ camera to its monitoring position (home). Use this "
+                "after you've finished tracking or scanning, or when done observing "
+                "a specific area. All moved cameras are automatically returned when "
+                "the session ends."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "camera_entity_id": {
+                        "type": "string",
+                        "description": "Which PTZ camera to return to home position",
+                        "enum": ptz_camera_ids,
+                    },
+                },
+                "required": ["camera_entity_id"],
+            },
+        ))
+
     if not declarations:
         return []
     return [types.Tool(function_declarations=declarations)]
@@ -473,6 +675,73 @@ def build_openai_tools(
                     "reason": {
                         "type": "string",
                         "description": "Brief note on why you're checking this camera",
+                    },
+                },
+                "required": ["camera_entity_id"],
+            },
+        })
+
+        # Switch camera
+        tools.append({
+            "type": "function",
+            "name": TOOL_SWITCH_CAMERA,
+            "description": (
+                "Switch the live video and 2-way audio feed to a different camera. "
+                "Use this to follow a person or monitor a different area."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "camera_entity_id": {
+                        "type": "string",
+                        "description": "The camera to switch to",
+                        "enum": camera_ids,
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why switching cameras",
+                    },
+                },
+                "required": ["camera_entity_id", "reason"],
+            },
+        })
+
+    # PTZ controls
+    ptz_cameras = [cp for cp in store.camera_placements if cp.has_ptz]
+    if ptz_cameras:
+        ptz_camera_ids = [cp.entity_id for cp in ptz_cameras]
+        tools.append({
+            "type": "function",
+            "name": TOOL_PTZ_MOVE,
+            "description": "Move a PTZ camera in a direction to track or scan.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "camera_entity_id": {
+                        "type": "string",
+                        "description": "Which PTZ camera to move",
+                        "enum": ptz_camera_ids,
+                    },
+                    "direction": {
+                        "type": "string",
+                        "description": "Direction to move",
+                        "enum": ["up", "down", "left", "right"],
+                    },
+                },
+                "required": ["camera_entity_id", "direction"],
+            },
+        })
+        tools.append({
+            "type": "function",
+            "name": TOOL_PTZ_RETURN,
+            "description": "Return a PTZ camera to its monitoring/home position.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "camera_entity_id": {
+                        "type": "string",
+                        "description": "Which PTZ camera to return home",
+                        "enum": ptz_camera_ids,
                     },
                 },
                 "required": ["camera_entity_id"],
@@ -719,6 +988,12 @@ async def execute_tool_call(
         # Smart tools
         if function_name == TOOL_VIEW_CAMERA:
             return await _execute_view_camera(hass, store, arguments)
+        if function_name == TOOL_SWITCH_CAMERA:
+            return await _execute_switch_camera(hass, store, arguments)
+        if function_name == TOOL_PTZ_MOVE:
+            return await _execute_ptz_move(hass, store, arguments)
+        if function_name == TOOL_PTZ_RETURN:
+            return await _execute_ptz_return(hass, store, arguments)
         if function_name == TOOL_GET_CALENDAR:
             return await _execute_get_calendar(hass, store, arguments)
         if function_name == TOOL_GET_HISTORY:
@@ -727,6 +1002,24 @@ async def execute_tool_call(
             return await _execute_search_events(hass, store, arguments)
         if function_name == TOOL_GET_LLMVISION_EVENTS:
             return await _execute_get_llmvision_events(hass, arguments, config)
+
+        # Important events
+        if function_name == "save_event":
+            return await _execute_save_event(hass, store, arguments, config)
+        if function_name == "attach_event_photo":
+            return await _execute_attach_event_photo(hass, store, arguments, config)
+
+        # Owner availability
+        if function_name == "check_owner_availability":
+            return _execute_check_availability(hass, config)
+
+        # Extend session timeout
+        if function_name == "extend_session":
+            return _execute_extend_session(arguments, config)
+
+        # Recall memories
+        if function_name == "recall_memories":
+            return await _execute_recall_memories(hass, store, arguments, config)
 
         # Notification
         if function_name.startswith("notify_"):
@@ -785,6 +1078,120 @@ async def _execute_view_camera(
         }
     except Exception as err:
         return {"error": f"Failed to capture from {camera_id}: {err}"}
+
+
+async def _execute_switch_camera(
+    hass: HomeAssistant, store: DataStore, arguments: dict[str, Any]
+) -> dict[str, Any]:
+    """Switch the active video/audio feed to a different camera.
+
+    Returns a special key that the session manager intercepts to change
+    the live camera feed source.
+    """
+    camera_id = arguments.get("camera_entity_id", "")
+    reason = arguments.get("reason", "")
+
+    allowed = [e.entity_id for e in store.managed_entities if e.entity_id.startswith("camera.")]
+    if camera_id not in allowed:
+        return {"error": f"Camera '{camera_id}' not in managed entities."}
+
+    managed = store.get_entity(camera_id)
+    cam_name = managed.name if managed else camera_id
+    _LOGGER.info("Switching active camera to %s (%s): %s", cam_name, camera_id, reason)
+
+    return {
+        "success": True,
+        "message": f"Switching live feed to {cam_name}. You will see the new view shortly.",
+        "_switch_camera": camera_id,  # Special key: session manager processes this
+    }
+
+
+async def _execute_ptz_move(
+    hass: HomeAssistant, store: DataStore, arguments: dict[str, Any]
+) -> dict[str, Any]:
+    """Move a PTZ camera in a direction by calling the configured service."""
+    camera_id = arguments.get("camera_entity_id", "")
+    direction = arguments.get("direction", "")
+
+    if direction not in ("up", "down", "left", "right"):
+        return {"error": f"Invalid direction: {direction}. Use up/down/left/right."}
+
+    # Find camera placement with PTZ config
+    placement = None
+    for cp in store.camera_placements:
+        if cp.entity_id == camera_id:
+            placement = cp
+            break
+
+    if not placement or not placement.has_ptz:
+        return {"error": f"Camera '{camera_id}' does not have PTZ controls configured."}
+
+    # Get the service entity for this direction
+    ptz_entity = getattr(placement, f"ptz_{direction}", "")
+    if not ptz_entity:
+        return {"error": f"PTZ {direction} not configured for {camera_id}."}
+
+    try:
+        # Call the PTZ service (button.press or similar)
+        domain = ptz_entity.split(".")[0]
+        if domain == "button":
+            await hass.services.async_call("button", "press", {"entity_id": ptz_entity})
+        elif domain == "script":
+            await hass.services.async_call("script", "turn_on", {"entity_id": ptz_entity})
+        else:
+            # Generic: try homeassistant.turn_on
+            await hass.services.async_call("homeassistant", "turn_on", {"entity_id": ptz_entity})
+
+        _LOGGER.info("PTZ move %s on %s via %s", direction, camera_id, ptz_entity)
+        managed = store.get_entity(camera_id)
+        cam_name = managed.name if managed else camera_id
+        return {
+            "success": True,
+            "message": f"Moving {cam_name} {direction}.",
+            "_ptz_moved_camera": camera_id,  # Track that this camera was moved
+        }
+    except Exception as err:
+        return {"error": f"PTZ move failed: {err}"}
+
+
+async def _execute_ptz_return(
+    hass: HomeAssistant, store: DataStore, arguments: dict[str, Any]
+) -> dict[str, Any]:
+    """Return a PTZ camera to its monitoring/home position."""
+    camera_id = arguments.get("camera_entity_id", "")
+
+    placement = None
+    for cp in store.camera_placements:
+        if cp.entity_id == camera_id:
+            placement = cp
+            break
+
+    if not placement:
+        return {"error": f"Camera '{camera_id}' not found in camera placements."}
+
+    if not placement.ptz_return_to_monitor:
+        return {"error": f"No return-to-monitor configured for {camera_id}."}
+
+    try:
+        ptz_entity = placement.ptz_return_to_monitor
+        domain = ptz_entity.split(".")[0]
+        if domain == "button":
+            await hass.services.async_call("button", "press", {"entity_id": ptz_entity})
+        elif domain == "script":
+            await hass.services.async_call("script", "turn_on", {"entity_id": ptz_entity})
+        else:
+            await hass.services.async_call("homeassistant", "turn_on", {"entity_id": ptz_entity})
+
+        _LOGGER.info("PTZ return to monitor: %s via %s", camera_id, ptz_entity)
+        managed = store.get_entity(camera_id)
+        cam_name = managed.name if managed else camera_id
+        return {
+            "success": True,
+            "message": f"{cam_name} returned to monitoring position.",
+            "_ptz_returned_camera": camera_id,
+        }
+    except Exception as err:
+        return {"error": f"PTZ return failed: {err}"}
 
 
 async def _execute_get_calendar(
@@ -1385,3 +1792,184 @@ def _slugify(text: str) -> str:
     if slug[0].isdigit():
         slug = f"tool_{slug}"
     return slug
+
+
+# ─── New Tool Implementations ────────────────────────────────────────────────
+
+
+async def _execute_save_event(
+    hass: HomeAssistant, store: DataStore, arguments: dict[str, Any],
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Save an important event and notify homeowners."""
+    from .events import EventStore, ImportantEvent  # noqa: PLC0415
+    from .const import DOMAIN  # noqa: PLC0415
+
+    title = arguments.get("title", "Untitled Event")
+    description = arguments.get("description", "")
+    severity = arguments.get("severity", "info")
+
+    # Get event store from hass.data
+    entry_id = (config or {}).get("_entry_id", "")
+    event_store: EventStore | None = None
+    if entry_id and DOMAIN in hass.data:
+        manager = hass.data[DOMAIN].get(entry_id)
+        if manager and hasattr(manager, "_event_store"):
+            event_store = manager._event_store
+
+    if not event_store:
+        return {"error": "Event store not available"}
+
+    event = ImportantEvent(
+        id="",
+        timestamp=0,
+        title=title,
+        description=description,
+        severity=severity,
+    )
+    event_id = await event_store.async_add_event(event)
+
+    # Send notification to all configured notification targets
+    for target in store.notification_targets:
+        try:
+            service_parts = target.service.split(".", 1)
+            if len(service_parts) == 2:
+                await hass.services.async_call(
+                    service_parts[0], service_parts[1],
+                    {
+                        "message": f"📋 {title}\n{description[:200]}",
+                        "title": f"🔔 Jeeves: {severity.upper()} Event",
+                        "data": {"push": {"interruption-level": "time-sensitive" if severity == "urgent" else "active"}},
+                    },
+                    blocking=False,
+                )
+        except Exception:
+            _LOGGER.debug("Failed to notify %s about event", target.service)
+
+    return {
+        "success": True,
+        "event_id": event_id,
+        "message": f"Event saved and homeowners notified: '{title}'",
+    }
+
+
+async def _execute_attach_event_photo(
+    hass: HomeAssistant, store: DataStore, arguments: dict[str, Any],
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Attach a camera snapshot to the most recent event."""
+    from .events import EventStore  # noqa: PLC0415
+    from .const import DOMAIN  # noqa: PLC0415
+
+    camera_id = arguments.get("camera_entity_id", "")
+
+    # Validate camera access
+    allowed = [e.entity_id for e in store.managed_entities if e.entity_id.startswith("camera.")]
+    if camera_id not in allowed:
+        return {"error": f"Camera '{camera_id}' not in managed entities."}
+
+    # Get event store
+    entry_id = (config or {}).get("_entry_id", "")
+    event_store: EventStore | None = None
+    if entry_id and DOMAIN in hass.data:
+        manager = hass.data[DOMAIN].get(entry_id)
+        if manager and hasattr(manager, "_event_store"):
+            event_store = manager._event_store
+
+    if not event_store or not event_store.events:
+        return {"error": "No events to attach photo to"}
+
+    # Get snapshot
+    try:
+        image = await ha_camera_get_image(hass, camera_id, timeout=10)
+        if not image or not image.content:
+            return {"error": f"Could not get image from {camera_id}"}
+
+        from .frame_processor import process_frame  # noqa: PLC0415
+        processed = await hass.async_add_executor_job(
+            process_frame, image.content, 1024, 768, 80
+        )
+        photo_b64 = base64.b64encode(processed).decode("ascii")
+    except Exception as err:
+        return {"error": f"Failed to capture photo: {err}"}
+
+    # Attach to most recent event
+    latest_event = event_store.events[-1]
+    success = await event_store.async_attach_photo(latest_event.id, photo_b64)
+
+    if success:
+        return {
+            "success": True,
+            "message": f"Photo attached to event '{latest_event.title}'",
+            "event_id": latest_event.id,
+        }
+    return {"error": "Failed to attach photo"}
+
+
+def _execute_check_availability(
+    hass: HomeAssistant, config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Check if owners responded to doorbell notification."""
+    from .const import DOMAIN  # noqa: PLC0415
+
+    entry_id = (config or {}).get("_entry_id", "")
+    if entry_id and DOMAIN in hass.data:
+        manager = hass.data[DOMAIN].get(entry_id)
+        if manager and hasattr(manager, "_notification_manager"):
+            status = manager._notification_manager.get_availability_status()
+            return {"status": status}
+
+    return {"status": "Notification system not configured or no notification sent yet."}
+
+
+def _execute_extend_session(
+    arguments: dict[str, Any], config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Extend session timeout — returns instruction for session manager."""
+    extra = arguments.get("extra_seconds", 60)
+    reason = arguments.get("reason", "")
+
+    # Clamp to reasonable range
+    extra = max(30, min(300, int(extra)))
+
+    return {
+        "success": True,
+        "_extend_session_seconds": extra,  # Special key: session manager processes
+        "message": f"Session extended by {extra} seconds. Reason: {reason}",
+    }
+
+
+async def _execute_recall_memories(
+    hass: HomeAssistant, store: DataStore, arguments: dict[str, Any],
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Search past session memories."""
+    from .const import DOMAIN  # noqa: PLC0415
+
+    query = arguments.get("query", "")
+    hours_back = min(int(arguments.get("hours_back", 72)), 720)
+
+    entry_id = (config or {}).get("_entry_id", "")
+    if entry_id and DOMAIN in hass.data:
+        manager = hass.data[DOMAIN].get(entry_id)
+        if manager and hasattr(manager, "_memory_store"):
+            memory_store = manager._memory_store
+            if query:
+                results = memory_store.search_memories(query)
+            else:
+                results = memory_store.get_recent_memories(hours_back)
+
+            if not results:
+                return {"message": "No matching memories found."}
+
+            summaries = []
+            for mem in results[-5:]:
+                import datetime  # noqa: PLC0415
+                dt = datetime.datetime.fromtimestamp(mem.timestamp)
+                summaries.append(
+                    f"[{dt.strftime('%Y-%m-%d %H:%M')}] "
+                    f"{mem.visitor_name or 'Unknown'}: {mem.summary[:200]}"
+                )
+            return {"memories": summaries, "count": len(results)}
+
+    return {"message": "Memory system not available."}

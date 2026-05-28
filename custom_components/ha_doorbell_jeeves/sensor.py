@@ -12,6 +12,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN, EVENT_MEMORY
+from .events import EVENT_IMPORTANT, ImportantEvent
 from .memory import SessionMemory
 from .memory_views import memory_image_url
 from .session_manager import JeevesSessionManager
@@ -232,5 +233,74 @@ async def async_setup_entry(
             JeevesMemoryCountSensor(manager, entry),
             JeevesLatestMemorySummarySensor(manager, entry),
             JeevesMemoryFeedSensor(manager, entry),
+            JeevesEventsFeedSensor(manager, entry),
         ]
     )
+
+
+class JeevesEventsFeedSensor(SensorEntity):
+    """Sensor entity providing the important events feed for dashboard cards."""
+
+    _attr_name = "Events Feed"
+    _attr_icon = "mdi:bell-alert"
+    _attr_has_entity_name = True
+
+    def __init__(self, manager: JeevesSessionManager, entry: ConfigEntry) -> None:
+        self._manager = manager
+        self._entry = entry
+        self._attr_unique_id = f"{entry.entry_id}_events_feed"
+        self._attr_native_value = 0
+        self._attr_device_info = _device_info(entry)
+        self._events: list[ImportantEvent] = []
+        self._unsub: Any = None
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to important event updates."""
+        @callback
+        def _on_event(event: Event) -> None:
+            self._refresh_state()
+            self.async_write_ha_state()
+
+        self._unsub = self.hass.bus.async_listen(EVENT_IMPORTANT, _on_event)
+        self._refresh_state()
+
+    async def async_will_remove_from_hass(self) -> None:
+        if self._unsub:
+            self._unsub()
+
+    def _refresh_state(self) -> None:
+        event_store = self._manager.event_store
+        if event_store:
+            self._events = list(event_store.events)
+            self._events.sort(key=lambda e: e.timestamp, reverse=True)
+        else:
+            self._events = []
+        self._attr_native_value = len(self._events)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Expose events data for the frontend card."""
+        entry_id = self._entry.entry_id
+        return {
+            "entry_id": entry_id,
+            "unacknowledged_count": sum(1 for e in self._events if not e.acknowledged),
+            "events": [
+                {
+                    "id": evt.id,
+                    "timestamp": datetime.fromtimestamp(
+                        evt.timestamp, tz=timezone.utc
+                    ).isoformat(),
+                    "title": evt.title,
+                    "description": evt.description,
+                    "severity": evt.severity,
+                    "acknowledged": evt.acknowledged,
+                    "photo_count": len(evt.photos),
+                    "photo_urls": [
+                        f"/api/{DOMAIN}/event_image/{entry_id}/{evt.id}/{i}"
+                        for i in range(len(evt.photos))
+                    ],
+                    "session_id": evt.session_id,
+                }
+                for evt in self._events[:100]  # Cap at 100 for performance
+            ],
+        }

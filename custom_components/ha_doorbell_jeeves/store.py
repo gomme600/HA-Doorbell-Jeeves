@@ -8,8 +8,20 @@ from typing import Any
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 
-from .const import STORAGE_KEY_ENTITIES, STORAGE_KEY_IDENTITIES, STORAGE_VERSION
-from .models import KnownIdentity, ManagedEntity, NotificationTarget, StartTrigger
+from .const import (
+    CONF_TASK_INSTRUCTIONS,
+    STORAGE_KEY_ENTITIES,
+    STORAGE_KEY_IDENTITIES,
+    STORAGE_VERSION,
+)
+from .models import (
+    CameraPlacement,
+    KnownIdentity,
+    ManagedEntity,
+    NotificationTarget,
+    StartTrigger,
+    TaskInstruction,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -21,6 +33,7 @@ class DataStore:
       - Managed entities (with their custom actions)
       - Notification targets
       - Start triggers
+      - Task instructions
       - Known identities (with reference images)
     """
 
@@ -33,6 +46,8 @@ class DataStore:
         self.managed_entities: list[ManagedEntity] = []
         self.notification_targets: list[NotificationTarget] = []
         self.start_triggers: list[StartTrigger] = []
+        self.task_instructions: list[TaskInstruction] = []
+        self.camera_placements: list[CameraPlacement] = []
         self.known_identities: list[KnownIdentity] = []
 
     async def async_load(self) -> None:
@@ -49,6 +64,14 @@ class DataStore:
             self.start_triggers = [
                 StartTrigger.from_dict(t) for t in entity_data.get("start_triggers", [])
             ]
+            self.task_instructions = [
+                TaskInstruction.from_dict(t)
+                for t in entity_data.get(CONF_TASK_INSTRUCTIONS, [])
+            ]
+            self.camera_placements = [
+                CameraPlacement.from_dict(c)
+                for c in entity_data.get("camera_placements", [])
+            ]
 
         # Identities
         id_data = await self._identity_store.async_load()
@@ -58,9 +81,13 @@ class DataStore:
             ]
 
         _LOGGER.debug(
-            "Loaded: %d entities, %d notifications, %d triggers, %d identities",
-            len(self.managed_entities), len(self.notification_targets),
-            len(self.start_triggers), len(self.known_identities),
+            "Loaded: %d entities, %d notifications, %d triggers, %d task instructions, %d cameras, %d identities",
+            len(self.managed_entities),
+            len(self.notification_targets),
+            len(self.start_triggers),
+            len(self.task_instructions),
+            len(self.camera_placements),
+            len(self.known_identities),
         )
 
     async def async_save_entities(self) -> None:
@@ -69,6 +96,8 @@ class DataStore:
             "entities": [e.to_dict() for e in self.managed_entities],
             "notifications": [n.to_dict() for n in self.notification_targets],
             "start_triggers": [t.to_dict() for t in self.start_triggers],
+            CONF_TASK_INSTRUCTIONS: [t.to_dict() for t in self.task_instructions],
+            "camera_placements": [c.to_dict() for c in self.camera_placements],
         }
         await self._entity_store.async_save(data)
 

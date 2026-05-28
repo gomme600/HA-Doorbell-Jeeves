@@ -142,6 +142,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if manager:
         await manager.async_stop_session()
         manager.unregister_start_triggers()
+        await manager.async_shutdown()
     return True
 
 

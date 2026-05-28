@@ -7,6 +7,21 @@ from typing import Any
 
 
 @dataclass
+class TaskInstruction:
+    """A titled instruction block appended to the system prompt."""
+
+    title: str
+    text: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"title": self.title, "text": self.text}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "TaskInstruction":
+        return cls(title=data.get("title", ""), text=data.get("text", ""))
+
+
+@dataclass
 class EntityAction:
     """A custom action that the AI can perform on a managed entity.
 
@@ -185,6 +200,69 @@ class KnownIdentity:
             image_base64=data.get("image_base64"),
             notes=data.get("notes", ""),
         )
+
+
+@dataclass
+class CameraPlacement:
+    """Camera placement on the property map for spatial awareness.
+
+    Position is relative to a house rectangle:
+    - side: "north", "south", "east", "west" (which side of the house)
+    - offset: 0.0 to 1.0 (position along that side, 0=left/top, 1=right/bottom)
+    - facing: "away", "along_left", "along_right" (direction camera faces)
+    """
+
+    entity_id: str
+    name: str
+    side: str  # north, south, east, west
+    offset: float = 0.5  # position along side
+    facing: str = "away"  # away, along_left, along_right
+    area_description: str = ""  # e.g., "Front garden, driveway, mailbox"
+    is_doorbell: bool = False
+    # PTZ capabilities (entity IDs for PTZ controls)
+    ptz_up: str = ""
+    ptz_down: str = ""
+    ptz_left: str = ""
+    ptz_right: str = ""
+    ptz_return_to_monitor: str = ""  # Service/script to return to home position
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "entity_id": self.entity_id,
+            "name": self.name,
+            "side": self.side,
+            "offset": self.offset,
+            "facing": self.facing,
+            "area_description": self.area_description,
+            "is_doorbell": self.is_doorbell,
+            "ptz_up": self.ptz_up,
+            "ptz_down": self.ptz_down,
+            "ptz_left": self.ptz_left,
+            "ptz_right": self.ptz_right,
+            "ptz_return_to_monitor": self.ptz_return_to_monitor,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "CameraPlacement":
+        return cls(
+            entity_id=data["entity_id"],
+            name=data.get("name", ""),
+            side=data.get("side", "north"),
+            offset=data.get("offset", 0.5),
+            facing=data.get("facing", "away"),
+            area_description=data.get("area_description", ""),
+            is_doorbell=data.get("is_doorbell", False),
+            ptz_up=data.get("ptz_up", ""),
+            ptz_down=data.get("ptz_down", ""),
+            ptz_left=data.get("ptz_left", ""),
+            ptz_right=data.get("ptz_right", ""),
+            ptz_return_to_monitor=data.get("ptz_return_to_monitor", ""),
+        )
+
+    @property
+    def has_ptz(self) -> bool:
+        """Check if this camera has any PTZ controls configured."""
+        return bool(self.ptz_up or self.ptz_down or self.ptz_left or self.ptz_right)
 
 
 @dataclass

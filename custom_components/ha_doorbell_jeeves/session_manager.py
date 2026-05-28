@@ -36,6 +36,7 @@ from .const import (
     CONF_IDENTITY_MODE,
     CONF_MEDIA_PLAYER_ENTITY,
     CONF_MEMORY_RETENTION_DAYS,
+    CONF_MAX_SESSION_TIMEOUT,
     CONF_MICROPHONE_ENTITY,
     CONF_MODEL,
     CONF_PROVIDER,
@@ -63,6 +64,7 @@ from .const import (
     DEFAULT_FRAME_MAX_HEIGHT,
     DEFAULT_FRAME_MAX_WIDTH,
     DEFAULT_FRAME_QUALITY,
+    DEFAULT_MAX_SESSION_TIMEOUT,
     DEFAULT_MEMORY_RETENTION_DAYS,
     DEFAULT_MODEL_GEMINI,
     DEFAULT_SESSION_TIMEOUT,
@@ -85,8 +87,10 @@ from .const import (
     SECURITY_MODE_AUTO,
     TOOL_GET_LLMVISION_EVENTS,
 )
+from .events import EventStore
 from .frame_processor import process_frame
 from .memory import MemoryStore, SessionMemory
+from .notifications import NotificationManager
 from .security import SecurityManager
 from .store import DataStore
 from .tools import build_gemini_tools, build_openai_tools, build_system_context, execute_tool_call
@@ -112,6 +116,8 @@ class JeevesSessionManager:
         # Data store (entities, actions, identities)
         self.store = DataStore(hass, entry.entry_id)
         self._memory_store = MemoryStore(hass, entry.entry_id)
+        self._event_store = EventStore(hass, entry.entry_id)
+        self._notification_manager = NotificationManager(hass)
         self._security = SecurityManager(hass, self._config, self.store)
 
         # Audio handler (Reolink/go2rtc)
@@ -136,6 +142,7 @@ class JeevesSessionManager:
 
         self._last_audio_activity: float = 0.0
         self._session_started_at: float = 0.0
+        self._session_timeout_deadline: float = 0.0
         self._ai_speaking_clear_task: asyncio.Task[None] | None = None
         self._session_end_reason: str = "session ended"
         self._session_memory_saved = False
@@ -148,6 +155,9 @@ class JeevesSessionManager:
         # chunk is received (accounts for speaker buffer + physical echo).
         self._ai_last_output_time: float = 0.0
         self._echo_gate_hold_sec: float = 4.0  # hold mic mute after last AI chunk (accounts for speaker-mic coupling)
+
+        # PTZ camera tracking: cameras moved during this session (auto-return on end)
+        self._ptz_moved_cameras: set[str] = set()
 
     def _normalize_manual_audio_config(self) -> None:
         """Backfill split go2rtc stream keys from the legacy single stream key."""
@@ -195,10 +205,17 @@ class JeevesSessionManager:
         """Configured memory retention period."""
         return self._memory_store.retention_days
 
+    @property
+    def event_store(self) -> EventStore:
+        """Access the event store for dashboard feeds."""
+        return self._event_store
+
     async def async_initialize(self) -> None:
         """Load persistent data and register start triggers."""
         await self.store.async_load()
         await self._memory_store.async_load()
+        await self._event_store.async_load()
+        await self._notification_manager.async_setup()
         await self._memory_store.async_set_retention_days(
             int(self._config.get(CONF_MEMORY_RETENTION_DAYS, DEFAULT_MEMORY_RETENTION_DAYS))
         )
@@ -236,6 +253,10 @@ class JeevesSessionManager:
             len(self.store.start_triggers),
             [t.entity_id for t in self.store.start_triggers],
         )
+
+    async def async_shutdown(self) -> None:
+        """Release background listeners and helpers during unload."""
+        await self._notification_manager.async_teardown()
 
     async def _lazy_setup_reolink(self) -> None:
         """Verify Reolink connectivity (deferred from boot for timing).
@@ -374,6 +395,7 @@ class JeevesSessionManager:
             self._session_end_reason = "conversation complete"
             self._session_memory_saved = False
             self._transcript_history = []
+            self._notification_manager.clear_session()
             self._touch_audio_activity()
             _LOGGER.warning("Connected! Session is now active.")
 
@@ -425,9 +447,12 @@ class JeevesSessionManager:
             if self._tool_router:
                 self._tool_router.start()
 
-            timeout = config.get(CONF_SESSION_TIMEOUT, DEFAULT_SESSION_TIMEOUT)
+            timeout = int(config.get(CONF_SESSION_TIMEOUT, DEFAULT_SESSION_TIMEOUT))
+            max_timeout = int(config.get(CONF_MAX_SESSION_TIMEOUT, DEFAULT_MAX_SESSION_TIMEOUT))
+            if max_timeout > 0:
+                timeout = min(timeout, max_timeout)
             if timeout > 0:
-                self._timeout_task = asyncio.create_task(self._session_timeout(timeout))
+                self._schedule_session_timeout(timeout)
 
             silence_timeout = float(config.get(CONF_SILENCE_TIMEOUT, DEFAULT_SILENCE_TIMEOUT))
             if silence_timeout > 0:
@@ -497,6 +522,7 @@ class JeevesSessionManager:
         self._timeout_task = None
         self._silence_task = None
         self._ai_speaking_clear_task = None
+        self._session_timeout_deadline = 0.0
 
         # Request recap from the live model BEFORE disconnecting (it has full context)
         live_recap: dict[str, str] | None = None
@@ -511,7 +537,12 @@ class JeevesSessionManager:
             self._client = None
 
         await self._store_session_memory(reason, live_recap=live_recap)
+        self._notification_manager.clear_session()
         self._session_start_snapshot = ""  # Free memory
+
+        # Auto-return any PTZ cameras moved during this session
+        await self._ptz_auto_return()
+
         self.hass.bus.async_fire(EVENT_SESSION_ENDED, {"entry_id": self.entry.entry_id})
         _LOGGER.info("Session ended (audit entries: %d)", len(self._security.audit_log))
 
@@ -904,6 +935,32 @@ class JeevesSessionManager:
                 await own_session.close()
         return None
 
+    def _schedule_session_timeout(self, timeout_seconds: int) -> None:
+        """Start or reset the session timeout watchdog."""
+        if self._timeout_task and not self._timeout_task.done():
+            self._timeout_task.cancel()
+        self._session_timeout_deadline = time.time() + timeout_seconds
+        self._timeout_task = asyncio.create_task(self._session_timeout(timeout_seconds))
+
+    def _extend_session_timeout(self, extra_seconds: int) -> int:
+        """Extend the active session timeout, respecting the configured cap."""
+        if not self._active:
+            return 0
+
+        current_deadline = max(self._session_timeout_deadline, time.time())
+        new_deadline = current_deadline + extra_seconds
+
+        max_timeout = int(self._config.get(CONF_MAX_SESSION_TIMEOUT, DEFAULT_MAX_SESSION_TIMEOUT))
+        if max_timeout > 0 and self._session_started_at > 0:
+            new_deadline = min(new_deadline, self._session_started_at + max_timeout)
+
+        remaining_seconds = max(0, int(new_deadline - time.time()))
+        if remaining_seconds <= 0:
+            return 0
+
+        self._schedule_session_timeout(remaining_seconds)
+        return remaining_seconds
+
     async def _session_timeout(self, timeout_seconds: int) -> None:
         try:
             await asyncio.sleep(timeout_seconds)
@@ -912,6 +969,64 @@ class JeevesSessionManager:
                 await self.async_stop_session(f"session timeout ({timeout_seconds}s)")
         except asyncio.CancelledError:
             pass
+
+    async def _switch_active_camera(self, camera_entity_id: str) -> None:
+        """Switch the live video feed to a different camera mid-session.
+
+        This stops the current vision loop and restarts it with the new camera.
+        If the new camera is Reolink, audio is also redirected.
+        """
+        _LOGGER.info("Switching active camera to: %s", camera_entity_id)
+        # Stop current vision loop
+        if self._vision_task and not self._vision_task.done():
+            self._vision_task.cancel()
+            try:
+                await self._vision_task
+            except asyncio.CancelledError:
+                pass
+
+        # Update the config to point to the new camera
+        self._config[CONF_CAMERA_ENTITY] = camera_entity_id
+
+        # Restart vision loop with new camera
+        if self._client and self._active:
+            from .vision import VisionLoop  # noqa: PLC0415
+            if hasattr(self, "_vision_loop"):
+                self._vision_loop.camera_entity_id = camera_entity_id
+            self._vision_task = asyncio.create_task(self._run_vision_loop())
+            _LOGGER.info("Vision loop restarted with camera: %s", camera_entity_id)
+
+    async def _ptz_auto_return(self) -> None:
+        """Return all PTZ cameras moved during this session to their monitor positions."""
+        if not self._ptz_moved_cameras:
+            return
+
+        from .store import DataStore  # noqa: PLC0415
+        store: DataStore = self._store
+
+        for camera_id in list(self._ptz_moved_cameras):
+            placement = None
+            for cp in store.camera_placements:
+                if cp.entity_id == camera_id:
+                    placement = cp
+                    break
+            if not placement or not placement.ptz_return_to_monitor:
+                continue
+
+            try:
+                ptz_entity = placement.ptz_return_to_monitor
+                domain = ptz_entity.split(".")[0]
+                if domain == "button":
+                    await self.hass.services.async_call("button", "press", {"entity_id": ptz_entity})
+                elif domain == "script":
+                    await self.hass.services.async_call("script", "turn_on", {"entity_id": ptz_entity})
+                else:
+                    await self.hass.services.async_call("homeassistant", "turn_on", {"entity_id": ptz_entity})
+                _LOGGER.info("PTZ auto-return: %s → %s", camera_id, ptz_entity)
+            except Exception:
+                _LOGGER.exception("Failed to auto-return PTZ camera: %s", camera_id)
+
+        self._ptz_moved_cameras.clear()
 
     async def _silence_watchdog(self, timeout: float = DEFAULT_SILENCE_TIMEOUT) -> None:
         """End the session if no audio activity occurs for too long."""
@@ -1314,6 +1429,31 @@ class JeevesSessionManager:
             if "_image_mime" in result:
                 result.pop("_image_mime")
 
+        extend_seconds = int(result.pop("_extend_session_seconds", 0) or 0)
+        if extend_seconds > 0:
+            remaining_timeout = self._extend_session_timeout(extend_seconds)
+            if remaining_timeout > 0:
+                result["message"] = (
+                    f"{result.get('message', 'Session timeout updated.')} "
+                    f"The session now has about {remaining_timeout} seconds remaining."
+                )
+            else:
+                result["success"] = False
+                result["error"] = "Session could not be extended further."
+
+        # Handle camera switching
+        switch_camera_id = result.pop("_switch_camera", None)
+        if switch_camera_id:
+            self.hass.async_create_task(self._switch_active_camera(switch_camera_id))
+
+        # Track PTZ-moved cameras for auto-return on session end
+        ptz_moved = result.pop("_ptz_moved_camera", None)
+        if ptz_moved and ptz_moved not in self._ptz_moved_cameras:
+            self._ptz_moved_cameras.add(ptz_moved)
+        ptz_returned = result.pop("_ptz_returned_camera", None)
+        if ptz_returned:
+            self._ptz_moved_cameras.discard(ptz_returned)
+
         if result.get("success") and function_name not in read_only_tools:
             self._security.record_action(function_name)
 
@@ -1609,10 +1749,22 @@ class JeevesSessionManager:
             parts: list[Any] = [
                 types.Part(
                     text=(
-                        "Summarize this completed Home Assistant doorbell conversation as JSON. "
-                        "Return keys: visitor_description, summary, outcome, visitor_name. "
-                        f"The session ended with outcome: {outcome}.\n\n"
-                        f"Transcript:\n{transcript_text or '[no transcript captured]'}"
+                        "You are summarizing a doorbell conversation for the homeowner's records. "
+                        "Return a JSON object with these keys:\n"
+                        "- visitor_name: The visitor's name if known/given, else empty string\n"
+                        "- visitor_description: Physical description of the visitor if visible (clothing, features, vehicle)\n"
+                        "- summary: A COMPLETE narrative of the entire interaction. Include:\n"
+                        "  * Why the visitor came (delivery, looking for someone, asking something, etc.)\n"
+                        "  * What was discussed in detail (specific requests, information exchanged)\n"
+                        "  * What decisions were made (by both parties - including refusals)\n"
+                        "  * What actions the agent took (opened gate, sent notification, etc.)\n"
+                        "  * Any specific details mentioned (package sizes, relay points, phone numbers, names)\n"
+                        "  * The final outcome and any promises/commitments made\n"
+                        "  Do NOT include the initial greeting. Focus on substantive content.\n"
+                        "- outcome: Brief outcome category (e.g., 'package_delivered', 'visitor_left_message', "
+                        "'access_granted', 'redirected_to_relay', 'suspicious_activity', 'no_answer')\n\n"
+                        f"Session ended with outcome: {outcome}\n\n"
+                        f"Full transcript:\n{transcript_text or '[no transcript captured]'}"
                     )
                 )
             ]
