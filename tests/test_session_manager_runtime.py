@@ -13,7 +13,11 @@ def test_switch_active_camera_restarts_existing_vision_loop() -> None:
         manager = JeevesSessionManager.__new__(JeevesSessionManager)
         manager._vision_task = asyncio.create_task(asyncio.sleep(3600))
         manager._config = {CONF_VISION_FPS: 2.5}
-        manager._audio_handler = SimpleNamespace(is_active=True, _camera_entity_id="camera.old")
+        async def _mock_start() -> None: pass
+        async def _mock_stop() -> None: pass
+        manager._audio_handler = SimpleNamespace(
+            is_active=True, _camera_entity_id="camera.old", start=_mock_start, stop=_mock_stop
+        )
         manager._client = object()
         manager._active = True
 
