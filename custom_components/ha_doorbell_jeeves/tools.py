@@ -76,6 +76,23 @@ def _llmvision_detected(hass: HomeAssistant) -> bool:
     return _llmvision_get_events_available(hass) or bool(_llmvision_entries(hass))
 
 
+def _position_description(x: float, y: float) -> str:
+    """Convert x/y (0-1) to a human-readable position relative to house center."""
+    # House is at center (0.25-0.75 range), so describe relative to it
+    if 0.3 <= x <= 0.7 and 0.3 <= y <= 0.7:
+        return "at the house"
+    parts = []
+    if y < 0.3:
+        parts.append("north")
+    elif y > 0.7:
+        parts.append("south")
+    if x < 0.3:
+        parts.append("west")
+    elif x > 0.7:
+        parts.append("east")
+    return " ".join(parts) + " of house" if parts else "near the house"
+
+
 def build_system_context(
     store: DataStore,
     hass: HomeAssistant,
@@ -122,13 +139,16 @@ def build_system_context(
     # Camera placement map (spatial context)
     if store.camera_placements:
         lines.append("\n--- CAMERA PLACEMENT MAP (spatial layout of the property) ---")
-        lines.append("Cameras are placed around the property. Directions indicate where they point:")
+        lines.append("Cameras are placed around the property. Positions are relative to the house center.")
+        lines.append("Directions indicate where each camera points:")
         for cp in store.camera_placements:
             ptz_label = " [PTZ]" if cp.has_ptz else ""
             doorbell_label = " [DOORBELL]" if cp.is_doorbell else ""
+            # Describe position relative to house center
+            pos_desc = _position_description(cp.x, cp.y)
             lines.append(
                 f"• {cp.name} [{cp.entity_id}]: "
-                f"facing {cp.facing_direction}{ptz_label}{doorbell_label}"
+                f"positioned {pos_desc}, facing {cp.facing_direction}{ptz_label}{doorbell_label}"
             )
             if cp.area_description:
                 lines.append(f"  Covers: {cp.area_description}")

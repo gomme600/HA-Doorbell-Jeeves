@@ -141,6 +141,25 @@ class JeevesCameraMapPanel extends HTMLElement {
   _renderEditPanel() {
     const p = this._placements[this._selected];
     if (!p) return "";
+    // Gather button/script entities for PTZ dropdowns
+    const ptzEntities = Object.keys(this._hass.states)
+      .filter(eid => eid.startsWith("button.") || eid.startsWith("script."))
+      .sort();
+    const ptzOptions = ptzEntities.map(eid => {
+      const friendly = this._hass.states[eid].attributes.friendly_name || eid;
+      return `<option value="${eid}">${friendly}</option>`;
+    }).join("");
+    const makeSelect = (id, label, value) => `
+      <label>${label}</label>
+      <select id="${id}" class="ptz-select">
+        <option value="">— None —</option>
+        ${ptzEntities.map(eid => {
+          const friendly = this._hass.states[eid].attributes.friendly_name || eid;
+          const sel = (value === eid) ? "selected" : "";
+          return `<option value="${eid}" ${sel}>${friendly}</option>`;
+        }).join("")}
+      </select>
+    `;
     return `
       <div class="edit-panel">
         <div class="edit-header">
@@ -155,12 +174,12 @@ class JeevesCameraMapPanel extends HTMLElement {
           <label>Rotation: <span id="rot-val">${Math.round(p.rotation || 0)}°</span></label>
           <input type="range" id="edit-rotation" min="0" max="360" value="${p.rotation || 0}">
           <div class="ptz-section">
-            <label class="section-label">PTZ Controls (entity IDs)</label>
-            <input type="text" id="ptz-up" placeholder="PTZ Up entity" value="${p.ptz_up || ""}">
-            <input type="text" id="ptz-down" placeholder="PTZ Down entity" value="${p.ptz_down || ""}">
-            <input type="text" id="ptz-left" placeholder="PTZ Left entity" value="${p.ptz_left || ""}">
-            <input type="text" id="ptz-right" placeholder="PTZ Right entity" value="${p.ptz_right || ""}">
-            <input type="text" id="ptz-return" placeholder="PTZ Return to monitor" value="${p.ptz_return_to_monitor || ""}">
+            <label class="section-label">PTZ Controls</label>
+            ${makeSelect("ptz-up", "Move Up", p.ptz_up || "")}
+            ${makeSelect("ptz-down", "Move Down", p.ptz_down || "")}
+            ${makeSelect("ptz-left", "Move Left", p.ptz_left || "")}
+            ${makeSelect("ptz-right", "Move Right", p.ptz_right || "")}
+            ${makeSelect("ptz-return", "Return to Monitor", p.ptz_return_to_monitor || "")}
           </div>
           <button class="save-btn" id="save-edit">Save</button>
           <button class="remove-btn" id="remove-cam">Remove Camera</button>
@@ -413,6 +432,12 @@ class JeevesCameraMapPanel extends HTMLElement {
       .ptz-section { margin-top: 12px; }
       .section-label { font-size: 0.75rem; text-transform: uppercase; color: var(--primary-color); font-weight: 700; }
       .ptz-section input { margin-bottom: 4px; }
+      .ptz-section select.ptz-select {
+        width: 100%; padding: 6px 8px; margin-bottom: 6px;
+        border: 1px solid var(--divider-color); border-radius: 6px;
+        font-size: 0.82rem; box-sizing: border-box;
+        background: var(--card-background-color); color: var(--primary-text-color);
+      }
       .save-btn {
         display: block; width: 100%; padding: 8px; margin-top: 12px;
         background: var(--primary-color); color: white; border: none;
