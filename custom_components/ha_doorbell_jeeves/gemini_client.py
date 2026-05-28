@@ -126,9 +126,10 @@ class GeminiLiveClient(BaseRealtimeClient):
             # heard part of it). This avoids the greeting repeating.
             await self._session.send_client_content(
                 turns=[types.Content(role="user", parts=[types.Part(text=(
-                    "[SYSTEM] You were greeting a visitor but the connection dropped. "
-                    "Continue naturally — do NOT repeat your greeting. "
-                    "Just listen for the visitor's response."
+                    "[SYSTEM] The connection was briefly interrupted. "
+                    "You are already in a conversation with the visitor. "
+                    "Continue exactly where you left off. "
+                    "Do NOT repeat your initial greeting."
                 ))])],
                 turn_complete=True,
             )
