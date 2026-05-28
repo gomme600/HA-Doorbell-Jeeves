@@ -52,6 +52,7 @@ class GeminiLiveClient(BaseRealtimeClient):
         self._connected = False
         self._conversation_turns: list[dict[str, str]] = []
         self._recap_future: asyncio.Future[str] | None = None
+        self._pending_tool_image: tuple[str, str] | None = None
 
     @property
     def connected(self) -> bool:
@@ -327,3 +328,12 @@ class GeminiLiveClient(BaseRealtimeClient):
                 )
             except Exception:
                 _LOGGER.exception("Failed to send tool response")
+            # Inject pending tool image AFTER the tool response so the model
+            # correlates the image with the tool call context
+            if self._pending_tool_image:
+                image_b64, mime_type = self._pending_tool_image
+                self._pending_tool_image = None
+                try:
+                    await self.send_image(image_b64, mime_type=mime_type)
+                except Exception:
+                    _LOGGER.exception("Failed to send tool image")

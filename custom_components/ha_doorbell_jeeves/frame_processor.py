@@ -28,7 +28,15 @@ def process_frame(
         Optimized JPEG bytes, or the original if processing fails.
     """
     try:
+        # Ensure quality is a valid integer (config values may arrive as strings)
+        quality = max(1, min(100, int(quality)))
+
         img = Image.open(io.BytesIO(raw_jpeg))
+
+        # Convert to RGB if necessary (e.g., RGBA or palette mode can't save as JPEG)
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+
         img.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
 
         output = io.BytesIO()

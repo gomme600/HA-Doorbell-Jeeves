@@ -1140,6 +1140,7 @@ class JeevesSessionManager:
             pass
 
     async def _handle_tool_call(self, function_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        _LOGGER.warning("Tool call: %s(%s)", function_name, arguments)
         self._security.log_event("tool_call_request", function_name, {"arguments": arguments})
         self.hass.bus.async_fire(
             EVENT_TOOL_CALL,
@@ -1212,13 +1213,25 @@ class JeevesSessionManager:
             self._config,
         )
 
-        if result.get("_image_base64") and self._client:
-            await self._client.send_image(
-                result["_image_base64"],
-                mime_type=result.get("_image_mime", "image/jpeg"),
+        has_image = bool(result.get("_image_base64"))
+        _LOGGER.warning(
+            "Tool result: %s → %s (has_image=%s)",
+            function_name,
+            "success" if result.get("success") else result.get("error", "unknown"),
+            has_image,
+        )
+
+        # Store image for injection AFTER tool response is sent (model needs response first)
+        if has_image and self._client:
+            self._client._pending_tool_image = (
+                result.pop("_image_base64"),
+                result.pop("_image_mime", "image/jpeg"),
             )
-            result.pop("_image_base64", None)
-            result.pop("_image_mime", None)
+        else:
+            if "_image_base64" in result:
+                result.pop("_image_base64")
+            if "_image_mime" in result:
+                result.pop("_image_mime")
 
         if result.get("success") and function_name not in read_only_tools:
             self._security.record_action(function_name)

@@ -764,8 +764,14 @@ async def _execute_view_camera(
         if not image:
             return {"error": f"Could not get image from {camera_id}"}
 
+        # Process image (resize/optimize) to avoid sending huge images to the model
+        from .frame_processor import process_frame  # noqa: PLC0415
+        processed = await hass.async_add_executor_job(
+            process_frame, image.content, 1024, 768, 75
+        )
+
         # Return base64 image — the session manager will inject this into the model
-        image_b64 = base64.b64encode(image.content).decode("ascii")
+        image_b64 = base64.b64encode(processed).decode("ascii")
         managed = store.get_entity(camera_id)
         cam_name = managed.name if managed else camera_id
 
