@@ -272,6 +272,8 @@ class ReolinkAudioHandler:
         self._talk_host: Any = None  # Dedicated Host object for talk connection
         self._talk_ability: dict | None = None
         self._talk_enc_type: Any = None
+        self._talk_held: bool = False  # Whether we currently hold the talk session
+        self._talk_channel: int = 0
         self._pcm_buffer: bytearray = bytearray()
         self._pcm_lock = asyncio.Lock()
         self._pcm_overflow_warned = False
@@ -1115,9 +1117,9 @@ class ReolinkAudioHandler:
     async def _baichuan_audio_output_loop(self) -> None:
         """Main audio output loop: buffer PCM → resample → ADPCM → Baichuan talk.
 
-        Runs as a background task. Consumes PCM from self._pcm_buffer,
-        resamples from 24kHz to camera rate, encodes as IMA ADPCM, and sends
-        via Baichuan protocol command 202.
+        Uses ON-DEMAND talk acquisition: acquires the speaker only when audio
+        arrives, releases it after a silence gap. This allows the Reolink app
+        to connect to the speaker at any time the AI is not actively talking.
         """
         import struct as struct_mod  # noqa: PLC0415
 
@@ -1127,13 +1129,11 @@ class ReolinkAudioHandler:
         ability = self._talk_ability
         sample_rate = ability["sample_rate"]
         length_per_encoder = ability["length_per_encoder"]
-        # CRITICAL: the ADPCM block size for DVI-4 is NOT length_per_encoder!
-        # It's (length_per_encoder / 2) + 4 bytes (4 = header: predictor + index + reserved)
-        # This matches what reolink_talk and neolink use.
         block_size = (length_per_encoder // 2) + 4
         channel = 0
+        self._talk_channel = channel
 
-        # Wait for the mechanical chime to finish before taking over the speaker
+        # Wait for the mechanical chime to finish before any speaker output
         chime_delay = getattr(self, "_chime_delay", DEFAULT_CHIME_DELAY)
         if chime_delay > 0:
             _LOGGER.warning(
@@ -1141,61 +1141,29 @@ class ReolinkAudioHandler:
             )
             await asyncio.sleep(chime_delay)
 
-        # Start talk session: send TalkConfig (cmd 201)
-        talk_started = await self._start_baichuan_talk(channel, ability)
-        if not talk_started:
-            _LOGGER.error("Failed to start Baichuan talk session — audio output disabled")
-            return
-
-        _LOGGER.warning(
-            "Baichuan talk session started! Streaming audio (rate=%d, block=%d)...",
-            sample_rate, block_size,
-        )
-
-        # Install FDX audio intercept on the TALK connection (retry after talk start).
-        # The hook may have already been installed pre-talk in _start_output_pipeline.
-        # If not, try again now that the talk session is active.
-        if ability.get("duplex") == "FDX" and not self._baichuan_audio_input_active:
-            if not self._aac_queue:
-                self._aac_queue = asyncio.Queue(maxsize=200)
-            if not self._aac_decoder_task or self._aac_decoder_task.done():
-                self._aac_decoder_task = asyncio.create_task(self._aac_decode_loop())
-            try:
-                success = self._install_talk_data_received_hook()
-            except Exception as exc:
-                _LOGGER.warning("FDX post-talk hook exception: %s", exc)
-                success = False
-            if success:
-                self._baichuan_audio_input_active = True
-                _LOGGER.warning("✓ FDX hook active (post-talk retry)")
-            else:
-                _LOGGER.warning(
-                    "FDX hook failed after talk start — mic limited to Preview (~1fps)"
-                )
+        # NOTE: We do NOT acquire the talk session here anymore.
+        # It will be acquired on-demand when first audio arrives.
 
         # Pure Python resampler: 24kHz mono s16le → camera sample_rate mono s16le
-        # Eliminates ffmpeg dependency and pipe buffering issues.
         input_rate = 24000
         _LOGGER.warning(
             "Audio output resampler ready (in-process %dHz → %dHz)", input_rate, sample_rate
         )
 
         chunks_sent = 0
-        # ADPCM encoder state (persistent across blocks for continuity)
         predictor = 0
         step_index = 0
-        # Calculate how many resampled PCM bytes we need for one ADPCM block
-        # Block = 4 bytes header + (block_size-4) bytes payload = (block_size-4)*2 samples
         samples_per_block = (block_size - 4) * 2 + 1
         pcm_bytes_per_block = samples_per_block * 2
 
-        # Neolink-style time tracking: tracks when the stream "should" end
-        # to prevent drift and ensure smooth playback
         import time as time_mod  # noqa: PLC0415
         expected_stream_end = time_mod.monotonic()
         resampled_pcm_buffer = bytearray()
-        # Leftover input samples that don't align to a complete resample step
         resample_leftover = bytearray()
+
+        # On-demand talk: track when last audio was sent to detect silence
+        TALK_RELEASE_DELAY = 1.5  # Release speaker after 1.5s of silence
+        last_audio_sent_time = 0.0
 
         try:
             while self._active:
@@ -1205,16 +1173,32 @@ class ReolinkAudioHandler:
                     self._pcm_buffer.clear()
 
                 if not chunk:
+                    # No audio — check if we should release the speaker
+                    if (
+                        self._talk_held
+                        and last_audio_sent_time > 0
+                        and (time_mod.monotonic() - last_audio_sent_time) > TALK_RELEASE_DELAY
+                    ):
+                        await self._release_talk()
                     await asyncio.sleep(0.01)
                     continue
+
+                # We have audio — acquire talk session if not held
+                if not self._talk_held:
+                    acquired = await self._acquire_talk()
+                    if not acquired:
+                        # Can't get speaker — skip this audio
+                        await asyncio.sleep(0.05)
+                        continue
+                    # Reset timing after re-acquisition
+                    expected_stream_end = time_mod.monotonic()
+                    chunks_sent_before_acquire = chunks_sent
 
                 # Resample in-process: linear interpolation 24kHz → target rate
                 raw_input = resample_leftover + chunk
                 resample_leftover = bytearray()
 
-                # Parse input as int16 samples
                 n_bytes = len(raw_input)
-                # Ensure even number of bytes
                 if n_bytes % 2:
                     resample_leftover = bytearray(raw_input[-1:])
                     raw_input = raw_input[:-1]
@@ -1225,11 +1209,9 @@ class ReolinkAudioHandler:
                     resample_leftover = bytearray(raw_input)
                     continue
 
-                # Convert to samples array
                 in_samples = struct_mod.unpack(f"<{n_samples_in}h", raw_input)
 
-                # Calculate output samples using linear interpolation
-                ratio = input_rate / sample_rate  # e.g. 24000/16000 = 1.5
+                ratio = input_rate / sample_rate
                 n_samples_out = int((n_samples_in - 1) / ratio)
                 if n_samples_out < 1:
                     resample_leftover = bytearray(raw_input)
@@ -1246,18 +1228,14 @@ class ReolinkAudioHandler:
                         val = in_samples[idx]
                     out_samples.append(max(-32768, min(32767, int(val))))
 
-                # Track unconsumed input samples for next iteration
                 consumed_input_samples = int(n_samples_out * ratio) + 1
                 if consumed_input_samples < n_samples_in:
                     leftover_start = consumed_input_samples * 2
                     resample_leftover = bytearray(raw_input[leftover_start:])
 
-                # Pack output samples and add to buffer
                 resampled_bytes = struct_mod.pack(f"<{len(out_samples)}h", *out_samples)
                 resampled_pcm_buffer.extend(resampled_bytes)
 
-                # Encode and send exactly one complete ADPCM block at a time.
-                # This preserves block boundaries and improves playback smoothness.
                 while len(resampled_pcm_buffer) >= pcm_bytes_per_block:
                     pcm_block = bytes(resampled_pcm_buffer[:pcm_bytes_per_block])
                     del resampled_pcm_buffer[:pcm_bytes_per_block]
@@ -1276,8 +1254,6 @@ class ReolinkAudioHandler:
                     if not payload:
                         continue
 
-                    # Calculate play duration for this block (neolink formula)
-                    # samples = (block_size - 4_header) * 2_samples_per_byte + 1_initial
                     block_samples = (block_size - 4) * 2 + 1
                     play_duration = block_samples / sample_rate
 
@@ -1285,6 +1261,7 @@ class ReolinkAudioHandler:
                     try:
                         await self._send_talk_binary(channel, payload)
                         chunks_sent += 1
+                        last_audio_sent_time = time_mod.monotonic()
                         if chunks_sent == 1:
                             _LOGGER.warning("✓ First ADPCM payload sent to doorbell speaker!")
                             expected_stream_end = now + play_duration
@@ -1293,15 +1270,15 @@ class ReolinkAudioHandler:
                     except Exception as exc:
                         if chunks_sent <= 3:
                             _LOGGER.warning("Baichuan talk send error: %s", exc)
+                        # Talk session may have been stolen by Reolink app
+                        self._talk_held = False
                         continue
 
-                    # Neolink-style pacing: track expected end time to avoid drift.
                     if now > expected_stream_end:
                         expected_stream_end = now + play_duration
                     else:
                         expected_stream_end += play_duration
 
-                    # Sleep until the expected stream position
                     sleep_time = expected_stream_end - time_mod.monotonic()
                     if sleep_time > 0.001:
                         await asyncio.sleep(sleep_time)
@@ -1311,15 +1288,33 @@ class ReolinkAudioHandler:
         except Exception:
             _LOGGER.warning("Baichuan audio output loop error", exc_info=True)
         finally:
-            # Let the last queued payload finish playback before stopping talk,
-            # otherwise the tail of speech can get clipped.
-            remaining = expected_stream_end - time_mod.monotonic()
-            if remaining > 0:
-                await asyncio.sleep(min(remaining + 0.1, 1.5))
-
-            # Stop talk session on camera
-            await self._stop_baichuan_talk(channel)
+            # Release talk session on exit
+            if self._talk_held:
+                remaining = expected_stream_end - time_mod.monotonic()
+                if remaining > 0:
+                    await asyncio.sleep(min(remaining + 0.1, 1.5))
+                await self._release_talk()
             _LOGGER.warning("Baichuan audio output loop ended (sent %d chunks)", chunks_sent)
+
+    async def _acquire_talk(self) -> bool:
+        """Acquire the Baichuan talk session on-demand (fast ~200ms)."""
+        if self._talk_held:
+            return True
+        if not self._talk_baichuan or not self._talk_ability:
+            return False
+        ok = await self._start_baichuan_talk(self._talk_channel, self._talk_ability)
+        if ok:
+            self._talk_held = True
+            _LOGGER.info("Talk session acquired (on-demand)")
+        return ok
+
+    async def _release_talk(self) -> None:
+        """Release the Baichuan talk session so Reolink app can connect."""
+        if not self._talk_held:
+            return
+        await self._stop_baichuan_talk(self._talk_channel)
+        self._talk_held = False
+        _LOGGER.info("Talk session released (speaker free for Reolink app)")
 
     async def _start_baichuan_talk(self, channel: int, ability: dict) -> bool:
         """Send TalkConfig (cmd 201) to start the talk session on the camera."""

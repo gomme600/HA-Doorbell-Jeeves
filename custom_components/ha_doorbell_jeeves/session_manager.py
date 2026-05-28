@@ -375,19 +375,26 @@ class JeevesSessionManager:
             self._touch_audio_activity()
             _LOGGER.warning("Connected! Session is now active.")
 
-            if config.get(CONF_AUDIO_MODE) == AUDIO_MODE_REOLINK:
-                _LOGGER.warning("Starting Reolink 2-way audio handler")
-                await self._start_reolink_audio(config)
-            else:
-                _LOGGER.warning("Audio mode is '%s' (not reolink)", config.get(CONF_AUDIO_MODE))
+            # Send greeting trigger IMMEDIATELY so AI starts generating while
+            # Reolink audio hardware is being set up in the background.
+            await self._send_initial_greeting()
 
-            if self._tool_router:
-                self._tool_router.start()
-
+            # Start vision loop early — send first frame to AI before audio is ready
             fps = config.get(CONF_VISION_FPS, DEFAULT_VISION_FPS)
             camera_entity = config.get(CONF_CAMERA_ENTITY, "")
             if camera_entity:
                 self._vision_task = asyncio.create_task(self._vision_loop(camera_entity, fps))
+
+            if self._tool_router:
+                self._tool_router.start()
+
+            # Start Reolink audio as a background task — this takes 5-15s but
+            # the AI is already generating the greeting response in parallel.
+            if config.get(CONF_AUDIO_MODE) == AUDIO_MODE_REOLINK:
+                _LOGGER.warning("Starting Reolink 2-way audio handler (background)")
+                self.hass.async_create_task(self._start_reolink_audio_background(config))
+            else:
+                _LOGGER.warning("Audio mode is '%s' (not reolink)", config.get(CONF_AUDIO_MODE))
 
             timeout = config.get(CONF_SESSION_TIMEOUT, DEFAULT_SESSION_TIMEOUT)
             if timeout > 0:
@@ -407,8 +414,6 @@ class JeevesSessionManager:
                 fps,
                 dual_model,
             )
-
-            await self._send_initial_greeting()
         except Exception:
             self._starting = False
             await self._cleanup_after_end()
@@ -488,6 +493,14 @@ class JeevesSessionManager:
         await self._client.send_audio(base64.b64decode(audio_base64))
 
     # ─── Reolink Audio Integration ────────────────────────────────────────────
+
+    async def _start_reolink_audio_background(self, config: dict) -> None:
+        """Background wrapper for Reolink audio setup (non-blocking startup)."""
+        try:
+            await self._start_reolink_audio(config)
+        except Exception:
+            _LOGGER.exception("Reolink audio setup failed (background)")
+            # Session continues without 2-way audio — AI can still see via camera
 
     async def _start_reolink_audio(self, config: dict) -> None:
         """Start the Reolink 2-way audio handler via go2rtc."""
@@ -1103,7 +1116,24 @@ class JeevesSessionManager:
                 self._clear_ai_speaking_flag()
             )
         if self._audio_handler and self._audio_handler.is_active:
+            # Flush any pre-buffered audio first (from before handler was ready)
+            if hasattr(self, "_pre_handler_audio_buf") and self._pre_handler_audio_buf:
+                buf = self._pre_handler_audio_buf
+                self._pre_handler_audio_buf = None
+                _LOGGER.warning(
+                    "Flushing %d bytes of pre-buffered AI audio to speaker",
+                    len(buf),
+                )
+                self.hass.async_create_task(self._audio_handler.send_audio(bytes(buf)))
             self.hass.async_create_task(self._audio_handler.send_audio(audio_bytes))
+        elif self._config.get(CONF_AUDIO_MODE) == AUDIO_MODE_REOLINK:
+            # Reolink mode but handler not ready yet — buffer audio for later
+            if not hasattr(self, "_pre_handler_audio_buf") or self._pre_handler_audio_buf is None:
+                self._pre_handler_audio_buf = bytearray()
+            self._pre_handler_audio_buf.extend(audio_bytes)
+            # Cap buffer at 5 seconds of 24kHz 16-bit mono = 240,000 bytes
+            if len(self._pre_handler_audio_buf) > 240000:
+                del self._pre_handler_audio_buf[:len(self._pre_handler_audio_buf) - 240000]
         else:
             audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
             speaker_entity = self._config.get(CONF_MEDIA_PLAYER_ENTITY, "")
