@@ -111,6 +111,7 @@ class JeevesSessionManager:
         self._active = False
         self._starting = False
         self._config = dict(entry.data) | dict(entry.options)
+        self._config["_entry_id"] = entry.entry_id
         self._normalize_manual_audio_config()
 
         # Data store (entities, actions, identities)
@@ -154,7 +155,7 @@ class JeevesSessionManager:
         # Gate stays closed for ECHO_GATE_HOLD seconds after the last AI output
         # chunk is received (accounts for speaker buffer + physical echo).
         self._ai_last_output_time: float = 0.0
-        self._echo_gate_hold_sec: float = 4.0  # hold mic mute after last AI chunk (accounts for speaker-mic coupling)
+        self._echo_gate_hold_sec: float = 1.2  # hold mic mute briefly after AI output without eating replies
 
         # PTZ camera tracking: cameras moved during this session (auto-return on end)
         self._ptz_moved_cameras: set[str] = set()
@@ -652,13 +653,6 @@ class JeevesSessionManager:
                 if mic_rx_count == 100:
                     self._save_debug_wav(bytes(self._debug_pcm_buf))
 
-            # At chunk 10 (~5s in), run an async audio diagnostic:
-            # send captured PCM to Gemini non-live API to verify speech is intelligible
-            if mic_rx_count == 10:
-                pcm_sample = bytes(self._debug_pcm_buf) if hasattr(self, "_debug_pcm_buf") else b""
-                if pcm_sample:
-                    self.hass.async_create_task(self._run_audio_diagnostic(pcm_sample))
-
             if self._mic_queue is None:
                 return
 
@@ -982,18 +976,49 @@ class JeevesSessionManager:
         try:
             await asyncio.sleep(timeout_seconds)
             if self._active:
-                _LOGGER.info("Session timeout (%ds)", timeout_seconds)
-                await self.async_stop_session(f"session timeout ({timeout_seconds}s)")
+                now = time.time()
+                loop_now = asyncio.get_running_loop().time()
+                silence_timeout = float(self._config.get(CONF_SILENCE_TIMEOUT, DEFAULT_SILENCE_TIMEOUT))
+                recent_activity = bool(
+                    self._last_audio_activity
+                    and (loop_now - self._last_audio_activity) < max(5.0, silence_timeout)
+                )
+
+                max_timeout = int(self._config.get(CONF_MAX_SESSION_TIMEOUT, DEFAULT_MAX_SESSION_TIMEOUT))
+                max_deadline = self._session_started_at + max_timeout if max_timeout > 0 else 0
+                if recent_activity and (not max_deadline or now < max_deadline):
+                    grace = int(max(5.0, min(30.0, silence_timeout)))
+                    if max_deadline:
+                        grace = max(1, min(grace, int(max_deadline - now)))
+                    _LOGGER.info(
+                        "Session timeout reached, but audio activity is recent; extending by %ds",
+                        grace,
+                    )
+                    self._schedule_session_timeout(grace)
+                    return
+
+                reason = (
+                    f"max session timeout ({max_timeout}s)"
+                    if max_deadline and now >= max_deadline
+                    else f"session timeout ({timeout_seconds}s)"
+                )
+                _LOGGER.info(reason)
+                await self.async_stop_session(reason)
         except asyncio.CancelledError:
             pass
 
-    async def _switch_active_camera(self, camera_entity_id: str) -> None:
+    async def _switch_active_camera(self, camera_entity_id: str) -> dict[str, Any]:
         """Switch the live video feed to a different camera mid-session.
 
         This stops the current vision loop and restarts it with the new camera.
         If the new camera is Reolink, audio is also redirected.
         """
         _LOGGER.info("Switching active camera to: %s", camera_entity_id)
+        result: dict[str, Any] = {
+            "video_switched": False,
+            "audio_switched": False,
+            "audio_message": "Audio was not changed.",
+        }
         # Stop current vision loop
         if self._vision_task and not self._vision_task.done():
             self._vision_task.cancel()
@@ -1004,8 +1029,6 @@ class JeevesSessionManager:
 
         # Update the config to point to the new camera
         self._config[CONF_CAMERA_ENTITY] = camera_entity_id
-
-        # Keep Reolink audio discovery aligned with the active camera.
         if self._audio_handler and self._audio_handler.is_active:
             self._audio_handler._camera_entity_id = camera_entity_id
 
@@ -1013,7 +1036,55 @@ class JeevesSessionManager:
         if self._client and self._active:
             fps = float(self._config.get(CONF_VISION_FPS, DEFAULT_VISION_FPS))
             self._vision_task = asyncio.create_task(self._vision_loop(camera_entity_id, fps))
+            result["video_switched"] = True
             _LOGGER.info("Vision loop restarted with camera: %s", camera_entity_id)
+
+        store = getattr(self, "store", None)
+        placements = getattr(store, "camera_placements", []) if store else []
+        placement = next((cp for cp in placements if cp.entity_id == camera_entity_id), None)
+        if self._config.get(CONF_AUDIO_MODE) == AUDIO_MODE_REOLINK:
+            if placement and placement.has_audio:
+                await self._restart_reolink_audio_for_camera(camera_entity_id, placement)
+                result["audio_switched"] = bool(self._audio_handler and self._audio_handler.is_active)
+                result["audio_message"] = (
+                    "Two-way audio was switched to the selected camera."
+                    if result["audio_switched"]
+                    else "Video switched, but two-way audio could not be started on the selected camera."
+                )
+            else:
+                result["audio_message"] = (
+                    "Video switched. The selected camera is not marked as two-way-audio capable, "
+                    "so audio remains on the existing audio path."
+                )
+        return result
+
+    async def _restart_reolink_audio_for_camera(self, camera_entity_id: str, placement: Any) -> None:
+        """Restart the Reolink audio stack for a newly selected audio-capable camera."""
+        if self._talk_monitor:
+            await self._talk_monitor.stop()
+            self._talk_monitor = None
+        if self._interrupt_detector:
+            self._interrupt_detector.stop()
+            self._interrupt_detector = None
+        if self._audio_handler:
+            await self._audio_handler.stop()
+            self._audio_handler = None
+        await self._stop_mic_forwarder()
+
+        audio_config = dict(self._config)
+        audio_config[CONF_CAMERA_ENTITY] = camera_entity_id
+        # During a live switch, do not reuse the previous camera's explicit stream.
+        audio_config[CONF_GO2RTC_STREAM_NAME] = camera_entity_id
+        audio_config[CONF_GO2RTC_INPUT_STREAM_NAME] = camera_entity_id
+        audio_config[CONF_GO2RTC_OUTPUT_STREAM_NAME] = camera_entity_id
+        if getattr(placement, "audio_method", ""):
+            audio_config[CONF_REOLINK_MIC_METHOD] = placement.audio_method
+            audio_config[CONF_REOLINK_MIC_URL] = getattr(placement, "audio_url", "")
+        else:
+            audio_config[CONF_REOLINK_MIC_METHOD] = ""
+            audio_config[CONF_REOLINK_MIC_URL] = ""
+
+        await self._start_reolink_audio(audio_config)
 
     async def _ptz_auto_return(self) -> None:
         """Return all PTZ cameras moved during this session to their monitor positions."""
@@ -1462,7 +1533,11 @@ class JeevesSessionManager:
         # Handle camera switching
         switch_camera_id = result.pop("_switch_camera", None)
         if switch_camera_id:
-            self.hass.async_create_task(self._switch_active_camera(switch_camera_id))
+            switch_result = await self._switch_active_camera(switch_camera_id)
+            result.update(switch_result)
+            if not switch_result.get("video_switched"):
+                result["success"] = False
+                result["error"] = "Camera switch was requested but the live video feed did not restart."
 
         # Track PTZ-moved cameras for auto-return on session end
         ptz_moved = result.pop("_ptz_moved_camera", None)

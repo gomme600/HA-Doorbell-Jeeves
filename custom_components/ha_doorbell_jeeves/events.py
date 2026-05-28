@@ -94,7 +94,9 @@ class EventStore:
             event.timestamp = time.time()
         self._events.append(event)
         await self.async_save()
-        self._hass.bus.async_fire(EVENT_IMPORTANT, event.to_dict())
+        payload = event.to_dict()
+        payload["entry_id"] = self._entry_id
+        self._hass.bus.async_fire(EVENT_IMPORTANT, payload)
         _LOGGER.info("Stored important event: %s (%s)", event.title, event.id)
         return event.id
 

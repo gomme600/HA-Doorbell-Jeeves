@@ -1295,11 +1295,17 @@ async def _execute_switch_camera(
 
     managed = store.get_entity(camera_id)
     cam_name = managed.name if managed else camera_id
+    placement = next((cp for cp in store.camera_placements if cp.entity_id == camera_id), None)
+    audio_note = (
+        "Two-way audio will also be switched if the camera audio setup succeeds."
+        if placement and placement.has_audio
+        else "This camera is not marked as two-way-audio capable, so only video is expected to switch."
+    )
     _LOGGER.info("Switching active camera to %s (%s): %s", cam_name, camera_id, reason)
 
     return {
         "success": True,
-        "message": f"Switching live feed to {cam_name}. You will see the new view shortly.",
+        "message": f"Switching live video feed to {cam_name}. {audio_note}",
         "_switch_camera": camera_id,  # Special key: session manager processes this
     }
 
@@ -2102,6 +2108,11 @@ async def _execute_save_event(
         manager = hass.data[DOMAIN].get(entry_id)
         if manager and hasattr(manager, "_event_store"):
             event_store = manager._event_store
+    if not event_store and DOMAIN in hass.data:
+        for manager in hass.data[DOMAIN].values():
+            if manager and hasattr(manager, "_event_store"):
+                event_store = manager._event_store
+                break
 
     if not event_store:
         return {"error": "Event store not available"}
@@ -2161,6 +2172,11 @@ async def _execute_attach_event_photo(
         manager = hass.data[DOMAIN].get(entry_id)
         if manager and hasattr(manager, "_event_store"):
             event_store = manager._event_store
+    if not event_store and DOMAIN in hass.data:
+        for manager in hass.data[DOMAIN].values():
+            if manager and hasattr(manager, "_event_store"):
+                event_store = manager._event_store
+                break
 
     if not event_store or not event_store.events:
         return {"error": "No events to attach photo to"}

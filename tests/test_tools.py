@@ -5,11 +5,13 @@ from types import SimpleNamespace
 from typing import Any
 
 from custom_components.ha_doorbell_jeeves.const import DOMAIN, TOOL_PLAY_AUDIO
+from custom_components.ha_doorbell_jeeves.events import EventStore, EVENT_IMPORTANT
 from custom_components.ha_doorbell_jeeves.models import AudioFile, CameraPlacement, ManagedEntity
 from custom_components.ha_doorbell_jeeves.tools import (
     _execute_extend_session,
     _execute_play_audio,
     _execute_recall_memories,
+    _execute_save_event,
     build_gemini_tools,
     build_openai_tools,
 )
@@ -173,3 +175,27 @@ def test_execute_recall_memories_parses_and_clamps_hours(hass: object) -> None:
     assert memory_store.hours_calls[0] == 72
     assert memory_store.hours_calls[1] == 720
     assert memory_store.search_calls == ["alex"]
+
+
+def test_execute_save_event_falls_back_to_available_manager_and_fires_entry_event(hass: object) -> None:
+    event_store = EventStore(hass, "entry-1")
+    manager = SimpleNamespace(_event_store=event_store)
+    hass.data = {DOMAIN: {"entry-1": manager}}
+
+    result = asyncio.run(
+        _execute_save_event(
+            hass,
+            _DummyStore(),
+            {
+                "title": "Security risk",
+                "description": "A suspicious visitor was seen near the side gate.",
+                "severity": "urgent",
+            },
+            {},
+        )
+    )
+
+    assert result["success"] is True
+    assert event_store.events[0].title == "Security risk"
+    assert hass.bus.events[-1][0] == EVENT_IMPORTANT
+    assert hass.bus.events[-1][1]["entry_id"] == "entry-1"

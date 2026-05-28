@@ -27,7 +27,7 @@ from typing import Any
 _LOGGER = logging.getLogger(__name__)
 
 # Debounce: wait this long after last transcript before triggering tool check
-TOOL_CHECK_DEBOUNCE_S = 1.5
+TOOL_CHECK_DEBOUNCE_S = 0.5
 
 
 class ToolRouter:
