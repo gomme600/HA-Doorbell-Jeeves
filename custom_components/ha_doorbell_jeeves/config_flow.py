@@ -37,8 +37,8 @@ from .const import (
     AUDIO_OUTPUT_EVENT,
     AUDIO_OUTPUT_GO2RTC,
     AUDIO_OUTPUT_MEDIA_PLAYER,
-    CAMERA_FACINGS,
-    CAMERA_SIDES,
+    CAMERA_FACINGS,  # noqa: F401 - kept for backward compat
+    CAMERA_SIDES,  # noqa: F401 - kept for backward compat
     CONF_API_BASE_URL,
     CONF_API_KEY,
     CONF_AUDIO_MANUAL_MODE,
@@ -850,9 +850,9 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
             placement = CameraPlacement(
                 entity_id=user_input["entity_id"],
                 name=user_input["name"],
-                side=user_input["side"],
-                offset=float(user_input["offset"]),
-                facing=user_input["facing"],
+                x=float(user_input.get("x", 0.5)),
+                y=float(user_input.get("y", 0.5)),
+                rotation=float(user_input.get("rotation", 0)),
                 area_description=user_input.get("area_description", ""),
                 is_doorbell=user_input.get("is_doorbell", False),
                 ptz_up=_clean_text(user_input.get("ptz_up", "")),
@@ -872,23 +872,9 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
         schema: dict[Any, Any] = {
             vol.Required("entity_id"): EntitySelector(EntitySelectorConfig(domain="camera")),
             vol.Required("name"): TextSelector(),
-            vol.Required("side", default=CAMERA_SIDES[0]): SelectSelector(
-                SelectSelectorConfig(
-                    options=[{"value": side, "label": side.title()} for side in CAMERA_SIDES],
-                    mode=SelectSelectorMode.DROPDOWN,
-                )
-            ),
-            vol.Required("offset", default=0.5): NumberSelector(
-                NumberSelectorConfig(min=0, max=1, step=0.1, mode=NumberSelectorMode.SLIDER)
-            ),
-            vol.Required("facing", default=CAMERA_FACINGS[0]): SelectSelector(
-                SelectSelectorConfig(
-                    options=[
-                        {"value": facing, "label": facing.replace("_", " ").title()}
-                        for facing in CAMERA_FACINGS
-                    ],
-                    mode=SelectSelectorMode.DROPDOWN,
-                )
+            vol.Required("rotation", default=0): NumberSelector(
+                NumberSelectorConfig(min=0, max=360, step=5, mode=NumberSelectorMode.SLIDER,
+                                     unit_of_measurement="°")
             ),
             vol.Optional("area_description", default=""): TextSelector(TextSelectorConfig(multiline=True)),
             vol.Optional("is_doorbell", default=False): BooleanSelector(),
@@ -902,6 +888,10 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
         return self.async_show_form(
             step_id="add_camera_placement",
             data_schema=vol.Schema(schema),
+            description_placeholders={
+                "tip": "Use the Camera Map card on your dashboard for visual placement. "
+                       "This form is for basic setup only."
+            },
         )
 
     async def async_step_remove_camera_placement(self, user_input: dict[str, Any] | None = None) -> FlowResult:
