@@ -828,13 +828,15 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
     async def async_step_camera_map(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         store = await self._async_get_store()
         placements: list[CameraPlacement] = getattr(store, CONF_CAMERA_PLACEMENTS)
-        items = [
-            f"{placement.name} ({placement.entity_id}) — {placement.side} side, facing {placement.facing}"
-            for placement in placements
-        ]
+        items = []
+        for p in placements:
+            audio_badge = " 🎙" if p.has_audio else ""
+            doorbell_badge = " 🔔" if p.is_doorbell else ""
+            items.append(f"{p.name} ({p.entity_id}) — {int(p.rotation)}°{doorbell_badge}{audio_badge}")
+        menu_opts = ["add_camera_placement", "edit_camera_placement", "verify_camera_audio", "remove_camera_placement", "init"]
         return self.async_show_menu(
             step_id="camera_map",
-            menu_options=["add_camera_placement", "remove_camera_placement", "init"],
+            menu_options=menu_opts,
             description_placeholders={
                 "camera_summary": "**Mapped Cameras:**\n"
                 + ("\n".join(f"• {item}" for item in items) if items else "None configured")
@@ -923,6 +925,222 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                 }
             ),
         )
+
+    async def async_step_edit_camera_placement(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Edit an existing camera placement — pre-fills all current values."""
+        store = await self._async_get_store()
+        placements: list[CameraPlacement] = getattr(store, CONF_CAMERA_PLACEMENTS)
+
+        if not placements:
+            return await self.async_step_camera_map()
+
+        # Phase 1: Select which camera to edit
+        if user_input is not None and "entity_id" in user_input and "name" not in user_input:
+            # Store selection and show edit form
+            self._edit_camera_entity_id = user_input["entity_id"]
+            existing = next((p for p in placements if p.entity_id == user_input["entity_id"]), None)
+            if not existing:
+                return await self.async_step_camera_map()
+
+            schema: dict[Any, Any] = {
+                vol.Required("name", default=existing.name): TextSelector(),
+                vol.Required("rotation", default=int(existing.rotation)): NumberSelector(
+                    NumberSelectorConfig(min=0, max=360, step=5, mode=NumberSelectorMode.SLIDER,
+                                         unit_of_measurement="°")
+                ),
+                vol.Optional("area_description", default=existing.area_description or ""): TextSelector(
+                    TextSelectorConfig(multiline=True)
+                ),
+                vol.Optional("is_doorbell", default=existing.is_doorbell): BooleanSelector(),
+                vol.Optional("has_audio", default=existing.has_audio): BooleanSelector(),
+            }
+            ptz_selector = EntitySelectorConfig(domain=["button", "script"])
+            _add_optional_entity_selector(schema, "ptz_up", existing.ptz_up or None, ptz_selector)
+            _add_optional_entity_selector(schema, "ptz_down", existing.ptz_down or None, ptz_selector)
+            _add_optional_entity_selector(schema, "ptz_left", existing.ptz_left or None, ptz_selector)
+            _add_optional_entity_selector(schema, "ptz_right", existing.ptz_right or None, ptz_selector)
+            _add_optional_entity_selector(schema, "ptz_return_to_monitor", existing.ptz_return_to_monitor or None, ptz_selector)
+            return self.async_show_form(
+                step_id="edit_camera_placement_form",
+                data_schema=vol.Schema(schema),
+                description_placeholders={"camera_name": existing.name},
+            )
+
+        # Phase 1: Show selector
+        options = [
+            {"value": p.entity_id, "label": f"{p.name} ({p.entity_id})"}
+            for p in placements
+        ]
+        return self.async_show_form(
+            step_id="edit_camera_placement",
+            data_schema=vol.Schema(
+                {
+                    vol.Required("entity_id"): SelectSelector(
+                        SelectSelectorConfig(options=options, mode=SelectSelectorMode.DROPDOWN)
+                    )
+                }
+            ),
+        )
+
+    async def async_step_edit_camera_placement_form(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Save the edited camera placement."""
+        if user_input is None:
+            return await self.async_step_camera_map()
+
+        store = await self._async_get_store()
+        placements: list[CameraPlacement] = getattr(store, CONF_CAMERA_PLACEMENTS)
+        entity_id = getattr(self, "_edit_camera_entity_id", None)
+        if not entity_id:
+            return await self.async_step_camera_map()
+
+        # Find existing to preserve x/y coordinates (set via dashboard card)
+        existing = next((p for p in placements if p.entity_id == entity_id), None)
+        x = existing.x if existing else 0.5
+        y = existing.y if existing else 0.5
+
+        updated = CameraPlacement(
+            entity_id=entity_id,
+            name=user_input["name"],
+            x=x,
+            y=y,
+            rotation=float(user_input.get("rotation", 0)),
+            area_description=user_input.get("area_description", ""),
+            is_doorbell=user_input.get("is_doorbell", False),
+            has_audio=user_input.get("has_audio", False),
+            ptz_up=_clean_text(user_input.get("ptz_up", "")),
+            ptz_down=_clean_text(user_input.get("ptz_down", "")),
+            ptz_left=_clean_text(user_input.get("ptz_left", "")),
+            ptz_right=_clean_text(user_input.get("ptz_right", "")),
+            ptz_return_to_monitor=_clean_text(user_input.get("ptz_return_to_monitor", "")),
+        )
+        # Preserve cached audio fields if not changed
+        if existing and existing.audio_method and user_input.get("has_audio", False):
+            updated.audio_method = existing.audio_method
+            updated.audio_url = existing.audio_url
+
+        setattr(
+            store,
+            CONF_CAMERA_PLACEMENTS,
+            [p for p in placements if p.entity_id != entity_id] + [updated],
+        )
+        await store.async_save_entities()
+        return await self.async_step_camera_map()
+
+    async def async_step_verify_camera_audio(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Verify 2-way audio works for a camera by probing its stream paths."""
+        store = await self._async_get_store()
+        placements: list[CameraPlacement] = getattr(store, CONF_CAMERA_PLACEMENTS)
+
+        # Include doorbell camera from main config + all placements with has_audio
+        doorbell_entity = self._data.get(CONF_CAMERA_ENTITY, "")
+        audio_cameras: list[dict[str, str]] = []
+        if doorbell_entity:
+            audio_cameras.append({"value": doorbell_entity, "label": f"🔔 Doorbell ({doorbell_entity})"})
+        for p in placements:
+            if p.has_audio and p.entity_id != doorbell_entity:
+                audio_cameras.append({"value": p.entity_id, "label": f"🎙 {p.name} ({p.entity_id})"})
+
+        if not audio_cameras:
+            return self.async_show_form(
+                step_id="verify_camera_audio",
+                data_schema=vol.Schema({}),
+                errors={"base": "no_audio_cameras"},
+            )
+
+        if user_input is not None and "entity_id" in user_input:
+            # Run audio verification
+            entity_id = user_input["entity_id"]
+            result = await self._verify_audio_stream(entity_id)
+
+            if result["success"]:
+                # Cache result
+                for p in placements:
+                    if p.entity_id == entity_id:
+                        p.audio_method = result["method"]
+                        p.audio_url = result["url"]
+                        break
+                await store.async_save_entities()
+
+                return self.async_show_form(
+                    step_id="verify_camera_audio_result",
+                    data_schema=vol.Schema({}),
+                    description_placeholders={
+                        "result": f"✅ **Audio verified!**\n\n"
+                                  f"- **Camera:** `{entity_id}`\n"
+                                  f"- **Method:** {result['method']}\n"
+                                  f"- **URL:** `{result['url'][:80]}...`\n\n"
+                                  f"2-way audio is working for this camera."
+                    },
+                )
+            else:
+                return self.async_show_form(
+                    step_id="verify_camera_audio_result",
+                    data_schema=vol.Schema({}),
+                    description_placeholders={
+                        "result": f"❌ **Audio verification failed**\n\n"
+                                  f"- **Camera:** `{entity_id}`\n"
+                                  f"- **Error:** {result['error']}\n\n"
+                                  f"Make sure go2rtc is configured or the camera supports RTSP audio backchannel."
+                    },
+                )
+
+        return self.async_show_form(
+            step_id="verify_camera_audio",
+            data_schema=vol.Schema(
+                {
+                    vol.Required("entity_id"): SelectSelector(
+                        SelectSelectorConfig(options=audio_cameras, mode=SelectSelectorMode.DROPDOWN)
+                    )
+                }
+            ),
+        )
+
+    async def async_step_verify_camera_audio_result(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Show verification result and return to camera map."""
+        return await self.async_step_camera_map()
+
+    async def _verify_audio_stream(self, camera_entity: str) -> dict[str, Any]:
+        """Probe audio stream path for a camera entity."""
+        try:
+            from .reolink_audio import (  # noqa: PLC0415
+                ReolinkAudioHandler,
+                _discover_go2rtc_url,
+                find_reolink_entry_for_camera,
+            )
+
+            hass = self.hass
+            handler = ReolinkAudioHandler(hass, "verify_probe", lambda x: None)
+            handler._camera_entity_id = camera_entity
+            reolink_entry_id = find_reolink_entry_for_camera(hass, camera_entity)
+            if reolink_entry_id:
+                handler._reolink_entry_id = reolink_entry_id
+            await handler._discover_reolink_details()
+
+            # Check go2rtc
+            go2rtc_url = await _discover_go2rtc_url(hass)
+            if go2rtc_url and handler._camera_unique_id:
+                import aiohttp  # noqa: PLC0415
+                stream_name = handler._camera_unique_id
+                api_url = f"{go2rtc_url}/api/streams?src={stream_name}"
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(api_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                            if resp.status == 200:
+                                return {"success": True, "method": "go2rtc", "url": f"{go2rtc_url}/api/ws?src={stream_name}"}
+                except Exception:
+                    pass
+
+            # RTSP fallback
+            if handler._reolink_rtsp_url:
+                return {"success": True, "method": "rtsp", "url": handler._reolink_rtsp_url}
+
+            # FLV fallback
+            if handler._reolink_flv_url:
+                return {"success": True, "method": "flv", "url": handler._reolink_flv_url}
+
+            return {"success": False, "error": "No audio stream path found (go2rtc/RTSP/FLV all unavailable)"}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
 
     async def async_step_audio(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         if user_input is not None:

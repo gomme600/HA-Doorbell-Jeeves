@@ -70,6 +70,8 @@
         "description": "Manage spatial camera placements used for property awareness and PTZ navigation. {camera_summary}",
         "menu_options": {
           "add_camera_placement": "\u2795 Add Camera Placement",
+          "edit_camera_placement": "\u270f\ufe0f Edit Camera Placement",
+          "verify_camera_audio": "\ud83d\udd0a Verify 2-Way Audio",
           "remove_camera_placement": "\u2796 Remove Camera Placement",
           "init": "\u2190 Back to Menu"
         }
@@ -90,6 +92,40 @@
           "ptz_right": "PTZ Right Control",
           "ptz_return_to_monitor": "PTZ Return-to-Monitor Control"
         }
+      },
+      "edit_camera_placement": {
+        "title": "Edit Camera Placement",
+        "description": "Select a camera to edit its settings.",
+        "data": {
+          "entity_id": "Camera to Edit"
+        }
+      },
+      "edit_camera_placement_form": {
+        "title": "Edit Camera: {camera_name}",
+        "description": "Update the camera placement settings. X/Y position is set via the dashboard card.",
+        "data": {
+          "name": "Display Name",
+          "rotation": "Facing Direction (degrees)",
+          "area_description": "Area Description (what the camera covers)",
+          "is_doorbell": "Is Doorbell Camera",
+          "has_audio": "2-Way Audio (mic + speaker)",
+          "ptz_up": "PTZ Up Control",
+          "ptz_down": "PTZ Down Control",
+          "ptz_left": "PTZ Left Control",
+          "ptz_right": "PTZ Right Control",
+          "ptz_return_to_monitor": "PTZ Return-to-Monitor Control"
+        }
+      },
+      "verify_camera_audio": {
+        "title": "Verify 2-Way Audio",
+        "description": "Select a camera to test its audio stream. Checks go2rtc, RTSP, and FLV availability.",
+        "data": {
+          "entity_id": "Camera to Verify"
+        }
+      },
+      "verify_camera_audio_result": {
+        "title": "Audio Verification Result",
+        "description": "{result}"
       },
       "remove_camera_placement": {
         "title": "Remove Camera Placement",
@@ -127,7 +163,8 @@
       "invalid_api_key": "Could not validate the API key. Please check it and try again.",
       "no_reolink_found": "No active Reolink integrations found. Please set up your Reolink doorbell in Home Assistant first.",
       "invalid_speaker_entity": "Speaker must be a valid media_player entity.",
-      "invalid_microphone_entity": "Microphone must be a valid assist_satellite or media_player entity."
+      "invalid_microphone_entity": "Microphone must be a valid assist_satellite or media_player entity.",
+      "no_audio_cameras": "No cameras with 2-way audio enabled. Enable 'has_audio' on a camera placement first or add a doorbell camera."
     },
     "abort": {
       "already_configured": "This doorbell is already configured."
@@ -473,6 +510,8 @@
         "description": "Manage spatial camera placements used for property awareness and PTZ navigation. {camera_summary}",
         "menu_options": {
           "add_camera_placement": "\u2795 Add Camera Placement",
+          "edit_camera_placement": "\u270f\ufe0f Edit Camera Placement",
+          "verify_camera_audio": "\ud83d\udd0a Verify 2-Way Audio",
           "remove_camera_placement": "\u2796 Remove Camera Placement",
           "init": "\u2190 Back to Menu"
         }
@@ -493,6 +532,40 @@
           "ptz_right": "PTZ Right Control",
           "ptz_return_to_monitor": "PTZ Return-to-Monitor Control"
         }
+      },
+      "edit_camera_placement": {
+        "title": "Edit Camera Placement",
+        "description": "Select a camera to edit its settings.",
+        "data": {
+          "entity_id": "Camera to Edit"
+        }
+      },
+      "edit_camera_placement_form": {
+        "title": "Edit Camera: {camera_name}",
+        "description": "Update the camera placement settings. X/Y position is set via the dashboard card.",
+        "data": {
+          "name": "Display Name",
+          "rotation": "Facing Direction (degrees)",
+          "area_description": "Area Description (what the camera covers)",
+          "is_doorbell": "Is Doorbell Camera",
+          "has_audio": "2-Way Audio (mic + speaker)",
+          "ptz_up": "PTZ Up Control",
+          "ptz_down": "PTZ Down Control",
+          "ptz_left": "PTZ Left Control",
+          "ptz_right": "PTZ Right Control",
+          "ptz_return_to_monitor": "PTZ Return-to-Monitor Control"
+        }
+      },
+      "verify_camera_audio": {
+        "title": "Verify 2-Way Audio",
+        "description": "Select a camera to test its audio stream. Checks go2rtc, RTSP, and FLV availability.",
+        "data": {
+          "entity_id": "Camera to Verify"
+        }
+      },
+      "verify_camera_audio_result": {
+        "title": "Audio Verification Result",
+        "description": "{result}"
       },
       "remove_camera_placement": {
         "title": "Remove Camera Placement",
@@ -529,7 +602,8 @@
     "error": {
       "llmvision_not_found": "LLM Vision is not installed or not loaded. Install/configure it first.",
       "invalid_speaker_entity": "Speaker must be a valid media_player entity.",
-      "invalid_microphone_entity": "Microphone must be a valid assist_satellite or media_player entity."
+      "invalid_microphone_entity": "Microphone must be a valid assist_satellite or media_player entity.",
+      "no_audio_cameras": "No cameras with 2-way audio enabled. Enable 'has_audio' on a camera placement first or add a doorbell camera."
     }
   }
 }
