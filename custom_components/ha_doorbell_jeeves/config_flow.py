@@ -1444,7 +1444,9 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                 "add_action",
                 "edit_action",
                 "add_notification",
+                "edit_notification",
                 "add_audio_file",
+                "edit_audio_file",
                 "remove_entity",
                 "remove_action",
                 "remove_notification",
@@ -1945,6 +1947,64 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
             ),
         )
 
+    async def async_step_edit_notification(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Edit an existing notification target."""
+        store = await self._async_get_store()
+        targets = store.notification_targets
+
+        if not targets:
+            return await self.async_step_entities()
+
+        # Phase 1: Select notification
+        if user_input is not None and "service" in user_input and "name" not in user_input:
+            self._edit_notification_service = user_input["service"]
+            existing = next((t for t in targets if t.service == user_input["service"]), None)
+            if not existing:
+                return await self.async_step_entities()
+            return self.async_show_form(
+                step_id="edit_notification_form",
+                data_schema=vol.Schema(
+                    {
+                        vol.Required("name", default=existing.name): TextSelector(),
+                        vol.Required("description", default=existing.description): TextSelector(TextSelectorConfig(multiline=True)),
+                    }
+                ),
+                description_placeholders={"notification_name": existing.name},
+            )
+
+        options = [{"value": t.service, "label": f"{t.name} ({t.service})"} for t in targets]
+        return self.async_show_form(
+            step_id="edit_notification",
+            data_schema=vol.Schema(
+                {
+                    vol.Required("service"): SelectSelector(
+                        SelectSelectorConfig(options=options, mode=SelectSelectorMode.DROPDOWN)
+                    )
+                }
+            ),
+        )
+
+    async def async_step_edit_notification_form(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Save edited notification target."""
+        if user_input is None:
+            return await self.async_step_entities()
+
+        store = await self._async_get_store()
+        old_service = getattr(self, "_edit_notification_service", None)
+        if not old_service:
+            return await self.async_step_entities()
+
+        # Remove old and add updated (service stays the same)
+        await store.async_remove_notification(old_service)
+        await store.async_add_notification(
+            NotificationTarget(
+                service=old_service,
+                name=user_input["name"],
+                description=user_input["description"],
+            )
+        )
+        return await self.async_step_entities()
+
     async def async_step_add_audio_file(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         """Add an audio file the agent can play over speakers."""
         from .models import AudioFile  # noqa: PLC0415
@@ -2019,6 +2079,87 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                 }
             ),
         )
+
+    async def async_step_edit_audio_file(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Edit an existing audio file."""
+        from .models import AudioFile  # noqa: PLC0415
+
+        store = await self._async_get_store()
+
+        if not store.audio_files:
+            return await self.async_step_entities()
+
+        # Phase 1: Select audio file
+        if user_input is not None and "audio_id" in user_input and "name" not in user_input:
+            self._edit_audio_file_id = user_input["audio_id"]
+            existing = next((af for af in store.audio_files if af.id == user_input["audio_id"]), None)
+            if not existing:
+                return await self.async_step_entities()
+            return self.async_show_form(
+                step_id="edit_audio_file_form",
+                data_schema=vol.Schema(
+                    {
+                        vol.Required("name", default=existing.name): TextSelector(),
+                        vol.Required("media_id", default=existing.media_id): TextSelector(),
+                        vol.Optional("description", default=existing.description or ""): TextSelector(
+                            TextSelectorConfig(multiline=True)
+                        ),
+                        vol.Optional("category", default=existing.category or ""): TextSelector(),
+                        vol.Optional("media_type", default=existing.media_type or "music"): SelectSelector(
+                            SelectSelectorConfig(
+                                options=[
+                                    {"value": "music", "label": "Music/Audio"},
+                                    {"value": "sound", "label": "Sound Effect"},
+                                ],
+                                mode=SelectSelectorMode.DROPDOWN,
+                            )
+                        ),
+                    }
+                ),
+                description_placeholders={"audio_name": existing.name},
+            )
+
+        options = [
+            {"value": af.id, "label": f"{af.name} ({af.category or 'General'})"}
+            for af in store.audio_files
+        ]
+        return self.async_show_form(
+            step_id="edit_audio_file",
+            data_schema=vol.Schema(
+                {
+                    vol.Required("audio_id"): SelectSelector(
+                        SelectSelectorConfig(options=options, mode=SelectSelectorMode.DROPDOWN)
+                    )
+                }
+            ),
+        )
+
+    async def async_step_edit_audio_file_form(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Save edited audio file."""
+        from .models import AudioFile  # noqa: PLC0415
+
+        if user_input is None:
+            return await self.async_step_entities()
+
+        store = await self._async_get_store()
+        audio_id = getattr(self, "_edit_audio_file_id", None)
+        if not audio_id:
+            return await self.async_step_entities()
+
+        # Update in-place
+        for i, af in enumerate(store.audio_files):
+            if af.id == audio_id:
+                store.audio_files[i] = AudioFile(
+                    id=audio_id,
+                    name=user_input["name"],
+                    description=user_input.get("description", ""),
+                    media_id=user_input["media_id"],
+                    media_type=user_input.get("media_type", "music"),
+                    category=user_input.get("category", ""),
+                )
+                break
+        await store.async_save_entities()
+        return await self.async_step_entities()
 
     async def async_step_security(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         if user_input is not None:
@@ -2116,7 +2257,7 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
         items = [instruction.title for instruction in instructions]
         return self.async_show_menu(
             step_id="task_instructions",
-            menu_options=["add_task_instruction", "remove_task_instruction", "init"],
+            menu_options=["add_task_instruction", "edit_task_instruction", "remove_task_instruction", "init"],
             description_placeholders={
                 "instruction_summary": "**Current Instructions:**\n"
                 + ("\n".join(f"• {item}" for item in items) if items else "None configured")
@@ -2174,6 +2315,66 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
             ),
         )
 
+    async def async_step_edit_task_instruction(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Edit an existing task instruction."""
+        store = await self._async_get_store()
+        instructions: list[TaskInstruction] = getattr(store, CONF_TASK_INSTRUCTIONS)
+
+        if not instructions:
+            return await self.async_step_task_instructions()
+
+        # Phase 1: Select instruction
+        if user_input is not None and "title" in user_input and "text" not in user_input:
+            self._edit_instruction_title = user_input["title"]
+            existing = next((i for i in instructions if i.title == user_input["title"]), None)
+            if not existing:
+                return await self.async_step_task_instructions()
+            return self.async_show_form(
+                step_id="edit_task_instruction_form",
+                data_schema=vol.Schema(
+                    {
+                        vol.Required("title", default=existing.title): TextSelector(),
+                        vol.Required("text", default=existing.text): TextSelector(TextSelectorConfig(multiline=True)),
+                    }
+                ),
+                description_placeholders={"instruction_title": existing.title},
+            )
+
+        options = [{"value": i.title, "label": i.title} for i in instructions]
+        return self.async_show_form(
+            step_id="edit_task_instruction",
+            data_schema=vol.Schema(
+                {
+                    vol.Required("title"): SelectSelector(
+                        SelectSelectorConfig(options=options, mode=SelectSelectorMode.DROPDOWN)
+                    )
+                }
+            ),
+        )
+
+    async def async_step_edit_task_instruction_form(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Save edited task instruction."""
+        if user_input is None:
+            return await self.async_step_task_instructions()
+
+        store = await self._async_get_store()
+        instructions: list[TaskInstruction] = getattr(store, CONF_TASK_INSTRUCTIONS)
+        old_title = getattr(self, "_edit_instruction_title", None)
+        if not old_title:
+            return await self.async_step_task_instructions()
+
+        updated = TaskInstruction(
+            title=_clean_text(user_input["title"]),
+            text=user_input["text"],
+        )
+        setattr(
+            store,
+            CONF_TASK_INSTRUCTIONS,
+            [i for i in instructions if i.title != old_title] + [updated],
+        )
+        await store.async_save_entities()
+        return await self.async_step_task_instructions()
+
     async def async_step_identities(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         from .models import KnownIdentity  # noqa: PLC0415
 
@@ -2181,7 +2382,7 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
         items = [f"{identity.name} ({identity.identity_type}, {identity.relationship})" for identity in store.known_identities]
         return self.async_show_menu(
             step_id="identities",
-            menu_options=["add_identity", "remove_identity", "identity_settings", "init"],
+            menu_options=["add_identity", "edit_identity", "remove_identity", "identity_settings", "init"],
             description_placeholders={
                 "identity_summary": "**Known Identities:**\n" + ("\n".join(f"• {item}" for item in items) if items else "None configured")
             },
@@ -2277,6 +2478,124 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                 }
             ),
         )
+
+    async def async_step_edit_identity(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Edit an existing known identity."""
+        from .models import KnownIdentity  # noqa: PLC0415
+
+        store = await self._async_get_store()
+        identities = store.known_identities
+
+        if not identities:
+            return await self.async_step_identities()
+
+        # Phase 1: Select identity
+        if user_input is not None and "name" in user_input and "description" not in user_input:
+            self._edit_identity_name = user_input["name"]
+            existing = next((i for i in identities if i.name == user_input["name"]), None)
+            if not existing:
+                return await self.async_step_identities()
+            return self.async_show_form(
+                step_id="edit_identity_form",
+                data_schema=vol.Schema(
+                    {
+                        vol.Required("name", default=existing.name): TextSelector(),
+                        vol.Required("identity_type", default=existing.identity_type): SelectSelector(
+                            SelectSelectorConfig(
+                                options=[
+                                    {"value": "person", "label": "Person"},
+                                    {"value": "animal", "label": "Animal"},
+                                    {"value": "object", "label": "Object/Vehicle"},
+                                ],
+                                mode=SelectSelectorMode.DROPDOWN,
+                            )
+                        ),
+                        vol.Required("relationship", default=existing.relationship): SelectSelector(
+                            SelectSelectorConfig(
+                                options=[
+                                    {"value": "owner", "label": "Owner"},
+                                    {"value": "family", "label": "Family"},
+                                    {"value": "friend", "label": "Friend"},
+                                    {"value": "pet", "label": "Pet"},
+                                    {"value": "delivery", "label": "Delivery"},
+                                    {"value": "guest", "label": "Guest"},
+                                ],
+                                mode=SelectSelectorMode.DROPDOWN,
+                            )
+                        ),
+                        vol.Required("description", default=existing.description): TextSelector(TextSelectorConfig(multiline=True)),
+                        vol.Required("access_level", default=existing.access_level): SelectSelector(
+                            SelectSelectorConfig(
+                                options=[
+                                    {"value": "full", "label": "Full Access"},
+                                    {"value": "limited", "label": "Limited Access"},
+                                    {"value": "guest", "label": "Guest (no access)"},
+                                    {"value": "none", "label": "Blocked"},
+                                ],
+                                mode=SelectSelectorMode.DROPDOWN,
+                            )
+                        ),
+                        vol.Optional("reference_image", default=""): TextSelector(TextSelectorConfig(type="text")),
+                        vol.Optional("notes", default=existing.notes or ""): TextSelector(TextSelectorConfig(multiline=True)),
+                    }
+                ),
+                description_placeholders={"identity_name": existing.name},
+            )
+
+        options = [{"value": i.name, "label": f"{i.name} ({i.identity_type})"} for i in identities]
+        return self.async_show_form(
+            step_id="edit_identity",
+            data_schema=vol.Schema(
+                {
+                    vol.Required("name"): SelectSelector(
+                        SelectSelectorConfig(options=options, mode=SelectSelectorMode.DROPDOWN)
+                    )
+                }
+            ),
+        )
+
+    async def async_step_edit_identity_form(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Save edited identity."""
+        from .models import KnownIdentity  # noqa: PLC0415
+
+        if user_input is None:
+            return await self.async_step_identities()
+
+        store = await self._async_get_store()
+        old_name = getattr(self, "_edit_identity_name", None)
+        if not old_name:
+            return await self.async_step_identities()
+
+        # Handle image
+        image_data = user_input.get("reference_image", "").strip()
+        image_b64: str | None = None
+        if image_data:
+            if image_data.startswith(("http://", "https://")):
+                image_b64 = await self._download_image_as_base64(image_data)
+            elif image_data.startswith("/"):
+                image_b64 = await self._read_local_image_as_base64(image_data)
+            else:
+                image_b64 = image_data
+        else:
+            # Preserve existing image if not re-uploaded
+            existing = next((i for i in store.known_identities if i.name == old_name), None)
+            if existing:
+                image_b64 = existing.image_base64
+
+        # Remove old and add updated
+        await store.async_remove_identity(old_name)
+        await store.async_add_identity(
+            KnownIdentity(
+                name=user_input["name"],
+                identity_type=user_input.get("identity_type", "person"),
+                relationship=user_input.get("relationship", "guest"),
+                description=user_input.get("description", ""),
+                access_level=user_input.get("access_level", "guest"),
+                image_base64=image_b64,
+                notes=user_input.get("notes", ""),
+            )
+        )
+        return await self.async_step_identities()
 
     async def async_step_identity_settings(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         if user_input is not None:

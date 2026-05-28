@@ -277,7 +277,9 @@
           "add_action": "⚡ Add Action",
           "edit_action": "🛠️ Edit Action",
           "add_notification": "🔔 Add Notification Target",
+          "edit_notification": "✏️ Edit Notification",
           "add_audio_file": "🔊 Add Audio File",
+          "edit_audio_file": "✏️ Edit Audio File",
           "remove_entity": "➖ Remove Entity",
           "remove_action": "🗑️ Remove Action",
           "remove_notification": "🗑️ Remove Notification Target",
@@ -412,6 +414,7 @@
         "description": "Manage known people, animals, and objects that the AI should recognize. {identity_summary}",
         "menu_options": {
           "add_identity": "➕ Add Identity",
+          "edit_identity": "✏️ Edit Identity",
           "remove_identity": "➖ Remove Identity",
           "identity_settings": "⚙️ Identity Detection Settings",
           "init": "← Back to Menu"
@@ -573,6 +576,7 @@
         "description": "Manage extra prompt instructions appended to Jeeves for specific duties. {instruction_summary}",
         "menu_options": {
           "add_task_instruction": "➕ Add Instruction",
+          "edit_task_instruction": "✏️ Edit Instruction",
           "remove_task_instruction": "➖ Remove Instruction",
           "init": "← Back to Menu"
         }
@@ -612,6 +616,74 @@
           "ptz_left": "PTZ Left Control",
           "ptz_right": "PTZ Right Control",
           "ptz_return_to_monitor": "PTZ Return-to-Monitor Control"
+        }
+      },
+      "edit_task_instruction": {
+        "title": "Edit Task Instruction",
+        "description": "Select an instruction to edit.",
+        "data": {
+          "title": "Instruction to Edit"
+        }
+      },
+      "edit_task_instruction_form": {
+        "title": "Edit Instruction: {instruction_title}",
+        "description": "Modify the instruction title and content.",
+        "data": {
+          "title": "Title",
+          "text": "Instruction Text"
+        }
+      },
+      "edit_identity": {
+        "title": "Edit Identity",
+        "description": "Select an identity to edit.",
+        "data": {
+          "name": "Identity to Edit"
+        }
+      },
+      "edit_identity_form": {
+        "title": "Edit Identity: {identity_name}",
+        "description": "Update identity details. Leave reference image empty to keep the existing one.",
+        "data": {
+          "name": "Name",
+          "identity_type": "Type",
+          "relationship": "Relationship",
+          "description": "Description",
+          "access_level": "Access Level",
+          "reference_image": "Reference Image (URL or path, leave empty to keep current)",
+          "notes": "Additional Notes"
+        }
+      },
+      "edit_notification": {
+        "title": "Edit Notification",
+        "description": "Select a notification target to edit.",
+        "data": {
+          "service": "Notification to Edit"
+        }
+      },
+      "edit_notification_form": {
+        "title": "Edit Notification: {notification_name}",
+        "description": "Update the notification name and description.",
+        "data": {
+          "name": "Display Name",
+          "description": "Description (when to notify this target)"
+        }
+      },
+      "edit_audio_file": {
+        "title": "Edit Audio File",
+        "description": "Select an audio file to edit.",
+        "data": {
+          "audio_id": "Audio File to Edit"
+        }
+      },
+      "edit_audio_file_form": {
+        "title": "Edit Audio: {audio_name}",
+        "description": "Update the audio file settings.",
+        "data": {
+          "name": "Display Name",
+          "media_id": "Media Content ID (URL or media source path)",
+          "description": "Description (when to play this)",
+          "category": "Category",
+          "media_type": "Media Type"
         }
       }
     },
