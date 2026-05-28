@@ -494,7 +494,9 @@ class DoorbellJeevesConfigFlow(ConfigFlow, domain=DOMAIN):
 
     async def async_step_provider(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         errors: dict[str, str] = {}
-        description_placeholders: dict[str, str] = {}
+        description_placeholders: dict[str, str] = {
+            "model_hint": "e.g. gemini-2.5-flash-native-audio-latest",
+        }
         provider = self._data.get(CONF_PROVIDER, PROVIDER_GEMINI)
         default_model = DEFAULT_MODEL_GEMINI if provider == PROVIDER_GEMINI else DEFAULT_MODEL_OPENAI
         default_voice = DEFAULT_VOICE_GEMINI if provider == PROVIDER_GEMINI else DEFAULT_VOICE_OPENAI
