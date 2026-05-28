@@ -70,8 +70,14 @@ def test_build_gemini_tools_omits_empty_target_enum() -> None:
     tools = build_gemini_tools(store)
     declarations = tools[0].function_declarations
     play_audio = next(declaration for declaration in declarations if declaration.name == TOOL_PLAY_AUDIO)
-    target = play_audio.parameters["properties"]["target_entity_id"]
-    assert "enum" not in target
+    params = play_audio.parameters
+    if isinstance(params, dict):
+        target = params["properties"]["target_entity_id"]
+        assert "enum" not in target
+        return
+
+    target = params.properties["target_entity_id"]
+    assert not getattr(target, "enum", None)
 
 
 def test_execute_play_audio_rejects_unmanaged_target(hass: object) -> None:
@@ -167,4 +173,3 @@ def test_execute_recall_memories_parses_and_clamps_hours(hass: object) -> None:
     assert memory_store.hours_calls[0] == 72
     assert memory_store.hours_calls[1] == 720
     assert memory_store.search_calls == ["alex"]
-
