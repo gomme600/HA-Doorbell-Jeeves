@@ -879,7 +879,11 @@ class JeevesSessionManager:
                     if go2rtc_stream:
                         image_bytes = await self._go2rtc_snapshot(go2rtc_stream)
                     if not image_bytes:
-                        raise cam_err  # noqa: TRY301
+                        consecutive_failures += 1
+                        if consecutive_failures % 5 == 1:
+                            _LOGGER.warning("Vision frame capture failed (camera %s): %s", camera_entity, cam_err)
+                        await asyncio.sleep(2)
+                        continue
 
                 if image_bytes and self._client:
                     processed = await self.hass.async_add_executor_job(
