@@ -645,14 +645,6 @@ class JeevesSessionManager:
             elif mic_rx_count % 500 == 0:
                 _LOGGER.info("Microphone input received: %d chunks", mic_rx_count)
 
-            # Save first 5 seconds of audio to WAV for diagnostic playback
-            if mic_rx_count <= 100:
-                if not hasattr(self, "_debug_pcm_buf"):
-                    self._debug_pcm_buf = bytearray()
-                self._debug_pcm_buf.extend(audio_bytes)
-                if mic_rx_count == 100:
-                    self._save_debug_wav(bytes(self._debug_pcm_buf))
-
             if self._mic_queue is None:
                 return
 
