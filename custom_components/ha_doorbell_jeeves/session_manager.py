@@ -807,6 +807,44 @@ class JeevesSessionManager:
             unsub = async_track_state_change_event(self.hass, [entity_id], _on_start_trigger)
             self._start_unsubs.append(unsub)
 
+        # Also register motion listeners for all managed cameras to help AI 'follow' visitor
+        self._register_motion_listeners()
+
+    def _register_motion_listeners(self) -> None:
+        """Register listeners for motion sensors related to cameras to aid tracking."""
+        camera_entities = [e.entity_id for e in self.store.managed_entities if e.entity_id.startswith("camera.")]
+        if not camera_entities:
+            return
+
+        # Find all binary sensors that look like motion/person sensors
+        for state in self.hass.states.async_all("binary_sensor"):
+            d_class = state.attributes.get("device_class")
+            if d_class not in ("motion", "occupancy", "person"):
+                continue
+
+            # Check if sensor entity ID or friendly name matches any managed camera slug
+            for cam_id in camera_entities:
+                cam_slug = cam_id.split(".")[1].replace("_fluent", "").replace("_main", "").replace("_sub", "")
+                if cam_slug in state.entity_id or cam_slug in state.name.lower().replace(" ", "_"):
+                    @callback
+                    def _on_motion(event: Event, cam=cam_id, sensor_name=state.name) -> None:
+                        new_state = event.data.get("new_state")
+                        if new_state and new_state.state == "on":
+                            # Only notify if motion is NOT on the currently active camera
+                            active_cam = self._config.get(CONF_CAMERA_ENTITY)
+                            if cam != active_cam:
+                                msg = (
+                                    f"[SYSTEM] Motion detected on '{sensor_name}'. "
+                                    f"The visitor may have moved to the area covered by {cam}. "
+                                    f"Use 'switch_camera' if you want to follow them."
+                                )
+                                if self._client and self._active:
+                                    self.hass.async_create_task(self._client.inject_context(msg))
+
+                    unsub = async_track_state_change_event(self.hass, [state.entity_id], _on_motion)
+                    self._start_unsubs.append(unsub)
+                    break
+
     def unregister_start_triggers(self) -> None:
         """Remove start trigger listeners (called on unload)."""
         for unsub in self._start_unsubs:
@@ -1004,10 +1042,10 @@ class JeevesSessionManager:
             pass
 
     async def _switch_active_camera(self, camera_entity_id: str) -> dict[str, Any]:
-        """Switch the live video feed to a different camera mid-session.
+        """Switch the live video and 2-way audio feed to a different camera.
 
         This stops the current vision loop and restarts it with the new camera.
-        If the new camera is Reolink, audio is also redirected.
+        If the new camera is Reolink, the entire audio stack is also redirected.
         """
         _LOGGER.info("Switching active camera to: %s", camera_entity_id)
         result: dict[str, Any] = {
@@ -1016,7 +1054,8 @@ class JeevesSessionManager:
             "audio_switched": False,
             "audio_message": "Audio was not changed.",
         }
-        # Stop current vision loop
+
+        # 1. Stop current vision loop
         if self._vision_task and not self._vision_task.done():
             self._vision_task.cancel()
             try:
@@ -1024,24 +1063,56 @@ class JeevesSessionManager:
             except asyncio.CancelledError:
                 pass
 
-        # Update the config to point to the new camera
+        # 2. Update session configuration
         self._config[CONF_CAMERA_ENTITY] = camera_entity_id
+        # Update go2rtc stream hints
         self._config[CONF_GO2RTC_STREAM_NAME] = camera_entity_id
         self._config[CONF_GO2RTC_INPUT_STREAM_NAME] = camera_entity_id
         self._config[CONF_GO2RTC_OUTPUT_STREAM_NAME] = camera_entity_id
-        if self._audio_handler and self._audio_handler.is_active:
-            await self._audio_handler.stop()
-            self._audio_handler._camera_entity_id = camera_entity_id
-            await self._audio_handler.start()
-        elif self._audio_handler:
-            self._audio_handler._camera_entity_id = camera_entity_id
 
-        # Restart vision loop with new camera
+        # 3. Handle Audio Transition
+        store = getattr(self, "store", None)
+        placements = getattr(store, "camera_placements", []) if store else []
+        placement = next((cp for cp in placements if cp.entity_id == camera_entity_id), None)
+
+        if self._config.get(CONF_AUDIO_MODE) == AUDIO_MODE_REOLINK:
+            if placement and placement.has_audio:
+                try:
+                    await self._restart_reolink_audio_for_camera(camera_entity_id, placement)
+                    result["audio_switched"] = bool(self._audio_handler and self._audio_handler.is_active)
+                    result["audio_message"] = (
+                        "Two-way audio successfully switched to the selected camera."
+                        if result["audio_switched"]
+                        else "Video switched, but two-way audio failed to start on the new camera."
+                    )
+                except Exception:
+                    _LOGGER.exception("Failed to restart audio for switched camera %s", camera_entity_id)
+                    result["audio_message"] = f"Error switching audio: {camera_entity_id}"
+            else:
+                result["audio_message"] = (
+                    "Video switched. The selected camera does not support two-way audio, "
+                    "so audio remains on the previous device."
+                )
+        elif self._audio_handler:
+            # For non-Reolink modes, just update the handler's entity reference if active
+            self._audio_handler._camera_entity_id = camera_entity_id
+            if self._audio_handler.is_active:
+                try:
+                    await self._audio_handler.stop()
+                    await self._audio_handler.start()
+                    result["audio_switched"] = True
+                    result["audio_message"] = "Audio handler restarted for new camera."
+                except Exception:
+                    _LOGGER.exception("Manual audio restart failed")
+
+        # 4. Restart Vision Loop
         if self._client and self._active:
             fps = float(self._config.get(CONF_VISION_FPS, DEFAULT_VISION_FPS))
             self._vision_task = asyncio.create_task(self._vision_loop(camera_entity_id, fps))
             result["video_switched"] = True
             _LOGGER.info("Vision loop restarted with camera: %s", camera_entity_id)
+
+            # Send immediate first frame to reduce latency perception
             try:
                 image = await ha_camera_get_image(self.hass, camera_entity_id, timeout=5)
                 if image and image.content:
@@ -1058,26 +1129,6 @@ class JeevesSessionManager:
             except Exception:
                 _LOGGER.warning("Could not send immediate frame for switched camera", exc_info=True)
 
-        store = getattr(self, "store", None)
-        placements = getattr(store, "camera_placements", []) if store else []
-        placement = next((cp for cp in placements if cp.entity_id == camera_entity_id), None)
-        if self._config.get(CONF_AUDIO_MODE) == AUDIO_MODE_REOLINK:
-            if placement and placement.has_audio:
-                try:
-                    await self._restart_reolink_audio_for_camera(camera_entity_id, placement)
-                except Exception:
-                    _LOGGER.exception("Failed to restart audio for switched camera %s", camera_entity_id)
-                result["audio_switched"] = bool(self._audio_handler and self._audio_handler.is_active)
-                result["audio_message"] = (
-                    "Two-way audio was switched to the selected camera."
-                    if result["audio_switched"]
-                    else "Video switched, but two-way audio could not be started on the selected camera."
-                )
-            else:
-                result["audio_message"] = (
-                    "Video switched. The selected camera is not marked as two-way-audio capable, "
-                    "so audio remains on the existing audio path."
-                )
         return result
 
     async def _restart_reolink_audio_for_camera(self, camera_entity_id: str, placement: Any) -> None:

@@ -188,13 +188,18 @@ class GeminiLiveClient(BaseRealtimeClient):
         except Exception:
             _LOGGER.exception("Failed to send image")
 
-    async def inject_context(self, text: str) -> None:
-        """Inject a text message into the live session (used by tool router for results)."""
+    async def inject_context(self, text: str, image_base64: str | None = None, mime_type: str = "image/jpeg") -> None:
+        """Inject a text message (and optional image) into the live session."""
         if not self._session or not self._connected:
             return
         try:
+            parts = [types.Part(text=text)]
+            if image_base64:
+                image_bytes = base64.b64decode(image_base64)
+                parts.append(types.Part(inline_data=types.Blob(data=image_bytes, mime_type=mime_type)))
+
             await self._session.send_client_content(
-                turns=[types.Content(role="user", parts=[types.Part(text=text)])],
+                turns=[types.Content(role="user", parts=parts)],
                 turn_complete=True,
             )
         except Exception:
@@ -412,11 +417,14 @@ class GeminiLiveClient(BaseRealtimeClient):
             self._tool_call_pending = False
 
         # Inject pending tool image AFTER the tool response so the model
-        # correlates the image with the tool call context
+        # correlates the image with the tool call context.
+        # We use inject_context (user role) for tool images (like snapshots)
+        # to ensure they are captured in history and not lost in the live stream.
         if self._session and self._connected and self._pending_tool_image:
             image_b64, mime_type = self._pending_tool_image
             self._pending_tool_image = None
-            try:
-                await self.send_image(image_b64, mime_type=mime_type)
-            except Exception:
-                _LOGGER.exception("Failed to send tool image")
+            await self.inject_context(
+                "[SYSTEM] The requested image has been captured and is attached below for your analysis.",
+                image_base64=image_b64,
+                mime_type=mime_type
+            )

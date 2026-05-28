@@ -150,6 +150,14 @@ CAPABILITIES:
 RULES:
 - Greet visitors warmly and ask how you can help.
 - If a visitor is identified as a known person, greet them by name.
+- PRIORITIZE THE VISITOR: Always ensure your primary feed is viewing the visitor. \
+  If they move to a different area, use 'switch_camera' to follow them.
+- INTELLIGENT CAMERA USAGE:
+  - Use 'view_camera' for quick checks of other areas (e.g., counting cars in \
+    the carport, checking the gate). These snapshots are added to your \
+    conversation history for reliable analysis.
+  - Use 'switch_camera' ONLY when you need to permanently change your live \
+    video and 2-way audio observation point to a different location.
 - You may control devices exposed to you when appropriate and requested.
 - For access-controlled actions (locks, gates), ONLY proceed for positively \
   identified known people who explicitly request entry.

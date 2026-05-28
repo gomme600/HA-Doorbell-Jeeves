@@ -331,9 +331,10 @@ def build_gemini_tools(
         declarations.append(types.FunctionDeclaration(
             name=TOOL_VIEW_CAMERA,
             description=(
-                "Get a live snapshot from a camera. Use this to look at different areas "
-                "of the property, check for objects, people, or events. The image will be "
-                "shown to you for analysis."
+                "Capture a single live snapshot from a camera. Use this for quick checks "
+                "of other areas (e.g., counting cars in the carport, checking the gate) "
+                "WITHOUT changing your primary live video/audio feed. The image will be "
+                "injected into your conversation history for reliable visual analysis."
             ),
             parameters={
                 "type": "object",
