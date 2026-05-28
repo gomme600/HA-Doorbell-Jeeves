@@ -377,23 +377,40 @@ class JeevesSessionManager:
             self._touch_audio_activity()
             _LOGGER.warning("Connected! Session is now active.")
 
-            # Send greeting trigger IMMEDIATELY so AI starts generating while
-            # Reolink audio hardware is being set up in the background.
-            # NOTE: If Reolink mode with cached method, we start audio FIRST
-            # (it's fast with cache), then trigger greeting to avoid buffering issues.
+            # Send greeting trigger AFTER audio is ready (prevents cut-off)
+            # BUT we must send SOMETHING within ~15s or Gemini's idle timeout kills
+            # the session. Strategy: if audio setup takes longer than 5s, send
+            # a keep-alive context message to prevent idle disconnect.
             reolink_mode = config.get(CONF_AUDIO_MODE) == AUDIO_MODE_REOLINK
-            has_cached_audio = bool(config.get(CONF_REOLINK_MIC_METHOD, ""))
 
-            if reolink_mode and has_cached_audio:
-                # Fast path: start audio handler first (cached = ~1-2s), then greet
-                _LOGGER.warning("Starting Reolink audio (cached method) before greeting")
-                await self._start_reolink_audio_background(config)
-                await self._send_initial_greeting()
-            elif reolink_mode:
-                # First run (no cache): start audio first (takes longer but avoids
-                # buffering issues), then trigger greeting once handler is ready.
-                _LOGGER.warning("Starting Reolink 2-way audio handler (first run, awaiting)")
-                await self._start_reolink_audio_background(config)
+            if reolink_mode:
+                # Start audio with timeout — if it takes too long, send keepalive
+                _LOGGER.warning("Starting Reolink audio before greeting")
+                audio_done = False
+
+                async def _audio_setup():
+                    nonlocal audio_done
+                    await self._start_reolink_audio_background(config)
+                    audio_done = True
+
+                audio_task = asyncio.create_task(_audio_setup())
+                try:
+                    await asyncio.wait_for(asyncio.shield(audio_task), timeout=5.0)
+                except asyncio.TimeoutError:
+                    # Audio setup taking too long — send keepalive to prevent Gemini timeout
+                    _LOGGER.warning("Audio setup >5s — sending Gemini keepalive")
+                    if self._client:
+                        try:
+                            await self._client.inject_context(
+                                "[SYSTEM] Audio hardware is being initialized. Stand by."
+                            )
+                        except Exception:
+                            pass
+                    # Wait for audio to finish (up to 30s more)
+                    try:
+                        await asyncio.wait_for(audio_task, timeout=30.0)
+                    except asyncio.TimeoutError:
+                        _LOGGER.error("Audio setup timed out after 35s")
                 await self._send_initial_greeting()
             else:
                 await self._send_initial_greeting()
