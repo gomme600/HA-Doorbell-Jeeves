@@ -277,7 +277,7 @@ class GeminiLiveClient(BaseRealtimeClient):
         self._keepalive_task = None
 
     async def _keepalive_loop(self) -> None:
-        """Send silent audio every 5s while waiting for model to generate.
+        """Send silent audio every 5s while waiting for tool execution to complete.
 
         Keeps the WebSocket alive during tool execution AND during the gap
         between tool_response and model generation start.
@@ -286,29 +286,27 @@ class GeminiLiveClient(BaseRealtimeClient):
         silent_frame = b"\x00" * 640
         try:
             while self._session and self._connected:
-                # Stop once model starts generating (no longer at risk of idle timeout)
-                if self._model_generating:
-                    break
-                # Also stop if tool is no longer pending AND model isn't generating
-                # (safety: don't keepalive forever if something goes wrong)
-                if not self._tool_call_pending and not self._model_generating:
-                    # Give a brief window for model to start generating after tool_response
-                    await asyncio.sleep(3)
-                    if not self._tool_call_pending and not self._model_generating:
+                # Primary condition: keep alive while tool is pending
+                if self._tool_call_pending:
+                    await asyncio.sleep(5)
+                    if not self._session or not self._connected:
                         break
-                    continue
-                await asyncio.sleep(5)
-                if not self._session or not self._connected or self._model_generating:
-                    break
-                try:
-                    await self._session.send_realtime_input(
-                        audio=types.Blob(
-                            data=silent_frame,
-                            mime_type=f"audio/pcm;rate={AUDIO_INPUT_SAMPLE_RATE}",
+                    if not self._tool_call_pending:
+                        break  # Tool done, stop
+                    try:
+                        await self._session.send_realtime_input(
+                            audio=types.Blob(
+                                data=silent_frame,
+                                mime_type=f"audio/pcm;rate={AUDIO_INPUT_SAMPLE_RATE}",
+                            )
                         )
-                    )
-                except Exception:
-                    break
+                    except Exception:
+                        break
+                else:
+                    # Tool no longer pending — give brief window for model to start
+                    await asyncio.sleep(3)
+                    if not self._tool_call_pending:
+                        break  # Model should be generating by now
         except asyncio.CancelledError:
             pass
 
