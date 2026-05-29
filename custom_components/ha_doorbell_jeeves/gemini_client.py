@@ -540,11 +540,11 @@ class GeminiLiveClient(BaseRealtimeClient):
                     except Exception:
                         _LOGGER.warning("Failed to decode tool image for FunctionResponse parts")
 
-                function_responses.append(
-                    types.FunctionResponse(
-                        id=fc.id, name=fc.name, response=result, parts=response_parts
-                    )
-                )
+                # Build FunctionResponse — only include parts if we have image data
+                fr_kwargs: dict[str, Any] = {"id": fc.id, "name": fc.name, "response": result}
+                if response_parts:
+                    fr_kwargs["parts"] = response_parts
+                function_responses.append(types.FunctionResponse(**fr_kwargs))
 
             if self._session and self._connected:
                 try:
