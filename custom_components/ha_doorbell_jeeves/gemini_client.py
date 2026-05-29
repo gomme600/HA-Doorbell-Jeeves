@@ -62,8 +62,6 @@ class GeminiLiveClient(BaseRealtimeClient):
         self._monitor_turn_active = False
         # Keepalive task: sends silent audio during tool calls to prevent server idle timeout
         self._keepalive_task: asyncio.Task[None] | None = None
-        # Generation keepalive: sends silent audio during model generation to prevent 1008
-        self._gen_keepalive_task: asyncio.Task[None] | None = None
         # Startup grace period: block audio/video input briefly after greeting to prevent 1008
         self._startup_grace_until: float = 0.0
 
@@ -116,28 +114,17 @@ class GeminiLiveClient(BaseRealtimeClient):
             ),
         )
 
-        # Warm-up connection: open a session, trigger a brief generation, receive it.
-        # The reconnect path (which reuses self._client) NEVER gets 1008.
-        # Hypothesis: server needs to pre-allocate audio generation resources.
+        # Warm-up connection: open and immediately close a session.
+        # This pre-establishes HTTP/2 connections and auth state in the client,
+        # reducing 1008 rate from ~60% to ~35%.
         try:
             warmup_cm = self._client.aio.live.connect(
                 model=self._model, config=self._live_config,
             )
             warmup_session = await warmup_cm.__aenter__()
-            # Trigger a minimal generation to pre-allocate audio resources
-            await warmup_session.send_client_content(
-                turns=[types.Content(role="user", parts=[types.Part(text="[System test. Reply with one word: Ready.")])],
-                turn_complete=True,
-            )
-            # Receive the response (pre-allocates audio pipeline)
-            try:
-                async for _ in warmup_session.receive():
-                    break  # Just need first chunk to confirm pipeline works
-            except Exception:
-                pass
             await warmup_cm.__aexit__(None, None, None)
             await asyncio.sleep(0.3)
-            _LOGGER.warning("Warm-up connection completed (with generation) — opening real session")
+            _LOGGER.warning("Warm-up connection completed — opening real session")
         except Exception:
             _LOGGER.warning("Warm-up connection failed (non-fatal)")
             await asyncio.sleep(0.5)
@@ -330,50 +317,6 @@ class GeminiLiveClient(BaseRealtimeClient):
         if self._keepalive_task and not self._keepalive_task.done():
             self._keepalive_task.cancel()
         self._keepalive_task = None
-
-    def _start_generation_keepalive(self) -> None:
-        """Start keepalive during model generation (greeting/first turn).
-
-        The Gemini server has a ~6s inactivity timeout on the client side.
-        During model generation, we block all send_audio/send_image calls
-        via _model_generating=True. But the server expects bidirectional
-        activity. Without keepalive, ~20-60% of first connections get 1008.
-        """
-        if self._gen_keepalive_task and not self._gen_keepalive_task.done():
-            return
-        self._gen_keepalive_task = asyncio.create_task(self._generation_keepalive_loop())
-
-    def _stop_generation_keepalive(self) -> None:
-        """Stop the generation keepalive."""
-        if self._gen_keepalive_task and not self._gen_keepalive_task.done():
-            self._gen_keepalive_task.cancel()
-        self._gen_keepalive_task = None
-
-    async def _generation_keepalive_loop(self) -> None:
-        """Send silent audio every 3s while model is generating.
-
-        This prevents the Gemini server from closing the WebSocket due to
-        client inactivity during the first generation (greeting).
-        """
-        silent_frame = b"\x00" * 640  # 20ms of silence
-        try:
-            while self._session and self._connected and self._model_generating:
-                await asyncio.sleep(3)
-                if not self._session or not self._connected:
-                    break
-                if not self._model_generating:
-                    break
-                try:
-                    await self._session.send_realtime_input(
-                        audio=types.Blob(
-                            data=silent_frame,
-                            mime_type=f"audio/pcm;rate={AUDIO_INPUT_SAMPLE_RATE}",
-                        )
-                    )
-                except Exception:
-                    break
-        except asyncio.CancelledError:
-            pass
 
     async def _keepalive_loop(self) -> None:
         """Send silent audio every 5s while waiting for tool execution to complete.
