@@ -1318,10 +1318,14 @@ class JeevesSessionManager:
         or injected messages. This loop injects periodic monitoring prompts so
         the model can take initiative as a security guard.
         """
-        # Wait for greeting to complete before starting monitoring
-        await asyncio.sleep(15.0)
-        _LOGGER.warning("Proactive monitoring loop started (interval=%.0fs)", self._monitor_interval)
+        _LOGGER.warning("Proactive monitor task created — waiting 15s for greeting to complete")
         try:
+            # Wait for greeting to complete before starting monitoring
+            await asyncio.sleep(15.0)
+            if not self._active or not self._client:
+                _LOGGER.warning("Monitor loop: session ended during initial wait")
+                return
+            _LOGGER.warning("Proactive monitoring loop active (interval=%.0fs)", self._monitor_interval)
             while self._active and self._client and self._client.connected:
                 await asyncio.sleep(self._monitor_interval)
                 if not self._active or not self._client or not self._client.connected:
@@ -1336,6 +1340,7 @@ class JeevesSessionManager:
                 if self._last_model_activity and (now - self._last_model_activity) < self._monitor_interval * 0.8:
                     continue
 
+                _LOGGER.warning("Monitor tick — injecting proactive check")
                 # Inject monitoring prompt — model can speak, call tools, or stay silent
                 try:
                     await self._client.inject_context(
@@ -1350,10 +1355,12 @@ class JeevesSessionManager:
                         turn_complete=True,
                     )
                 except Exception:
-                    _LOGGER.debug("Monitor inject failed (session may have ended)")
+                    _LOGGER.warning("Monitor inject failed (session may have ended)")
                     break
         except asyncio.CancelledError:
             pass
+        except Exception:
+            _LOGGER.exception("Proactive monitor loop unexpected error")
         _LOGGER.warning("Proactive monitoring loop ended")
 
     def _touch_audio_activity(self) -> None:

@@ -2225,9 +2225,11 @@ async def _execute_notification(
         return {
             "success": True,
             "message": (
-                f"Notification sent to {target.name} with action buttons. "
-                f"Do NOT announce this to the visitor — do NOT say 'I notified the owner' or similar. "
-                f"Simply continue the conversation naturally. The owner will respond via buttons if available."
+                "DONE. The homeowner has been silently notified — they may respond soon. "
+                "CRITICAL INSTRUCTION: Do NOT tell the visitor about the notification. "
+                "Do NOT say 'je préviens', 'j'ai notifié', 'la personne est informée' or ANYTHING similar. "
+                "Instead, ask the visitor a helpful follow-up question like "
+                "'Puis-je vous aider en attendant?' or simply wait silently for them to speak."
             ),
         }
 
