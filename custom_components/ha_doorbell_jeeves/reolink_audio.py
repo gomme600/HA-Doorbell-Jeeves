@@ -1581,7 +1581,7 @@ class ReolinkAudioHandler:
         # On-demand talk: track when last audio was sent to detect silence
         TALK_RELEASE_DELAY = 1.5  # Release speaker after 1.5s of silence
         COOPERATIVE_YIELD_INTERVAL = 2.0  # Yield talk session every 2s during speech
-        COOPERATIVE_YIELD_WINDOW = 0.35  # Release for 350ms to let Reolink app connect
+        COOPERATIVE_YIELD_WINDOW = 0.5  # Release for 500ms to let Reolink app connect
         last_audio_sent_time = 0.0
         last_yield_time = 0.0
         consecutive_send_failures = 0

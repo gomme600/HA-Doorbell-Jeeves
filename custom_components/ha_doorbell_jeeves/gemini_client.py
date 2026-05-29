@@ -113,16 +113,14 @@ class GeminiLiveClient(BaseRealtimeClient):
         )
         self._session = await self._session_cm.__aenter__()
         self._connected = True
-        # Start with model_generating=True: the model will generate its greeting
-        # immediately after connect. This prevents mic audio from being sent during
-        # the greeting generation (which causes 1008 policy violations).
-        # Will be cleared when first turn_complete signal arrives.
-        self._model_generating = True
 
         await self._inject_reference_images()
         self._receive_task = asyncio.create_task(self._receive_loop())
         # Set startup grace period: block audio/video for 5s to let the model initialize
-        # and avoid 1008 policy violation from audio racing with session setup
+        # and avoid 1008 policy violation from audio racing with session setup.
+        # NOTE: We do NOT set _model_generating=True here because that would block
+        # the greeting inject_context call. The 5s grace period is sufficient to
+        # prevent audio from flowing during the model's initial generation.
         self._startup_grace_until = time.time() + 5.0
         _LOGGER.info("Gemini Live connected (model=%s, voice=%s)", self._model, self._voice)
 
@@ -321,7 +319,9 @@ class GeminiLiveClient(BaseRealtimeClient):
             return
         # SAFETY GATE: Wait for model generation or tool processing to finish.
         # Rather than silently dropping, wait up to 15s for the model to finish.
-        if self._model_generating or self._tool_call_pending:
+        # Skip the gate during startup grace period (greeting must go through immediately)
+        in_startup = time.time() < self._startup_grace_until
+        if not in_startup and (self._model_generating or self._tool_call_pending):
             _LOGGER.info("inject_context waiting: model_generating=%s, tool_pending=%s",
                          self._model_generating, self._tool_call_pending)
             for _ in range(30):  # 30 x 0.5s = 15s max wait
