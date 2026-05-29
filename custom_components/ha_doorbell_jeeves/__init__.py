@@ -302,6 +302,29 @@ def _register_services(hass: HomeAssistant) -> None:
         }),
     )
 
+    async def handle_inject_text(call: ServiceCall) -> None:
+        """Inject text into the AI session (simulates user speech for testing)."""
+        manager = await _get_manager(call)
+        if manager and hasattr(manager, "_client") and manager._client and manager._client.connected:
+            text = call.data.get("text", "")
+            turn_complete = call.data.get("turn_complete", True)
+            await manager._client.inject_context(
+                f"[USER SPEECH] The visitor just said: \"{text}\"",
+                turn_complete=turn_complete,
+            )
+            _LOGGER.info("Injected text into session: %s", text[:100])
+        else:
+            _LOGGER.warning("Cannot inject text — no active session")
+
+    hass.services.async_register(
+        DOMAIN, "inject_text", handle_inject_text,
+        schema=vol.Schema({
+            vol.Optional("entry_id"): cv.string,
+            vol.Required("text"): cv.string,
+            vol.Optional("turn_complete"): bool,
+        }),
+    )
+
     # ─── Entity Management Services ──────────────────────────────────────────
 
     async def handle_add_entity(call: ServiceCall) -> None:
