@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -61,6 +62,8 @@ class GeminiLiveClient(BaseRealtimeClient):
         self._monitor_turn_active = False
         # Keepalive task: sends silent audio during tool calls to prevent server idle timeout
         self._keepalive_task: asyncio.Task[None] | None = None
+        # Startup grace period: block audio/video input briefly after greeting to prevent 1008
+        self._startup_grace_until: float = 0.0
 
     @property
     def connected(self) -> bool:
@@ -113,6 +116,9 @@ class GeminiLiveClient(BaseRealtimeClient):
 
         await self._inject_reference_images()
         self._receive_task = asyncio.create_task(self._receive_loop())
+        # Set startup grace period: block audio/video for 3s to let the model initialize
+        # and avoid 1008 policy violation from audio racing with session setup
+        self._startup_grace_until = time.time() + 3.0
         _LOGGER.info("Gemini Live connected (model=%s, voice=%s)", self._model, self._voice)
 
     async def _reconnect_session(self) -> bool:
@@ -211,6 +217,9 @@ class GeminiLiveClient(BaseRealtimeClient):
         # GATE: Block during tool processing or active model generation
         if self._tool_call_pending or self._model_generating:
             return
+        # GATE: Block during startup grace period (prevents 1008 race with greeting)
+        if time.time() < self._startup_grace_until:
+            return
         try:
             await self._session.send_realtime_input(
                 audio=types.Blob(
@@ -231,6 +240,9 @@ class GeminiLiveClient(BaseRealtimeClient):
         if not self._session or not self._connected:
             return
         if self._tool_call_pending or self._model_generating:
+            return
+        # Block during startup grace period
+        if time.time() < self._startup_grace_until:
             return
         try:
             image_bytes = base64.b64decode(image_base64)
@@ -287,12 +299,21 @@ class GeminiLiveClient(BaseRealtimeClient):
         """
         if not self._session or not self._connected:
             return
-        # SAFETY GATE: Never inject during model generation or tool processing.
-        # This is the primary cause of 1008 "policy violation" errors.
+        # SAFETY GATE: Wait for model generation or tool processing to finish.
+        # Rather than silently dropping, wait up to 15s for the model to finish.
         if self._model_generating or self._tool_call_pending:
-            _LOGGER.debug("inject_context blocked: model_generating=%s, tool_pending=%s",
+            _LOGGER.info("inject_context waiting: model_generating=%s, tool_pending=%s",
                          self._model_generating, self._tool_call_pending)
-            return
+            for _ in range(30):  # 30 x 0.5s = 15s max wait
+                await asyncio.sleep(0.5)
+                if not self._model_generating and not self._tool_call_pending:
+                    break
+                if not self._session or not self._connected:
+                    return
+            else:
+                _LOGGER.warning("inject_context timed out waiting for model — dropping message")
+                return
+            _LOGGER.info("inject_context: gate cleared, proceeding with injection")
         # Set monitor mute BEFORE sending so the response audio gets suppressed
         if monitor:
             self._monitor_turn_active = True
@@ -552,7 +573,7 @@ class GeminiLiveClient(BaseRealtimeClient):
             self._monitor_turn_active = False
         try:
             function_responses: list[types.FunctionResponse] = []
-            # Track image data for inline delivery
+            # Track image data for realtime media delivery
             pending_image_bytes: bytes | None = None
             pending_image_mime: str = "image/jpeg"
             pending_image_ctx: str = ""
@@ -564,7 +585,6 @@ class GeminiLiveClient(BaseRealtimeClient):
                     result = {"error": f"Tool '{fc.name}' execution failed"}
 
                 # Extract pending image if the tool produced one
-                response_parts = None
                 if self._pending_tool_image:
                     if len(self._pending_tool_image) == 2:
                         image_b64, pending_image_mime = self._pending_tool_image
@@ -574,76 +594,64 @@ class GeminiLiveClient(BaseRealtimeClient):
                     self._pending_tool_image = None
                     try:
                         pending_image_bytes = base64.b64decode(image_b64)
-                        # Try to include image directly in FunctionResponse.parts
-                        # (requires google-genai >= 2.x)
-                        response_parts = [
-                            types.FunctionResponsePart(
-                                inline_data=types.FunctionResponseBlob(
-                                    data=pending_image_bytes, mime_type=pending_image_mime
-                                )
-                            )
-                        ]
-                    except (AttributeError, TypeError) as sdk_err:
-                        # Older SDK — FunctionResponsePart not available
-                        _LOGGER.debug("FunctionResponse.parts not supported: %s", sdk_err)
-                        response_parts = None
                     except Exception as img_err:
-                        _LOGGER.warning("Failed to build FunctionResponse parts: %s", img_err)
-                        response_parts = None
+                        _LOGGER.warning("Failed to decode tool image: %s", img_err)
+                        pending_image_bytes = None
 
-                # Build FunctionResponse — only include parts if SDK supports it
-                fr_kwargs: dict[str, Any] = {"id": fc.id, "name": fc.name, "response": result}
-                if response_parts:
-                    fr_kwargs["parts"] = response_parts
-                function_responses.append(types.FunctionResponse(**fr_kwargs))
+                # Build FunctionResponse (text-only — image goes via realtime_input)
+                function_responses.append(
+                    types.FunctionResponse(id=fc.id, name=fc.name, response=result)
+                )
 
             if self._session and self._connected:
                 # Stop keepalive before sending response (model will generate after this)
                 self._stop_keepalive()
-                # If we have an image that couldn't go in FunctionResponse.parts,
-                # inject it via send_client_content BEFORE the tool_response so
-                # the model sees it in context when generation starts.
-                if pending_image_bytes and not response_parts:
+
+                # CRITICAL: Inject tool image via send_realtime_input (media channel).
+                # The Gemini Live API only processes images sent through the realtime
+                # media channel — send_client_content inline_data does NOT show images
+                # to the model. We send the image BEFORE the tool_response so the model
+                # has the visual context available when it starts generating.
+                if pending_image_bytes:
                     try:
-                        ctx_text = pending_image_ctx or (
-                            "[TOOL IMAGE] The image below was captured by the tool. "
-                            "Analyze it carefully for your response."
-                        )
-                        await self._session.send_client_content(
-                            turns=[types.Content(role="user", parts=[
-                                types.Part(text=ctx_text),
-                                types.Part(inline_data=types.Blob(
-                                    data=pending_image_bytes, mime_type=pending_image_mime
-                                )),
-                            ])],
-                            turn_complete=False,  # Don't trigger generation yet
+                        await self._session.send_realtime_input(
+                            media=types.Blob(
+                                data=pending_image_bytes, mime_type=pending_image_mime
+                            )
                         )
                         _LOGGER.warning(
-                            "Tool image injected via send_client_content before tool_response (%d bytes)",
-                            len(pending_image_bytes),
+                            "Tool image injected via send_realtime_input (%d bytes, %s)",
+                            len(pending_image_bytes), pending_image_mime,
                         )
                     except Exception:
-                        _LOGGER.warning("Failed to inject tool image before tool_response")
+                        _LOGGER.warning("Failed to inject tool image via send_realtime_input")
+
+                    # Also send the context text via send_client_content so the model
+                    # knows what the image is (which camera, analysis instructions)
+                    if pending_image_ctx:
+                        try:
+                            await self._session.send_client_content(
+                                turns=[types.Content(role="user", parts=[
+                                    types.Part(text=pending_image_ctx),
+                                ])],
+                                turn_complete=False,
+                            )
+                        except Exception:
+                            _LOGGER.debug("Failed to send tool image context text")
 
                 # Send tool_response (this triggers model generation)
+                # Don't include image in FunctionResponse.parts — it doesn't work
+                # reliably in the Live API. The realtime_input above is authoritative.
                 try:
+                    plain = [
+                        types.FunctionResponse(id=fr.id, name=fr.name, response=fr.response)
+                        for fr in function_responses
+                    ]
                     await self._session.send_tool_response(
-                        function_responses=function_responses
+                        function_responses=plain
                     )
-                except Exception as send_err:
-                    # If sending with parts fails, retry without parts
-                    if response_parts:
-                        _LOGGER.warning("Tool response with parts failed (%s), retrying without", send_err)
-                        try:
-                            plain = [
-                                types.FunctionResponse(id=fr.id, name=fr.name, response=fr.response)
-                                for fr in function_responses
-                            ]
-                            await self._session.send_tool_response(function_responses=plain)
-                        except Exception:
-                            _LOGGER.exception("Tool response retry also failed")
-                    else:
-                        _LOGGER.exception("Failed to send tool response")
+                except Exception:
+                    _LOGGER.exception("Failed to send tool response")
         finally:
             # Stop keepalive in case it's still running
             self._stop_keepalive()
