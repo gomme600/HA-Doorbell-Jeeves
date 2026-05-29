@@ -222,7 +222,7 @@ class GeminiLiveClient(BaseRealtimeClient):
         """
         if not self._session or not self._connected:
             return
-        if self._tool_call_pending:
+        if self._tool_call_pending or self._model_generating:
             return
         try:
             image_bytes = base64.b64decode(image_base64)
