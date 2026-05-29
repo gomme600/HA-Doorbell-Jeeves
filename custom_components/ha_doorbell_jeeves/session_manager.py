@@ -1000,6 +1000,12 @@ class JeevesSessionManager:
 
         while self._active:
             try:
+                # Skip sending frames while a tool image is being processed
+                # (prevents overwriting the injected snapshot with a live frame)
+                if self._client and self._client._vision_paused:
+                    await asyncio.sleep(0.5)
+                    continue
+
                 image_bytes: bytes | None = None
                 # Primary: HA camera snapshot API
                 try:
@@ -1857,6 +1863,9 @@ class JeevesSessionManager:
                 result.pop("_image_mime", "image/jpeg"),
                 image_context,
             )
+            # Pause vision loop so the injected frame isn't immediately overwritten
+            # by the next live camera frame. Cleared when model_turn starts.
+            self._client._vision_paused = True
         else:
             if "_image_base64" in result:
                 result.pop("_image_base64")

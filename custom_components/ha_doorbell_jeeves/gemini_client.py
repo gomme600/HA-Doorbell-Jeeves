@@ -54,6 +54,7 @@ class GeminiLiveClient(BaseRealtimeClient):
         self._recap_future: asyncio.Future[str] | None = None
         self._pending_tool_image: tuple[str, str, str] | None = None
         self._tool_call_pending = False
+        self._vision_paused = False  # Pause vision loop during tool image injection
         # Track model generation state (informational — used by reconnect logic)
         self._model_generating = False
 
@@ -180,6 +181,7 @@ class GeminiLiveClient(BaseRealtimeClient):
         self._connected = False
         self._tool_call_pending = False
         self._model_generating = False
+        self._vision_paused = False
         if self._receive_task and not self._receive_task.done():
             self._receive_task.cancel()
             try:
@@ -369,6 +371,7 @@ class GeminiLiveClient(BaseRealtimeClient):
                 # Full response stream consumed — safe to ungate vision/audio
                 self._model_generating = False
                 self._tool_call_pending = False  # Safety: ensure not stuck
+                self._vision_paused = False  # Safety: ensure vision resumes
 
                 if not self._connected:
                     break
@@ -420,6 +423,8 @@ class GeminiLiveClient(BaseRealtimeClient):
             self._model_generating = True
             # Model is responding — tool call cycle is complete
             self._tool_call_pending = False
+            # Resume vision loop if it was paused for tool image injection
+            self._vision_paused = False
             for part in server_content.model_turn.parts:
                 if part.inline_data and part.inline_data.mime_type and "audio" in part.inline_data.mime_type:
                     self._on_audio_output(part.inline_data.data)
