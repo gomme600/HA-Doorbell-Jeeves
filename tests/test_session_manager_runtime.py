@@ -119,3 +119,26 @@ def test_resolve_camera_entity_falls_back_to_managed_camera() -> None:
     assert manager._resolve_camera_entity("camera.missing") == "camera.entree"
     assert manager._config[CONF_CAMERA_ENTITY] == "camera.entree"
 
+
+def test_resolve_camera_entity_prefers_managed_camera_over_unmanaged_state() -> None:
+    manager = JeevesSessionManager.__new__(JeevesSessionManager)
+    manager._config = {}
+    manager.hass = SimpleNamespace(
+        states=SimpleNamespace(
+            get=lambda entity_id: object()
+            if entity_id in {"camera.raw_reolink", "camera.entree"}
+            else None
+        )
+    )
+    manager.store = SimpleNamespace(
+        camera_placements=[
+            SimpleNamespace(entity_id="camera.entree", is_doorbell=True),
+        ],
+        managed_entities=[
+            SimpleNamespace(entity_id="camera.entree"),
+        ],
+    )
+
+    assert manager._resolve_camera_entity("camera.raw_reolink") == "camera.entree"
+    assert manager._config[CONF_CAMERA_ENTITY] == "camera.entree"
+

@@ -185,9 +185,6 @@ class JeevesSessionManager:
 
     def _resolve_camera_entity(self, preferred_entity: str) -> str:
         """Use the preferred camera when available, otherwise fall back to a managed camera."""
-        if self._camera_exists(preferred_entity):
-            return preferred_entity
-
         candidates: list[str] = []
         for placement in getattr(self.store, "camera_placements", []):
             if placement.is_doorbell:
@@ -197,6 +194,19 @@ class JeevesSessionManager:
             for entity in getattr(self.store, "managed_entities", [])
             if entity.entity_id.startswith("camera.")
         )
+        candidates = list(dict.fromkeys(candidates))
+
+        if preferred_entity in candidates and self._camera_exists(preferred_entity):
+            return preferred_entity
+
+        if preferred_entity and candidates:
+            _LOGGER.warning(
+                "Configured camera %s is not a managed camera; preferring managed camera candidates",
+                preferred_entity,
+            )
+
+        if self._camera_exists(preferred_entity) and not candidates:
+            return preferred_entity
 
         for candidate in candidates:
             if candidate != preferred_entity and self._camera_exists(candidate):
