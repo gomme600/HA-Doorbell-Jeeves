@@ -1336,15 +1336,15 @@ async def _execute_view_camera(
             # Fallback: try go2rtc snapshot
             import aiohttp  # noqa: PLC0415
 
+            from homeassistant.helpers.aiohttp_client import async_get_clientsession  # noqa: PLC0415
+
             from .reolink_audio import _discover_go2rtc_url, _get_go2rtc_session  # noqa: PLC0415
             base_url = await _discover_go2rtc_url(hass)
             if base_url:
                 url = f"{base_url}/api/frame.jpeg?src={camera_id}"
                 session = _get_go2rtc_session(hass)
-                own_session: aiohttp.ClientSession | None = None
                 if session is None:
-                    own_session = aiohttp.ClientSession()
-                    session = own_session
+                    session = async_get_clientsession(hass)
                 try:
                     async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                         if resp.status == 200:
@@ -1352,9 +1352,6 @@ async def _execute_view_camera(
                             _LOGGER.info("Captured go2rtc fallback snapshot for %s: %d bytes", camera_id, len(raw_jpeg))
                 except Exception:
                     _LOGGER.debug("go2rtc snapshot fallback failed for %s", camera_id, exc_info=True)
-                finally:
-                    if own_session is not None:
-                        await own_session.close()
 
         if not raw_jpeg:
             return {"error": f"Could not get image from {camera_id} (all methods failed)"}

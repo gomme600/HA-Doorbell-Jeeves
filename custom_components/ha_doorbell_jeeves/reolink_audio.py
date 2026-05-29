@@ -89,29 +89,27 @@ async def _discover_go2rtc_url(hass: HomeAssistant) -> str | None:
         pass
 
     # Method 2: Try known ports on localhost (with and without common auth)
-    session = aiohttp.ClientSession()
-    try:
-        for port in GO2RTC_PORTS:
-            try:
-                url = f"http://127.0.0.1:{port}"
-                async with session.get(
-                    f"{url}/api/streams",
-                    timeout=aiohttp.ClientTimeout(total=3),
-                ) as resp:
-                    if resp.status in (200, 401):
-                        # 200 = accessible, 401 = exists but needs auth
-                        if resp.status == 200:
-                            _LOGGER.info("Discovered go2rtc at %s (no auth)", url)
-                            GO2RTC_BASE = url
-                            return GO2RTC_BASE
-                        else:
-                            _LOGGER.info("Found go2rtc at %s (requires auth)", url)
-                            GO2RTC_BASE = url
-                            return GO2RTC_BASE
-            except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
-                continue
-    finally:
-        await session.close()
+    from homeassistant.helpers.aiohttp_client import async_get_clientsession  # noqa: PLC0415
+    session = async_get_clientsession(hass)
+    for port in GO2RTC_PORTS:
+        try:
+            url = f"http://127.0.0.1:{port}"
+            async with session.get(
+                f"{url}/api/streams",
+                timeout=aiohttp.ClientTimeout(total=3),
+            ) as resp:
+                if resp.status in (200, 401):
+                    # 200 = accessible, 401 = exists but needs auth
+                    if resp.status == 200:
+                        _LOGGER.info("Discovered go2rtc at %s (no auth)", url)
+                        GO2RTC_BASE = url
+                        return GO2RTC_BASE
+                    else:
+                        _LOGGER.info("Found go2rtc at %s (requires auth)", url)
+                        GO2RTC_BASE = url
+                        return GO2RTC_BASE
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+            continue
 
     _LOGGER.warning("Could not discover go2rtc — tried ports %s", GO2RTC_PORTS)
     return None
@@ -205,12 +203,10 @@ async def setup_go2rtc_stream(
 
     # Use HA's authenticated session if available (for HA-managed go2rtc)
     ha_session = _get_go2rtc_session(hass)
-    own_session = None
-    if ha_session:
-        session = ha_session
-    else:
-        own_session = aiohttp.ClientSession()
-        session = own_session
+    if not ha_session:
+        from homeassistant.helpers.aiohttp_client import async_get_clientsession  # noqa: PLC0415
+        ha_session = async_get_clientsession(hass)
+    session = ha_session
 
     try:
         url = f"{base_url}/api/streams"
@@ -235,9 +231,6 @@ async def setup_go2rtc_stream(
     except Exception:
         _LOGGER.exception("Error setting up go2rtc stream")
         return False
-    finally:
-        if own_session:
-            await own_session.close()
 
 
 async def probe_audio_input_method(
@@ -1145,6 +1138,15 @@ class ReolinkAudioHandler:
         self._active = False
         self._listen_active = False
 
+        # Close go2rtc proxy session if we created our own
+        try:
+            own_sess = getattr(self, "_go2rtc_own_session", None)
+            if own_sess:
+                await own_sess.close()
+                self._go2rtc_own_session = None
+        except Exception:
+            pass
+
         # Stop ffmpeg resampler
         try:
             if self._ffmpeg_proc and self._ffmpeg_proc.returncode is None:
@@ -1417,6 +1419,12 @@ class ReolinkAudioHandler:
             _LOGGER.warning("Created dedicated Baichuan %s connection to %s:%s", purpose, host, bc_port)
             return bc
         except Exception as exc:
+            # Ensure we logout if login succeeded but something else failed
+            if "new_host" in dir() and new_host:
+                try:
+                    await asyncio.wait_for(new_host.logout(), timeout=5)
+                except Exception:
+                    pass
             _LOGGER.warning("Failed to create Baichuan %s connection: %s", purpose, exc)
             return None
 
@@ -2620,10 +2628,9 @@ class ReolinkAudioHandler:
 
         ha_session = _get_go2rtc_session(self._hass)
         if not ha_session:
-            _LOGGER.warning("go2rtc proxy: no authenticated session — trying raw session")
-            # Fallback: try without auth (some go2rtc setups don't need it)
-            ha_session = aiohttp.ClientSession()
-            self._go2rtc_own_session = ha_session  # track for cleanup
+            _LOGGER.warning("go2rtc proxy: no authenticated session — using HA shared session")
+            from homeassistant.helpers.aiohttp_client import async_get_clientsession  # noqa: PLC0415
+            ha_session = async_get_clientsession(self._hass)
 
         # Check if stream exists; register if not
         try:
@@ -4136,10 +4143,10 @@ class ReolinkAudioHandler:
             return None
 
         ha_session = _get_go2rtc_session(self._hass)
-        own_session: aiohttp.ClientSession | None = None
         if not ha_session:
-            own_session = aiohttp.ClientSession()
-        session = ha_session or own_session
+            from homeassistant.helpers.aiohttp_client import async_get_clientsession  # noqa: PLC0415
+            ha_session = async_get_clientsession(self._hass)
+        session = ha_session
 
         try:
             # Check if stream already exists in go2rtc
@@ -4193,9 +4200,6 @@ class ReolinkAudioHandler:
         except Exception as exc:
             _LOGGER.warning("go2rtc HTTP stream lookup failed: %s", exc)
             return None
-        finally:
-            if own_session:
-                await own_session.close()
 
     async def _resolve_go2rtc_stream_name(self) -> str | None:
         """Resolve the go2rtc stream name for this camera.
@@ -4254,10 +4258,10 @@ class ReolinkAudioHandler:
             return None
 
         ha_session = _get_go2rtc_session(self._hass)
-        own_session: aiohttp.ClientSession | None = None
         if not ha_session:
-            own_session = aiohttp.ClientSession()
-        session = ha_session or own_session
+            from homeassistant.helpers.aiohttp_client import async_get_clientsession  # noqa: PLC0415
+            ha_session = async_get_clientsession(self._hass)
+        session = ha_session
 
         try:
             # Query go2rtc for available streams
@@ -4311,9 +4315,6 @@ class ReolinkAudioHandler:
         except Exception:
             _LOGGER.debug("Failed to query go2rtc streams", exc_info=True)
             return None
-        finally:
-            if own_session:
-                await own_session.close()
 
     async def _get_camera_stream_source(self) -> str | None:
         """Get the authenticated stream URL from the camera entity.
@@ -4568,9 +4569,16 @@ class ReolinkAudioHandler:
                 if proc.returncode is None:
                     proc.terminate()
                     try:
-                        proc.kill()
-                    except Exception:
-                        pass
+                        await asyncio.wait_for(proc.wait(), timeout=3)
+                    except (asyncio.TimeoutError, Exception):
+                        try:
+                            proc.kill()
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            await proc.wait()
+                        except Exception:
+                            pass
             self._listen_active = False
             _LOGGER.warning("Audio input: stream reader stopped (sent %d chunks)", chunks_sent)
 
@@ -4656,12 +4664,14 @@ class ReolinkTalkMonitor:
         if self._active:
             return
         self._active = True
-        self._session = aiohttp.ClientSession()
+        self._session = aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(limit=1, limit_per_host=1)
+        )
         self._poll_task = asyncio.create_task(self._poll_loop())
         _LOGGER.info("Reolink talk monitor started (host=%s)", self._host)
 
     async def stop(self) -> None:
-        """Stop the monitor."""
+        """Stop the monitor and release the camera HTTP session."""
         self._active = False
         if self._poll_task and not self._poll_task.done():
             self._poll_task.cancel()
@@ -4670,6 +4680,15 @@ class ReolinkTalkMonitor:
             except asyncio.CancelledError:
                 pass
         self._poll_task = None
+        # Logout from camera to free the HTTP session slot
+        if self._session and self._token:
+            try:
+                url = f"http://{self._host}/api.cgi?cmd=Logout&token={self._token}"
+                payload = [{"cmd": "Logout", "action": 0}]
+                async with self._session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    _LOGGER.debug("Reolink talk monitor logout: status=%s", resp.status)
+            except Exception:
+                _LOGGER.debug("Reolink talk monitor logout failed", exc_info=True)
         if self._session:
             await self._session.close()
             self._session = None

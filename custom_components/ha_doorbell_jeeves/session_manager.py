@@ -1098,6 +1098,8 @@ class JeevesSessionManager:
         """Get a JPEG snapshot from go2rtc as fallback when camera entity is unavailable."""
         import aiohttp  # noqa: PLC0415
 
+        from homeassistant.helpers.aiohttp_client import async_get_clientsession  # noqa: PLC0415
+
         from .reolink_audio import _discover_go2rtc_url, _get_go2rtc_session  # noqa: PLC0415
 
         base_url = await _discover_go2rtc_url(self.hass)
@@ -1105,23 +1107,20 @@ class JeevesSessionManager:
             return None
         url = f"{base_url}/api/frame.jpeg?src={stream_name}"
         session = _get_go2rtc_session(self.hass)
-        own_session = None
         if not session:
-            own_session = aiohttp.ClientSession()
-            session = own_session
+            # Use HA's shared session instead of creating a new one
+            session = async_get_clientsession(self.hass)
         try:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                 if resp.status == 200:
                     return await resp.read()
         except Exception:
             pass
-        finally:
-            if own_session:
-                await own_session.close()
         return None
 
     async def _rtsp_snapshot(self, rtsp_url: str) -> bytes | None:
         """Capture a single JPEG frame from an RTSP stream via ffmpeg."""
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 "ffmpeg", "-y", "-rtsp_transport", "tcp",
@@ -1136,6 +1135,17 @@ class JeevesSessionManager:
                 return stdout
         except (asyncio.TimeoutError, Exception):
             pass
+        finally:
+            # Always kill ffmpeg to free the RTSP session slot on the camera
+            if proc and proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=3)
+                except Exception:
+                    pass
         return None
 
     def _schedule_session_timeout(self, timeout_seconds: int) -> None:
