@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -57,6 +58,8 @@ class GeminiLiveClient(BaseRealtimeClient):
         # Model turn gate: blocks realtime input while model is actively generating
         # to prevent 1008 policy violations during thinking/generation
         self._model_generating = False
+        self._model_gen_start: float = 0.0  # monotonic time when generation started
+        self._MODEL_GEN_TIMEOUT = 30.0  # safety: auto-clear gate after this many seconds
 
     @property
     def connected(self) -> bool:
@@ -134,28 +137,32 @@ class GeminiLiveClient(BaseRealtimeClient):
                     f"{t['role'].upper()}: {t['text']}" for t in recent
                 )
                 history_parts.append(types.Part(text=(
-                    "[SYSTEM] CONNECTION RESUMED — DO NOT REPEAT YOUR GREETING.\n"
+                    "[SYSTEM] CONNECTION RESUMED — DO NOT SPEAK.\n"
                     "You are Jeeves, already mid-conversation with a visitor at the door. "
                     "The connection was briefly interrupted but the visitor is still here.\n\n"
                     "CONVERSATION SO FAR:\n"
                     f"{transcript_text}\n\n"
-                    "RULES FOR RESUMING:\n"
+                    "CRITICAL RULES:\n"
+                    "- Do NOT respond to this message. Stay SILENT.\n"
                     "- Do NOT say hello again or re-introduce yourself.\n"
-                    "- Do NOT say 'Je préviens le propriétaire' again if you already said it.\n"
-                    "- Simply continue naturally from where you left off.\n"
-                    "- If you were waiting for a tool result, say you're still checking.\n"
-                    "- Keep it brief — just one short sentence acknowledging you're back, or stay silent."
+                    "- Do NOT say 'Je préviens le propriétaire' again.\n"
+                    "- Wait for the visitor to speak, then respond naturally.\n"
+                    "- If a tool result arrives, process it silently or respond briefly."
                 )))
             else:
                 history_parts.append(types.Part(text=(
                     "[SYSTEM] CONNECTION RESUMED. You already greeted the visitor. "
-                    "Do NOT repeat your greeting. Continue the conversation naturally."
+                    "Do NOT speak. Wait for visitor input."
                 )))
 
+            # turn_complete=False: gives model context without triggering a response
+            # This prevents the model from repeating the greeting on reconnect
             await self._session.send_client_content(
                 turns=[types.Content(role="user", parts=history_parts)],
-                turn_complete=True,
+                turn_complete=False,
             )
+            # Model should NOT generate — ensure gate is off so audio can flow
+            self._model_generating = False
             _LOGGER.warning("Gemini reconnected — continuation prompt sent (with %d history turns)", len(self._conversation_turns))
             return True
         except Exception:
@@ -183,11 +190,22 @@ class GeminiLiveClient(BaseRealtimeClient):
         self._conversation_turns.clear()
         _LOGGER.info("Gemini Live disconnected")
 
+    def _is_model_generating(self) -> bool:
+        """Check if model is generating, with safety timeout."""
+        if not self._model_generating:
+            return False
+        # Safety timeout: auto-clear if stuck for too long
+        if self._model_gen_start and (time.monotonic() - self._model_gen_start) > self._MODEL_GEN_TIMEOUT:
+            _LOGGER.warning("Model generating gate timed out after %.0fs — auto-clearing", self._MODEL_GEN_TIMEOUT)
+            self._model_generating = False
+            return False
+        return True
+
     async def send_audio(self, pcm_bytes: bytes) -> None:
         if not self._session or not self._connected:
             return
         # GATE: Prevent sending audio during tool processing or model generation
-        if self._tool_call_pending or self._model_generating:
+        if self._tool_call_pending or self._is_model_generating():
             return
         try:
             await self._session.send_realtime_input(
@@ -205,7 +223,7 @@ class GeminiLiveClient(BaseRealtimeClient):
         if not self._session or not self._connected:
             return
         # GATE: Prevent sending images during tool processing or model generation
-        if self._tool_call_pending or self._model_generating:
+        if self._tool_call_pending or self._is_model_generating():
             return
         try:
             image_bytes = base64.b64decode(image_base64)
@@ -228,6 +246,7 @@ class GeminiLiveClient(BaseRealtimeClient):
 
             # Pre-set model_generating since the model will respond after this
             self._model_generating = True
+            self._model_gen_start = time.monotonic()
             await self._session.send_client_content(
                 turns=[types.Content(role="user", parts=parts)],
                 turn_complete=True,
@@ -394,6 +413,8 @@ class GeminiLiveClient(BaseRealtimeClient):
 
         if server_content and server_content.model_turn:
             # Model is actively generating — gate realtime input
+            if not self._model_generating:
+                self._model_gen_start = time.monotonic()
             self._model_generating = True
             for part in server_content.model_turn.parts:
                 if part.inline_data and part.inline_data.mime_type and "audio" in part.inline_data.mime_type:

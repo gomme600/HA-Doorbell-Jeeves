@@ -180,8 +180,14 @@ class JeevesSessionManager:
             self._config[CONF_GO2RTC_STREAM_NAME] = output_stream
 
     def _camera_exists(self, camera_entity: str) -> bool:
-        """Return True if Home Assistant currently knows this camera entity."""
-        return bool(camera_entity and self.hass.states.get(camera_entity) is not None)
+        """Return True if camera entity exists AND is in a usable state."""
+        if not camera_entity:
+            return False
+        state = self.hass.states.get(camera_entity)
+        if state is None:
+            return False
+        # Camera must not be unavailable/unknown to be usable
+        return state.state not in ("unavailable", "unknown")
 
     def _resolve_camera_entity(self, preferred_entity: str) -> str:
         """Use the preferred camera when available, otherwise fall back to a managed camera."""

@@ -382,6 +382,7 @@ class ReolinkAudioHandler:
         self._baichuan: Any = None
         self._talk_baichuan: Any = None  # Separate connection for talk (CMD 201/202)
         self._talk_host: Any = None  # Dedicated Host object for talk connection
+        self._preview_host: Any = None  # Dedicated Host object for preview/input connection
         self._talk_ability: dict | None = None
         self._talk_enc_type: Any = None
         self._talk_held: bool = False  # Whether we currently hold the talk session
@@ -517,7 +518,7 @@ class ReolinkAudioHandler:
 
         # Slow fallback: probe all methods (only if no cache or cache failed)
         # Create a second Baichuan connection for Preview fallback
-        bc = await self._get_baichuan_object()
+        bc = await self._get_baichuan_object(purpose="preview")
         if bc:
             self._baichuan = bc
 
@@ -1137,80 +1138,116 @@ class ReolinkAudioHandler:
 
 
     async def stop(self) -> None:
-        """Stop the audio handler and all subprocesses."""
+        """Stop the audio handler and all subprocesses.
+
+        Each cleanup step is independent — failures in one don't prevent others.
+        """
         self._active = False
         self._listen_active = False
 
         # Stop ffmpeg resampler
-        if self._ffmpeg_proc and self._ffmpeg_proc.returncode is None:
-            try:
-                if self._ffmpeg_proc.stdin and not self._ffmpeg_proc.stdin.is_closing():
-                    self._ffmpeg_proc.stdin.close()
-                self._ffmpeg_proc.terminate()
-                await asyncio.wait_for(self._ffmpeg_proc.wait(), timeout=3)
-            except Exception:
+        try:
+            if self._ffmpeg_proc and self._ffmpeg_proc.returncode is None:
                 try:
-                    self._ffmpeg_proc.kill()
+                    if self._ffmpeg_proc.stdin and not self._ffmpeg_proc.stdin.is_closing():
+                        self._ffmpeg_proc.stdin.close()
+                    self._ffmpeg_proc.terminate()
+                    await asyncio.wait_for(self._ffmpeg_proc.wait(), timeout=3)
                 except Exception:
-                    pass
+                    try:
+                        self._ffmpeg_proc.kill()
+                    except Exception:
+                        pass
+        except Exception as exc:
+            _LOGGER.debug("ffmpeg resampler cleanup error: %s", exc)
         self._ffmpeg_proc = None
 
         # Stop Baichuan talk session
-        await self._stop_baichuan_talk(0)
+        try:
+            await self._stop_baichuan_talk(0)
+        except Exception as exc:
+            _LOGGER.debug("Baichuan talk stop error: %s", exc)
 
         # Stop Preview stream (CMD 4)
-        await self._stop_preview_stream()
+        try:
+            await self._stop_preview_stream()
+        except Exception as exc:
+            _LOGGER.debug("Preview stream stop error: %s", exc)
 
         # Cancel RTSP audio input task
-        if self._input_processor_task and not self._input_processor_task.done():
-            self._input_processor_task.cancel()
-            try:
-                await self._input_processor_task
-            except (asyncio.CancelledError, Exception):
-                pass
+        try:
+            if self._input_processor_task and not self._input_processor_task.done():
+                self._input_processor_task.cancel()
+                try:
+                    await self._input_processor_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        except Exception:
+            pass
         self._input_processor_task = None
 
         # Cancel AAC decoder task
-        if self._aac_decoder_task and not self._aac_decoder_task.done():
-            self._aac_decoder_task.cancel()
-            try:
-                await self._aac_decoder_task
-            except (asyncio.CancelledError, Exception):
-                pass
+        try:
+            if self._aac_decoder_task and not self._aac_decoder_task.done():
+                self._aac_decoder_task.cancel()
+                try:
+                    await self._aac_decoder_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        except Exception:
+            pass
         self._aac_decoder_task = None
         self._aac_queue = None
 
         # Cancel raw TCP mic task
-        if self._raw_mic_task and not self._raw_mic_task.done():
-            self._raw_mic_task.cancel()
-            try:
-                await self._raw_mic_task
-            except (asyncio.CancelledError, Exception):
-                pass
+        try:
+            if self._raw_mic_task and not self._raw_mic_task.done():
+                self._raw_mic_task.cancel()
+                try:
+                    await self._raw_mic_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        except Exception:
+            pass
         self._raw_mic_task = None
 
         # Logout dedicated talk connection
         if hasattr(self, "_talk_host") and self._talk_host:
             try:
-                await self._talk_host.logout()
-            except Exception:
-                pass
+                await asyncio.wait_for(self._talk_host.logout(), timeout=5)
+            except Exception as exc:
+                _LOGGER.debug("Talk host logout error: %s", exc)
             self._talk_host = None
 
-        # Cancel output reader task
-        if self._output_reader_task and not self._output_reader_task.done():
-            self._output_reader_task.cancel()
+        # Logout dedicated preview/input connection
+        if hasattr(self, "_preview_host") and self._preview_host:
             try:
-                await self._output_reader_task
-            except asyncio.CancelledError:
-                pass
+                await asyncio.wait_for(self._preview_host.logout(), timeout=5)
+            except Exception as exc:
+                _LOGGER.debug("Preview host logout error: %s", exc)
+            self._preview_host = None
+
+        # Cancel output reader task
+        try:
+            if self._output_reader_task and not self._output_reader_task.done():
+                self._output_reader_task.cancel()
+                try:
+                    await self._output_reader_task
+                except asyncio.CancelledError:
+                    pass
+        except Exception:
+            pass
         self._output_reader_task = None
 
-        async with self._pcm_lock:
-            self._pcm_buffer.clear()
-            self._pcm_overflow_warned = False
+        try:
+            async with self._pcm_lock:
+                self._pcm_buffer.clear()
+                self._pcm_overflow_warned = False
+        except Exception:
+            pass
 
         self._baichuan = None
+        self._talk_baichuan = None
         self._talk_ability = None
         _LOGGER.warning("Reolink audio handler stopped (sent %d audio chunks)", self._send_count)
 
@@ -1301,12 +1338,16 @@ class ReolinkAudioHandler:
         # Start the output processing loop
         self._output_reader_task = asyncio.create_task(self._baichuan_audio_output_loop())
 
-    async def _get_baichuan_object(self):
-        """Create a dedicated Baichuan connection for talk.
+    async def _get_baichuan_object(self, purpose: str = "talk"):
+        """Create a dedicated Baichuan connection.
 
         We create our OWN Host/Baichuan connection rather than reusing the
         Reolink integration's connection. This avoids interference between
         our audio streaming and the integration's normal command flow.
+
+        Args:
+            purpose: "talk" for speaker output, "preview" for mic input.
+                     Controls which host reference is stored for proper cleanup.
         """
         camera_entity = self._camera_entity_id or ""
         reolink_entry_id = self._reolink_entry_id
@@ -1340,7 +1381,7 @@ class ReolinkAudioHandler:
             from homeassistant.helpers.aiohttp_client import async_get_clientsession  # noqa: PLC0415
             from reolink_aio.api import Host  # noqa: PLC0415
 
-            talk_host = Host(
+            new_host = Host(
                 host=host,
                 username=username,
                 password=password,
@@ -1349,14 +1390,17 @@ class ReolinkAudioHandler:
                 bc_port=bc_port,
                 aiohttp_get_session_callback=lambda: async_get_clientsession(self._hass),
             )
-            bc = talk_host.baichuan
+            bc = new_host.baichuan
             await bc.login()
-            # Store the Host object so we can logout later
-            self._talk_host = talk_host
-            _LOGGER.warning("Created dedicated Baichuan talk connection to %s:%s", host, bc_port)
+            # Store the Host object in the appropriate slot for proper cleanup
+            if purpose == "talk":
+                self._talk_host = new_host
+            else:
+                self._preview_host = new_host
+            _LOGGER.warning("Created dedicated Baichuan %s connection to %s:%s", purpose, host, bc_port)
             return bc
         except Exception as exc:
-            _LOGGER.warning("Failed to create Baichuan talk connection: %s", exc)
+            _LOGGER.warning("Failed to create Baichuan %s connection: %s", purpose, exc)
             return None
 
     async def _query_talk_ability(self) -> dict | None:
