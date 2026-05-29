@@ -547,11 +547,15 @@ class JeevesSessionManager:
             reolink_mode = config.get(CONF_AUDIO_MODE) == AUDIO_MODE_REOLINK
 
             if reolink_mode:
-                # Send greeting IMMEDIATELY after connect — minimize idle time
-                # before first generation (reduces 1008 rate).
-                # Audio setup runs in parallel; output audio is buffered until hardware ready.
+                # Send greeting FIRST, then start receive loop.
+                # Critical ordering: greeting MUST be sent before receive loop starts.
+                # In reconnect (which never gets 1008), this ordering is natural.
+                # On initial connect, we must ensure the same ordering.
                 camera_entity = self._resolve_camera_entity(config.get(CONF_CAMERA_ENTITY, ""))
                 await self._send_initial_greeting(camera_entity)
+
+                # NOW start the receive loop (after greeting is sent)
+                self._client.start_receive()
 
                 # Start audio setup in background (model generates while hardware initializes)
                 _LOGGER.warning("Starting Reolink audio (model already generating greeting)")
@@ -563,6 +567,8 @@ class JeevesSessionManager:
             else:
                 camera_entity = self._resolve_camera_entity(config.get(CONF_CAMERA_ENTITY, ""))
                 await self._send_initial_greeting(camera_entity)
+                # Start receive loop after greeting
+                self._client.start_receive()
                 _LOGGER.warning("Audio mode is '%s' (not reolink)", config.get(CONF_AUDIO_MODE))
 
             # Start vision loop — send frames to AI for visual context
