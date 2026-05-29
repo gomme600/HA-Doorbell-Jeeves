@@ -192,10 +192,19 @@ def build_system_context(
     # Camera viewing capability
     camera_entities = [e for e in readable_entities if e.entity_id.startswith("camera.")]
     if camera_entities:
+        # Determine which is the primary camera from config
+        primary_cam_id = ""
+        if config:
+            from .const import CONF_CAMERA_ENTITY  # noqa: PLC0415
+            primary_cam_id = config.get(CONF_CAMERA_ENTITY, "")
         lines.append("\n--- CAMERAS (you can view any of these on demand) ---")
         for cam in camera_entities:
-            lines.append(f"• {cam.name} [{cam.entity_id}]: {cam.description}")
-        lines.append("Use the 'view_camera' tool to get a live snapshot from any camera above.")
+            marker = " ⭐ PRIMARY (your live video feed)" if cam.entity_id == primary_cam_id else ""
+            lines.append(f"• {cam.name} [{cam.entity_id}]: {cam.description}{marker}")
+        lines.append(
+            "Use 'view_camera' to get a high-res snapshot. Without specifying a camera, "
+            "it uses your PRIMARY camera. Only specify a different camera_entity_id to check other areas."
+        )
         lines.append("Use 'switch_camera' to change which camera provides the live video/audio feed.")
 
     # Camera placement map (spatial context)
@@ -329,20 +338,32 @@ def build_gemini_tools(
     camera_entities = [e for e in readable_entities if e.entity_id.startswith("camera.")]
     if camera_entities:
         camera_ids = [e.entity_id for e in camera_entities]
+        # Determine the primary camera for the tool description
+        primary_cam = ""
+        if config:
+            from .const import CONF_CAMERA_ENTITY  # noqa: PLC0415
+            primary_cam = config.get(CONF_CAMERA_ENTITY, "")
+        primary_note = f" Defaults to your PRIMARY camera ({primary_cam})." if primary_cam else ""
         declarations.append(types.FunctionDeclaration(
             name=TOOL_VIEW_CAMERA,
             description=(
-                "COMMAND: Capture a single live snapshot from a camera. Use this for "
-                "quick checks of other areas (e.g., carport, gate) WITHOUT changing "
-                "your primary live video/audio feed. The image is added to your "
-                "history for analysis."
+                "COMMAND: Capture a high-resolution snapshot from a camera for visual analysis. "
+                "Use this to see what is currently visible on a camera."
+                f"{primary_note} "
+                "Only specify a different camera_entity_id if you want to check a DIFFERENT area "
+                "(e.g., carport, garden). Your live video feed already shows the primary camera — "
+                "use view_camera to get a high-res still for careful analysis."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "camera_entity_id": {
                         "type": "string",
-                        "description": "Camera ID to snapshot",
+                        "description": (
+                            f"Camera to snapshot. OMIT to use your primary camera ({primary_cam}). "
+                            "Only specify if checking a DIFFERENT camera."
+                            if primary_cam else "Camera ID to snapshot"
+                        ),
                         "enum": camera_ids,
                     },
                     "reason": {
@@ -350,7 +371,7 @@ def build_gemini_tools(
                         "description": "Reason for snapshot",
                     },
                 },
-                "required": ["camera_entity_id"],
+                "required": [],
             },
         ))
 
@@ -819,19 +840,29 @@ def build_openai_tools(
     camera_entities = [e for e in readable_entities if e.entity_id.startswith("camera.")]
     if camera_entities:
         camera_ids = [e.entity_id for e in camera_entities]
+        primary_cam_oai = ""
+        if config:
+            from .const import CONF_CAMERA_ENTITY  # noqa: PLC0415
+            primary_cam_oai = config.get(CONF_CAMERA_ENTITY, "")
+        primary_note_oai = f" Defaults to primary camera ({primary_cam_oai})." if primary_cam_oai else ""
         tools.append({
             "type": "function",
             "name": TOOL_VIEW_CAMERA,
             "description": (
-                "Get a live snapshot from a camera. Use this to look at different areas "
-                "of the property, check for objects, people, or events."
+                "Get a high-resolution snapshot from a camera for visual analysis."
+                f"{primary_note_oai} "
+                "Only specify a different camera_entity_id to check a DIFFERENT area."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "camera_entity_id": {
                         "type": "string",
-                        "description": "Which camera to view",
+                        "description": (
+                            f"Camera to snapshot. OMIT to use primary camera ({primary_cam_oai}). "
+                            "Only specify if checking a different camera."
+                            if primary_cam_oai else "Which camera to view"
+                        ),
                         "enum": camera_ids,
                     },
                     "reason": {
@@ -839,7 +870,7 @@ def build_openai_tools(
                         "description": "Brief note on why you're checking this camera",
                     },
                 },
-                "required": ["camera_entity_id"],
+                "required": [],
             },
         })
 
@@ -1187,7 +1218,7 @@ async def execute_tool_call(
 
         # Smart tools
         if function_name == TOOL_VIEW_CAMERA:
-            return await _execute_view_camera(hass, store, arguments)
+            return await _execute_view_camera(hass, store, arguments, config)
         if function_name == TOOL_SWITCH_CAMERA:
             return await _execute_switch_camera(hass, store, arguments)
         if function_name == TOOL_PTZ_MOVE:
@@ -1245,7 +1276,8 @@ async def execute_tool_call(
 
 
 async def _execute_view_camera(
-    hass: HomeAssistant, store: DataStore, arguments: dict[str, Any]
+    hass: HomeAssistant, store: DataStore, arguments: dict[str, Any],
+    config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Capture a snapshot from a camera and return it for AI analysis.
 
@@ -1254,6 +1286,13 @@ async def _execute_view_camera(
     """
     camera_id = arguments.get("camera_entity_id", "")
     reason = arguments.get("reason", "on-demand check")
+
+    # Default to the active/primary session camera if none specified
+    if not camera_id and config:
+        from .const import CONF_CAMERA_ENTITY  # noqa: PLC0415
+        camera_id = config.get(CONF_CAMERA_ENTITY, "")
+        if camera_id:
+            _LOGGER.info("view_camera: defaulting to primary camera %s", camera_id)
 
     # Validate entity is managed
     allowed = [e.entity_id for e in store.managed_entities if e.entity_id.startswith("camera.")]
@@ -1317,23 +1356,29 @@ async def _execute_view_camera(
             "_image_base64": image_b64,  # Special key: session manager injects as image
             "_image_mime": "image/jpeg",
             "_image_context": (
-                f"[SYSTEM] ON-DEMAND CAMERA SNAPSHOT — {cam_name} ({camera_id})\n"
-                f"Capture reason: {reason}\n"
+                f"[VISUAL ANALYSIS REQUIRED] Camera: {cam_name} ({camera_id})\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "CRITICAL INSTRUCTION: The image immediately following this message is a "
-                "HIGH-RESOLUTION snapshot captured just now from this specific camera.\n"
-                "• Count objects CAREFULLY — look at the ENTIRE image systematically.\n"
-                "• If asked 'how many cars', count each distinct vehicle you can see.\n"
-                "• Do NOT rely on memory or previous frames — use ONLY this snapshot.\n"
-                "• If something is not visible in this image, say it is NOT visible.\n"
-                "• Do NOT hallucinate or invent objects that are not clearly in the image.\n"
-                "• Describe what you ACTUALLY see, even if it contradicts expectations.\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                "MANDATORY RULES FOR THIS IMAGE:\n"
+                "1. Describe ONLY what you can ACTUALLY SEE in the pixel data.\n"
+                "2. Do NOT use camera area descriptions, location metadata, or "
+                "expectations to fabricate what should be visible.\n"
+                "3. If NO PERSON is clearly visible in the image, you MUST say "
+                "'No person is visible in this image' — do NOT invent one.\n"
+                "4. If the image shows an empty scene (hallway, garden, room), "
+                "describe it as empty. Do NOT assume someone 'must be there'.\n"
+                "5. Do NOT copy descriptions from system prompts or camera configs "
+                "(like 'near the letterbox' or 'at the front door') unless you can "
+                "genuinely see those objects AND a person next to them.\n"
+                "6. Before notifying anyone about a visitor, VERIFY you can see a "
+                "human figure. If unsure, say 'I cannot clearly identify a person'.\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "Analyze the attached image NOW. What do you ACTUALLY see?"
             ),
             "message": (
-                f"A high-resolution snapshot from {cam_name} has been captured and injected. "
-                "Analyze ONLY this snapshot image to answer the visitor's question. "
-                "Count all objects carefully and report exactly what you see."
+                f"Snapshot captured from {cam_name}. "
+                "IMPORTANT: Describe ONLY what is visible in the actual image pixels. "
+                "If no person is visible, say so clearly. Do NOT fabricate descriptions "
+                "based on expected context or camera metadata."
             ),
         }
     except asyncio.TimeoutError:
