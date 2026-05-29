@@ -162,6 +162,11 @@ class JeevesSessionManager:
         # PTZ camera tracking: cameras moved during this session (auto-return on end)
         self._ptz_moved_cameras: set[str] = set()
 
+        # Proactive monitoring: periodic turn injection so the model can act autonomously
+        self._monitor_task: asyncio.Task[None] | None = None
+        self._last_model_activity: float = 0.0  # time of last model turn completion
+        self._monitor_interval: float = 12.0  # seconds between proactive checks
+
     def _normalize_manual_audio_config(self) -> None:
         """Backfill split go2rtc stream keys from the legacy single stream key."""
         legacy_stream = str(self._config.get(CONF_GO2RTC_STREAM_NAME, "") or "").strip()
@@ -546,6 +551,9 @@ class JeevesSessionManager:
             silence_timeout = float(config.get(CONF_SILENCE_TIMEOUT, DEFAULT_SILENCE_TIMEOUT))
             if silence_timeout > 0:
                 self._silence_task = asyncio.create_task(self._silence_watchdog(silence_timeout))
+
+            # Start proactive monitoring loop (gives model agency to act without visitor speech)
+            self._monitor_task = asyncio.create_task(self._proactive_monitor_loop())
 
             self._register_stop_triggers()
 
@@ -1291,6 +1299,57 @@ class JeevesSessionManager:
         except asyncio.CancelledError:
             pass
 
+    async def _proactive_monitor_loop(self) -> None:
+        """Periodically give the model a turn to act autonomously.
+
+        This enables the model to:
+        - End the session on its own if the visitor leaves
+        - Switch cameras to follow a suspect
+        - Send alerts based on what it sees
+        - Speak proactively (e.g., warn about suspicious behavior)
+
+        With NO_INTERRUPTION mode, the model only gets turns from visitor speech
+        or injected messages. This loop injects periodic monitoring prompts so
+        the model can take initiative as a security guard.
+        """
+        # Wait for greeting to complete before starting monitoring
+        await asyncio.sleep(15.0)
+        _LOGGER.warning("Proactive monitoring loop started (interval=%.0fs)", self._monitor_interval)
+        try:
+            while self._active and self._client and self._client.connected:
+                await asyncio.sleep(self._monitor_interval)
+                if not self._active or not self._client or not self._client.connected:
+                    break
+
+                # Skip if model is currently generating (don't stack turns)
+                if self._client.model_generating:
+                    continue
+
+                # Skip if model was recently active (speech/tool within interval)
+                now = time.time()
+                if self._last_model_activity and (now - self._last_model_activity) < self._monitor_interval * 0.8:
+                    continue
+
+                # Inject monitoring prompt — model can speak, call tools, or stay silent
+                try:
+                    await self._client.inject_context(
+                        "[MONITOR] Periodic check. You are continuously watching the live camera feed. "
+                        "Assess the situation silently. ONLY take action if something requires it:\n"
+                        "- If the visitor left or no one is visible → call end_conversation\n"
+                        "- If you see suspicious behavior → send an alert notification\n"
+                        "- If the visitor moved → consider switching cameras to follow them\n"
+                        "- If you notice something important → speak to the visitor\n"
+                        "- If nothing needs attention → call no_action_needed (do NOT speak)\n"
+                        "Do NOT repeat your greeting. Do NOT announce that you're monitoring.",
+                        turn_complete=True,
+                    )
+                except Exception:
+                    _LOGGER.debug("Monitor inject failed (session may have ended)")
+                    break
+        except asyncio.CancelledError:
+            pass
+        _LOGGER.warning("Proactive monitoring loop ended")
+
     def _touch_audio_activity(self) -> None:
         """Mark the current time as the latest audio activity."""
         self._last_audio_activity = asyncio.get_running_loop().time()
@@ -1502,6 +1561,8 @@ class JeevesSessionManager:
             "IMPORTANT: In this same turn, after starting your greeting speech, also call "
             "the notify tool to alert the homeowner. You MUST do both (speak AND call notify) "
             "in the same response turn — do NOT wait for a second turn. "
+            "Do NOT tell the visitor you are notifying anyone — just greet them warmly and "
+            "ask how you can help. The notification is silent/internal. "
             "Speak now."
         )
         try:
@@ -1517,6 +1578,7 @@ class JeevesSessionManager:
     def _handle_audio_output(self, audio_bytes: bytes) -> None:
         """Handle audio output from the AI model."""
         self._touch_audio_activity()
+        self._last_model_activity = time.time()
         if not hasattr(self, "_audio_out_count"):
             self._audio_out_count = 0
         self._audio_out_count += 1
@@ -1587,6 +1649,15 @@ class JeevesSessionManager:
         if getattr(self, "_greeting_phase", False):
             _LOGGER.warning("Tool call %s blocked during greeting phase — forcing speech first", function_name)
             return {"error": "You must speak your greeting FIRST before using any tools. Speak now."}
+
+        # Track model activity for proactive monitoring + silence watchdog
+        self._last_model_activity = time.time()
+        self._touch_audio_activity()
+
+        # no_action_needed: silent acknowledgment from monitoring tick (no-op)
+        if function_name == "no_action_needed":
+            return {"success": True}
+
         _LOGGER.warning("Tool call: %s(%s)", function_name, arguments)
         self._security.log_event("tool_call_request", function_name, {"arguments": arguments})
         self.hass.bus.async_fire(
@@ -1824,6 +1895,7 @@ class JeevesSessionManager:
                 self._timeout_task,
                 self._silence_task,
                 self._ai_speaking_clear_task,
+                self._monitor_task,
             ):
                 if task and not task.done():
                     task.cancel()
@@ -1835,6 +1907,7 @@ class JeevesSessionManager:
             self._timeout_task = None
             self._silence_task = None
             self._ai_speaking_clear_task = None
+            self._monitor_task = None
             if self._client:
                 try:
                     await self._client.disconnect()

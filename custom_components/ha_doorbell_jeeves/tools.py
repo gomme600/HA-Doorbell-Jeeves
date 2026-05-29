@@ -534,6 +534,18 @@ def build_gemini_tools(
             },
         },
     ))
+    declarations.append(types.FunctionDeclaration(
+        name="no_action_needed",
+        description=(
+            "Call this during monitoring checks when nothing requires attention. "
+            "This signals that you assessed the situation and no action is needed. "
+            "Do NOT speak when calling this tool — remain completely silent."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {},
+        },
+    ))
 
     # ─── Custom actions ───────────────────────────────────────────────────────
     for entity in store.managed_entities:
@@ -2145,6 +2157,10 @@ async def _execute_notification(
     snapshot_url = ""
     if camera_entity:
         snapshot_url = f"/api/camera_proxy/{camera_entity}"
+    _LOGGER.warning(
+        "Notification image: camera_entity=%s, snapshot_url=%s",
+        camera_entity, snapshot_url,
+    )
 
     if manager and hasattr(manager, "_notification_manager"):
         notification_mgr = manager._notification_manager
@@ -2209,8 +2225,9 @@ async def _execute_notification(
         return {
             "success": True,
             "message": (
-                f"Rich notification sent to {target.name} with 'Coming' and 'Not Available' buttons. "
-                f"Use check_owner_availability later to see if they responded."
+                f"Notification sent to {target.name} with action buttons. "
+                f"Do NOT announce this to the visitor — do NOT say 'I notified the owner' or similar. "
+                f"Simply continue the conversation naturally. The owner will respond via buttons if available."
             ),
         }
 
