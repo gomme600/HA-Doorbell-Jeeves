@@ -113,25 +113,23 @@ class GeminiLiveClient(BaseRealtimeClient):
         )
         self._session = await self._session_cm.__aenter__()
         self._connected = True
-
-        # Start receive loop FIRST — catches any server-sent setup errors immediately.
-        # Previously we started it after reference images, which meant early 1008s were missed.
-        self._receive_task = asyncio.create_task(self._receive_loop())
+        self._connect_time = time.time()
+        _LOGGER.warning("WS connected at T+0.0")
 
         # Wait for the server to fully initialize the session.
         # Gemini Live has an internal setup phase after WebSocket connect.
-        # Sending content too early triggers 1008 "policy violation" intermittently.
-        # 3s delay (increased from 2s) gives the server sufficient initialization time.
         await asyncio.sleep(3.0)
+        _LOGGER.warning("Post-sleep at T+%.1f, injecting reference images...", time.time() - self._connect_time)
 
         await self._inject_reference_images()
+        _LOGGER.warning("Reference images done at T+%.1f, starting receive loop...", time.time() - self._connect_time)
+
+        # Start receive loop AFTER reference images are sent.
+        self._receive_task = asyncio.create_task(self._receive_loop())
+
         # Set startup grace period: block audio/video for 5s to let the model initialize
-        # and avoid 1008 policy violation from audio racing with session setup.
-        # NOTE: We do NOT set _model_generating=True here because that would block
-        # the greeting inject_context call. The 5s grace period is sufficient to
-        # prevent audio from flowing during the model's initial generation.
         self._startup_grace_until = time.time() + 5.0
-        _LOGGER.info("Gemini Live connected (model=%s, voice=%s)", self._model, self._voice)
+        _LOGGER.warning("Gemini Live connected at T+%.1f (model=%s, voice=%s)", time.time() - self._connect_time, self._model, self._voice)
 
     async def _reconnect_session(self) -> bool:
         """Tear down current session and open a new one (same config). Returns True on success."""
@@ -358,6 +356,8 @@ class GeminiLiveClient(BaseRealtimeClient):
             # processing, triggering a 1008 policy violation.
             if turn_complete:
                 self._model_generating = True
+                if hasattr(self, '_connect_time'):
+                    _LOGGER.warning("inject_context(turn_complete=True) at T+%.1f", time.time() - self._connect_time)
 
             await self._session.send_client_content(
                 turns=[types.Content(role="user", parts=parts)],
@@ -467,7 +467,8 @@ class GeminiLiveClient(BaseRealtimeClient):
                     self._tool_call_pending = False
                     self._vision_paused = False
                     err_str = str(recv_err)
-                    _LOGGER.warning("Gemini receive() raised: %s (turns=%d)", err_str[:200], turns_completed)
+                    t_err = time.time() - self._connect_time if hasattr(self, '_connect_time') else -1
+                    _LOGGER.warning("Gemini receive() raised at T+%.1f: %s (turns=%d)", t_err, err_str[:200], turns_completed)
                     if ("close" in err_str.lower() or "1008" in err_str
                             or "1011" in err_str or "deadline" in err_str.lower()
                             or "not implemented" in err_str.lower()):
