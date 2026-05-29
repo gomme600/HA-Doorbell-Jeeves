@@ -1820,10 +1820,14 @@ class JeevesSessionManager:
     async def _send_initial_greeting(self, camera_entity: str = "") -> None:
         """Send an initial trigger message so the AI starts speaking immediately.
 
-        Vision context is merged directly into the greeting message to avoid sending
-        multiple partial turns before the greeting. Multiple partial turns
-        (reference images + vision context) before turn_complete=True were found
-        to cause ~20% first-connection 1008 errors.
+        Uses a two-phase approach to avoid 1008 policy violations:
+        1. Send full context as a partial turn (turn_complete=False) — no generation
+        2. Wait 2s for server to fully process the context
+        3. Send minimal trigger (turn_complete=True) — starts generation
+
+        This separation gives the Gemini server time to process reference images
+        and context before being asked to generate, which eliminates the ~20%
+        first-connection 1008 error rate.
         """
         if not self._client:
             return
@@ -1831,7 +1835,7 @@ class JeevesSessionManager:
         self._greeting_phase = True
         self._notify_after_greeting = True  # Trigger notification after greeting completes
 
-        # Build combined vision + greeting message (single turn_complete=True call)
+        # Build context message (will be sent as partial turn)
         vision_prefix = ""
         if camera_entity:
             vision_prefix = (
@@ -1840,23 +1844,31 @@ class JeevesSessionManager:
                 "Do NOT call view_camera for this camera — you already see it live. "
             )
 
-        trigger_msg = (
+        context_msg = (
             f"[SYSTEM] {vision_prefix}"
             "A visitor just rang the doorbell. "
-            "START SPEAKING YOUR GREETING IMMEDIATELY — do NOT call any tools first. "
             "A camera frame is being sent to you right now — use it to identify the visitor "
             "if you recognize them, but do NOT wait or call view_camera. "
             "Just greet them warmly and ask how you can help. "
-            "Do NOT tell the visitor you are notifying anyone. "
-            "Speak now."
+            "Do NOT tell the visitor you are notifying anyone."
         )
+
         try:
-            # Pre-close echo gate with generous initial hold: AI will start
-            # speaking after this message. The hold time will be naturally
-            # extended by _handle_audio_output as actual audio chunks arrive.
-            self._ai_last_output_time = time.time() + 8.0  # Gate closed for at least 10s total
-            await self._client.inject_context(trigger_msg)
-            _LOGGER.warning("Sent initial greeting trigger to AI model (echo gate pre-armed)")
+            # Phase 1: Load context without triggering generation
+            await self._client.inject_context(context_msg, turn_complete=False)
+            _LOGGER.warning("Greeting context loaded (turn_complete=False), waiting 2s for server to process...")
+
+            # Phase 2: Wait for server to fully process context + reference images
+            await asyncio.sleep(2.0)
+
+            # Phase 3: Trigger generation with minimal message
+            # Pre-close echo gate with generous initial hold
+            self._ai_last_output_time = time.time() + 8.0
+            await self._client.inject_context(
+                "[SYSTEM] Speak your greeting NOW.",
+                turn_complete=True,
+            )
+            _LOGGER.warning("Sent greeting generation trigger (echo gate pre-armed)")
         except Exception:
             _LOGGER.exception("Failed to send initial greeting trigger")
 
