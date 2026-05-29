@@ -2213,6 +2213,13 @@ async def _execute_notification(
             except Exception as err2:
                 _LOGGER.warning("go2rtc snapshot fallback exception: %s", err2)
 
+        # Try 3: use the latest frame from the active vision loop
+        if not image_bytes and manager:
+            latest = getattr(manager, "_latest_vision_frame", b"")
+            if latest:
+                image_bytes = latest
+                _LOGGER.info("Using cached vision frame for notification (%d bytes)", len(latest))
+
         if image_bytes:
             def _write_snapshot() -> None:
                 with open(snapshot_path, "wb") as f:

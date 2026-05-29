@@ -152,6 +152,7 @@ class JeevesSessionManager:
         self._session_end_reason: str = "session ended"
         self._session_memory_saved = False
         self._session_start_snapshot: str = ""
+        self._latest_vision_frame: bytes = b""  # Latest frame from vision loop
         self._transcript_history: list[dict[str, str]] = []
 
         # Echo gate: suppress mic forwarding while AI is speaking to prevent
@@ -1065,6 +1066,7 @@ class JeevesSessionManager:
                     processed = await self.hass.async_add_executor_job(
                         process_frame, image_bytes, max_w, max_h, quality,
                     )
+                    self._latest_vision_frame = processed  # Cache for notifications
                     frame_b64 = base64.b64encode(processed).decode("ascii")
                     await self._client.send_image(frame_b64, mime_type="image/jpeg")
                     frames_sent += 1
