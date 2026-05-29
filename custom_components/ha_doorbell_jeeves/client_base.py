@@ -37,7 +37,12 @@ class BaseRealtimeClient(ABC):
         """Inject an image frame into the session."""
 
     @abstractmethod
-    async def inject_context(self, text: str) -> None:
+    async def inject_context(
+        self,
+        text: str,
+        image_base64: str | None = None,
+        mime_type: str = "image/jpeg",
+    ) -> None:
         """Inject a text context message into the session (for tool results in dual-model mode)."""
 
     async def request_recap(self, outcome: str, timeout: float = 8.0) -> dict[str, str] | None:

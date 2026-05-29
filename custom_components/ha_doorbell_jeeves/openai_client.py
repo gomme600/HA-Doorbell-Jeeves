@@ -51,7 +51,7 @@ class OpenAIRealtimeClient(BaseRealtimeClient):
         self._receive_task: asyncio.Task[None] | None = None
         self._connected = False
         self._conversation_turns: list[dict[str, str]] = []
-        self._pending_tool_image: tuple[str, str] | None = None
+        self._pending_tool_image: tuple[str, str, str] | None = None
 
     @property
     def connected(self) -> bool:
@@ -119,16 +119,24 @@ class OpenAIRealtimeClient(BaseRealtimeClient):
         except Exception:
             _LOGGER.exception("Failed to send image to OpenAI")
 
-    async def inject_context(self, text: str) -> None:
+    async def inject_context(
+        self,
+        text: str,
+        image_base64: str | None = None,
+        mime_type: str = "image/jpeg",
+    ) -> None:
         """Inject a text message into the realtime session (used by tool router for results)."""
         if not self._ws or not self._connected:
             return
         try:
+            content: list[dict[str, Any]] = [{"type": "input_text", "text": text}]
+            if image_base64:
+                content.append({"type": "input_image", "image": image_base64})
             await self._ws.conversation.item.create(
                 item={
                     "type": "message",
                     "role": "user",
-                    "content": [{"type": "input_text", "text": text}],
+                    "content": content,
                 }
             )
         except Exception:
@@ -234,8 +242,16 @@ class OpenAIRealtimeClient(BaseRealtimeClient):
                 pending_tool_image = self._pending_tool_image
                 self._pending_tool_image = None
                 if pending_tool_image:
-                    image_b64, mime_type = pending_tool_image
-                    await self.send_image(image_b64, mime_type=mime_type)
+                    if len(pending_tool_image) == 2:
+                        image_b64, mime_type = pending_tool_image
+                        await self.send_image(image_b64, mime_type=mime_type)
+                    else:
+                        image_b64, mime_type, image_context = pending_tool_image
+                        await self.inject_context(
+                            image_context,
+                            image_base64=image_b64,
+                            mime_type=mime_type,
+                        )
                 await self._ws.response.create()
             except Exception:
                 _LOGGER.exception("Failed to send function output")

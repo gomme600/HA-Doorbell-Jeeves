@@ -668,7 +668,11 @@ class DoorbellJeevesConfigFlow(ConfigFlow, domain=DOMAIN):
     def _create_entry(self) -> FlowResult:
         if not self._data.get("start_triggers_config") and self._data.get("doorbell_trigger_entity"):
             self._data["start_triggers_config"] = [
-                {"entity_id": self._data["doorbell_trigger_entity"], "to_state": "on"}
+                {
+                    "entity_id": self._data["doorbell_trigger_entity"],
+                    "to_state": "on",
+                    "restart_session": True,
+                }
             ]
         self._data.pop("doorbell_trigger_entity", None)
         camera = self._data.get(CONF_CAMERA_ENTITY, "")
@@ -2215,8 +2219,14 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
         )
 
         if user_input is not None:
+            restart_entities = user_input.get("restart_entities", [])
             self._data["start_triggers_config"] = [
-                {"entity_id": entity_id, "to_state": "on"} for entity_id in user_input.get("start_entities", [])
+                {
+                    "entity_id": entity_id,
+                    "to_state": "on",
+                    "restart_session": entity_id in restart_entities,
+                }
+                for entity_id in user_input.get("start_entities", [])
             ]
             self._data[CONF_STOP_ENTITIES] = user_input.get(CONF_STOP_ENTITIES, [])
             self._data[CONF_TAKEOVER_REOLINK_API] = user_input.get(CONF_TAKEOVER_REOLINK_API, True)
@@ -2229,9 +2239,19 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
 
         current_start = self._data.get("start_triggers_config", [])
         start_entity_ids = [trigger["entity_id"] for trigger in current_start if trigger.get("entity_id")]
+        restart_entity_ids = [
+            trigger["entity_id"]
+            for trigger in current_start
+            if trigger.get("entity_id") and trigger.get("restart_session")
+        ]
         is_reolink = self._data.get(CONF_AUDIO_MODE) == AUDIO_MODE_REOLINK
         schema: dict[Any, Any] = {
             vol.Optional("start_entities", default=start_entity_ids): EntitySelector(
+                EntitySelectorConfig(
+                    domain=["binary_sensor", "input_boolean", "button"], multiple=True
+                )
+            ),
+            vol.Optional("restart_entities", default=restart_entity_ids): EntitySelector(
                 EntitySelectorConfig(
                     domain=["binary_sensor", "input_boolean", "button"], multiple=True
                 )

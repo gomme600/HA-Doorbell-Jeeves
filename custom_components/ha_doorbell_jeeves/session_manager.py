@@ -96,6 +96,8 @@ from .store import DataStore
 from .tools import build_gemini_tools, build_openai_tools, build_system_context, execute_tool_call
 
 _LOGGER = logging.getLogger(__name__)
+TOOL_CALL_TIMEOUT = 25.0
+CAMERA_SWITCH_TIMEOUT = 30.0
 
 
 class JeevesSessionManager:
@@ -283,6 +285,16 @@ class JeevesSessionManager:
         except Exception:  # noqa: BLE001
             _LOGGER.exception("Failed to start session from trigger")
 
+    async def _restart_session_from_trigger(self) -> None:
+        """Stop the current session cleanly, then start a fresh one."""
+        try:
+            if self._active or self._starting:
+                await self.async_stop_session("restart requested by trigger")
+            await asyncio.sleep(0.2)
+            await self._safe_start_session()
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Failed to restart session from trigger")
+
     async def async_start_session(self) -> None:
         """Start the AI concierge session."""
         if self._active or self._starting:
@@ -460,6 +472,13 @@ class JeevesSessionManager:
             fps = config.get(CONF_VISION_FPS, DEFAULT_VISION_FPS)
             camera_entity = config.get(CONF_CAMERA_ENTITY, "")
             if camera_entity:
+                if self._client:
+                    await self._client.inject_context(
+                        "[SYSTEM] Live camera feed starting. "
+                        f"All realtime video frames that follow are from {camera_entity}. "
+                        "Treat these frames as current live visual evidence. "
+                        "If vision frames stop or a camera tool fails, say you cannot see it clearly."
+                    )
                 self._vision_task = asyncio.create_task(self._vision_loop(camera_entity, fps))
 
             if self._tool_router:
@@ -801,8 +820,7 @@ class JeevesSessionManager:
                 
                 if (self._active or self._starting) and _restart:
                     _LOGGER.warning("Start trigger FIRED with RESTART → restarting session")
-                    self.hass.async_create_task(self.async_stop_session("restart requested by trigger"))
-                    self.hass.async_create_task(self._safe_start_session())
+                    self.hass.async_create_task(self._restart_session_from_trigger())
                 elif not self._active and not self._starting:
                     _LOGGER.warning("Start trigger FIRED → starting session")
                     self.hass.async_create_task(self._safe_start_session())
@@ -1113,6 +1131,12 @@ class JeevesSessionManager:
         # 4. Restart Vision Loop
         if self._client and self._active:
             fps = float(self._config.get(CONF_VISION_FPS, DEFAULT_VISION_FPS))
+            if hasattr(self._client, "inject_context"):
+                await self._client.inject_context(
+                    "[SYSTEM] Live camera feed switching. "
+                    f"All realtime video frames that follow are from {camera_entity_id}. "
+                    "Do not describe the old camera as current."
+                )
             self._vision_task = asyncio.create_task(self._vision_loop(camera_entity_id, fps))
             result["video_switched"] = True
             _LOGGER.info("Vision loop restarted with camera: %s", camera_entity_id)
@@ -1568,13 +1592,34 @@ class JeevesSessionManager:
                         "instruction": "Inform the visitor this action cannot be completed.",
                     }
 
-        result = await execute_tool_call(
-            self.hass,
-            self.store,
-            function_name,
-            arguments,
-            self._config,
-        )
+        try:
+            result = await asyncio.wait_for(
+                execute_tool_call(
+                    self.hass,
+                    self.store,
+                    function_name,
+                    arguments,
+                    self._config,
+                ),
+                timeout=TOOL_CALL_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            _LOGGER.warning("Tool call timed out: %s after %.1fs", function_name, TOOL_CALL_TIMEOUT)
+            return {
+                "success": False,
+                "error": f"Tool '{function_name}' timed out after {TOOL_CALL_TIMEOUT:.0f} seconds.",
+                "instruction": (
+                    "Tell the visitor the action or camera check did not complete. "
+                    "Do not guess or invent what the camera showed."
+                ),
+            }
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.exception("Tool call failed unexpectedly: %s", function_name)
+            return {
+                "success": False,
+                "error": f"Tool '{function_name}' failed: {err}",
+                "instruction": "Tell the visitor the action failed. Do not claim it succeeded.",
+            }
 
         has_image = bool(result.get("_image_base64"))
         _LOGGER.warning(
@@ -1586,15 +1631,28 @@ class JeevesSessionManager:
 
         # Store image for injection AFTER tool response is sent (model needs response first)
         if has_image and self._client:
+            image_context = str(
+                result.pop(
+                    "_image_context",
+                    (
+                        "[SYSTEM] IMAGE CAPTURED. The requested visual snapshot has been injected "
+                        "below. Analyze THIS IMAGE carefully for your response. This snapshot is "
+                        "the ground truth for the current camera question."
+                    ),
+                )
+            )
             self._client._pending_tool_image = (
                 result.pop("_image_base64"),
                 result.pop("_image_mime", "image/jpeg"),
+                image_context,
             )
         else:
             if "_image_base64" in result:
                 result.pop("_image_base64")
             if "_image_mime" in result:
                 result.pop("_image_mime")
+            if "_image_context" in result:
+                result.pop("_image_context")
 
         extend_seconds = int(result.pop("_extend_session_seconds", 0) or 0)
         if extend_seconds > 0:
@@ -1611,11 +1669,33 @@ class JeevesSessionManager:
         # Handle camera switching
         switch_camera_id = result.pop("_switch_camera", None)
         if switch_camera_id:
-            switch_result = await self._switch_active_camera(switch_camera_id)
+            try:
+                switch_result = await asyncio.wait_for(
+                    self._switch_active_camera(switch_camera_id),
+                    timeout=CAMERA_SWITCH_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                _LOGGER.warning(
+                    "Camera switch timed out: %s after %.1fs",
+                    switch_camera_id,
+                    CAMERA_SWITCH_TIMEOUT,
+                )
+                switch_result = {
+                    "video_switched": False,
+                    "audio_switched": False,
+                    "initial_frame_sent": False,
+                    "error": (
+                        f"Camera switch to {switch_camera_id} timed out after "
+                        f"{CAMERA_SWITCH_TIMEOUT:.0f} seconds."
+                    ),
+                }
             result.update(switch_result)
             if not switch_result.get("video_switched"):
                 result["success"] = False
-                result["error"] = "Camera switch was requested but the live video feed did not restart."
+                result["error"] = switch_result.get(
+                    "error",
+                    "Camera switch was requested but the live video feed did not restart.",
+                )
 
         # Track PTZ-moved cameras for auto-return on session end
         ptz_moved = result.pop("_ptz_moved_camera", None)

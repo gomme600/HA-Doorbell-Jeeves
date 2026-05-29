@@ -8,6 +8,7 @@ from custom_components.ha_doorbell_jeeves.const import DOMAIN, TOOL_PLAY_AUDIO
 from custom_components.ha_doorbell_jeeves.events import EventStore, EVENT_IMPORTANT
 from custom_components.ha_doorbell_jeeves.models import AudioFile, CameraPlacement, ManagedEntity
 from custom_components.ha_doorbell_jeeves.tools import (
+    _execute_view_camera,
     _execute_extend_session,
     _execute_play_audio,
     _execute_recall_memories,
@@ -199,3 +200,46 @@ def test_execute_save_event_falls_back_to_available_manager_and_fires_entry_even
     assert event_store.events[0].title == "Security risk"
     assert hass.bus.events[-1][0] == EVENT_IMPORTANT
     assert hass.bus.events[-1][1]["entry_id"] == "entry-1"
+
+
+def test_execute_view_camera_returns_labeled_image_context(hass: object, monkeypatch: Any) -> None:
+    async def _run() -> None:
+        async def _fake_get_image(_hass: object, _camera_id: str, timeout: int = 8) -> Any:
+            return SimpleNamespace(content=b"not-a-real-jpeg")
+
+        def _fake_process_frame(
+            image_bytes: bytes,
+            _max_width: int,
+            _max_height: int,
+            _quality: int,
+        ) -> bytes:
+            return image_bytes
+
+        import custom_components.ha_doorbell_jeeves.frame_processor as frame_processor_module
+        import custom_components.ha_doorbell_jeeves.tools as tools_module
+
+        monkeypatch.setattr(tools_module, "ha_camera_get_image", _fake_get_image)
+        monkeypatch.setattr(frame_processor_module, "process_frame", _fake_process_frame)
+
+        store = _DummyStore(
+            managed_entities=[
+                ManagedEntity(
+                    entity_id="camera.carport",
+                    name="Carport",
+                    description="Covers the parked cars",
+                )
+            ]
+        )
+        result = await _execute_view_camera(
+            hass,
+            store,
+            {"camera_entity_id": "camera.carport", "reason": "count cars"},
+        )
+
+        assert result["success"] is True
+        assert result["camera_entity_id"] == "camera.carport"
+        assert "_image_base64" in result
+        assert "Camera entity: camera.carport" in result["_image_context"]
+        assert "do not infer it" in result["_image_context"]
+
+    asyncio.run(_run())

@@ -9,6 +9,7 @@ Smart tools are auto-generated based on entity domains:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import re
@@ -1229,7 +1230,11 @@ async def execute_tool_call(
 
     except Exception as err:
         _LOGGER.exception("Tool execution error: %s", function_name)
-        return {"error": str(err)}
+        return {
+            "success": False,
+            "error": f"{function_name} failed: {err}",
+            "instruction": "Do not claim the tool succeeded.",
+        }
 
 
 # ─── Smart Tool Implementations ───────────────────────────────────────────────
@@ -1254,24 +1259,36 @@ async def _execute_view_camera(
     try:
         raw_jpeg: bytes | None = None
         # Try HA camera snapshot API
-        image = await ha_camera_get_image(hass, camera_id, timeout=8)
+        image = await asyncio.wait_for(
+            ha_camera_get_image(hass, camera_id, timeout=8),
+            timeout=10,
+        )
         if image and image.content:
             raw_jpeg = image.content
             _LOGGER.info("Captured HA snapshot for %s: %d bytes", camera_id, len(raw_jpeg))
         else:
             # Fallback: try go2rtc snapshot
+            import aiohttp  # noqa: PLC0415
+
             from .reolink_audio import _discover_go2rtc_url, _get_go2rtc_session  # noqa: PLC0415
             base_url = await _discover_go2rtc_url(hass)
             if base_url:
                 url = f"{base_url}/api/frame.jpeg?src={camera_id}"
-                session = _get_go2rtc_session(hass) or aiohttp.ClientSession()
+                session = _get_go2rtc_session(hass)
+                own_session: aiohttp.ClientSession | None = None
+                if session is None:
+                    own_session = aiohttp.ClientSession()
+                    session = own_session
                 try:
-                    async with session.get(url, timeout=5) as resp:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                         if resp.status == 200:
                             raw_jpeg = await resp.read()
                             _LOGGER.info("Captured go2rtc fallback snapshot for %s: %d bytes", camera_id, len(raw_jpeg))
                 except Exception:
-                    pass
+                    _LOGGER.debug("go2rtc snapshot fallback failed for %s", camera_id, exc_info=True)
+                finally:
+                    if own_session is not None:
+                        await own_session.close()
 
         if not raw_jpeg:
             return {"error": f"Could not get image from {camera_id} (all methods failed)"}
@@ -1290,13 +1307,34 @@ async def _execute_view_camera(
         return {
             "success": True,
             "camera": cam_name,
+            "camera_entity_id": camera_id,
             "reason": reason,
             "_image_base64": image_b64,  # Special key: session manager injects as image
             "_image_mime": "image/jpeg",
+            "_image_context": (
+                "[SYSTEM] IMAGE CAPTURED BY TOOL: view_camera.\n"
+                f"Camera name: {cam_name}\n"
+                f"Camera entity: {camera_id}\n"
+                f"Reason: {reason}\n"
+                "The image immediately following this text is the live snapshot from that camera. "
+                "Use only this image as ground truth for questions about this camera view. "
+                "If the requested object/person is not visible, say that it is not visible; do not infer it."
+            ),
             "message": f"Here is the current view from {cam_name}. Analyze what you see.",
         }
+    except asyncio.TimeoutError:
+        return {
+            "success": False,
+            "error": (
+                f"Timed out while capturing image from {camera_id}. "
+                "No current image was provided to the model."
+            ),
+        }
     except Exception as err:
-        return {"error": f"Failed to capture from {camera_id}: {err}"}
+        return {
+            "success": False,
+            "error": f"Failed to capture from {camera_id}: {err}. No current image was provided to the model.",
+        }
 
 
 async def _execute_switch_camera(

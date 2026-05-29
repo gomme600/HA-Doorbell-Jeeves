@@ -62,6 +62,7 @@
         "description": "Choose which entities start Jeeves automatically and which entities stop the session.",
         "data": {
           "start_entities": "Start Trigger Entities",
+          "restart_entities": "Restart Session When These Start Triggers Fire",
           "stop_entities": "Stop Trigger Entities"
         }
       },
@@ -400,6 +401,7 @@
         "description": "Configure which entities trigger the AI session and how to detect when a human takes over.\n\n**Start triggers** automatically activate Jeeves (e.g., doorbell press).\n**Stop triggers** end the session (e.g., front door opens).\n**Human takeover** stops the AI when you start talking via the Reolink app or another method.",
         "data": {
           "start_entities": "Start Trigger Entities (e.g., doorbell button)",
+          "restart_entities": "Restart Session Triggers (e.g., doorbell button only)",
           "stop_entities": "Stop Trigger Entities (e.g., front door sensor)",
           "takeover_reolink_api": "Reolink API Takeover Detection (polls camera talk state)",
           "takeover_audio_energy": "Audio Energy Takeover Detection (monitors mic loudness)",

@@ -52,7 +52,7 @@ class GeminiLiveClient(BaseRealtimeClient):
         self._connected = False
         self._conversation_turns: list[dict[str, str]] = []
         self._recap_future: asyncio.Future[str] | None = None
-        self._pending_tool_image: tuple[str, str] | None = None
+        self._pending_tool_image: tuple[str, str, str] | None = None
         self._tool_call_pending = False
 
     @property
@@ -425,12 +425,17 @@ class GeminiLiveClient(BaseRealtimeClient):
         # We use inject_context (user role) for tool images (like snapshots)
         # to ensure they are captured in history and not lost in the live stream.
         if self._session and self._connected and self._pending_tool_image:
-            image_b64, mime_type = self._pending_tool_image
+            if len(self._pending_tool_image) == 2:
+                image_b64, mime_type = self._pending_tool_image
+                image_context = (
+                    "[SYSTEM] IMAGE CAPTURED. The requested visual snapshot has been injected "
+                    "below. Analyze THIS IMAGE carefully for your response."
+                )
+            else:
+                image_b64, mime_type, image_context = self._pending_tool_image
             self._pending_tool_image = None
             await self.inject_context(
-                "[SYSTEM] IMAGE CAPTURED. The requested visual snapshot has been injected "
-                "into your context below. Analyze THIS IMAGE carefully for your response. "
-                "This snapshot is the ground truth for your current analysis.",
+                image_context,
                 image_base64=image_b64,
                 mime_type=mime_type
             )

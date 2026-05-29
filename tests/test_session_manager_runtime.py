@@ -74,3 +74,27 @@ def test_ptz_auto_return_uses_store_and_clears_tracking() -> None:
 
     asyncio.run(_run())
 
+
+def test_restart_session_from_trigger_waits_for_stop_before_start() -> None:
+    async def _run() -> None:
+        manager = JeevesSessionManager.__new__(JeevesSessionManager)
+        manager._active = True
+        manager._starting = False
+        calls: list[str] = []
+
+        async def _stop(reason: str) -> None:
+            calls.append(f"stop:{reason}")
+            manager._active = False
+
+        async def _start() -> None:
+            calls.append("start")
+
+        manager.async_stop_session = _stop
+        manager._safe_start_session = _start
+
+        await manager._restart_session_from_trigger()
+
+        assert calls == ["stop:restart requested by trigger", "start"]
+
+    asyncio.run(_run())
+
