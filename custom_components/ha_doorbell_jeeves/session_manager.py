@@ -1020,9 +1020,14 @@ class JeevesSessionManager:
         consecutive_failures = 0
         frames_sent = 0
         go2rtc_stream = self._config.get(CONF_GO2RTC_STREAM_NAME, "")
-        # Also try the Reolink camera's native go2rtc stream (unique_id-based)
+        # Use the audio handler's resolved stream name (the one registered in go2rtc)
         if not go2rtc_stream and self._audio_handler:
-            go2rtc_stream = getattr(self._audio_handler, "_camera_unique_id", "") or ""
+            go2rtc_stream = getattr(self._audio_handler, "_stream_name", "") or ""
+        # Fallback: construct from Reolink entry ID
+        if not go2rtc_stream:
+            reolink_entry = self._config.get(CONF_REOLINK_ENTRY_ID, "")
+            if reolink_entry:
+                go2rtc_stream = f"jeeves_reolink_{reolink_entry.replace('-', '_')[:12]}"
 
         while self._active:
             try:
@@ -2306,7 +2311,15 @@ class JeevesSessionManager:
         except Exception:
             _LOGGER.debug("HA camera API failed for snapshot, trying go2rtc fallback", exc_info=True)
         # Fallback: go2rtc JPEG snapshot
-        go2rtc_stream = self._config.get(CONF_GO2RTC_STREAM_NAME, "") or camera_entity
+        go2rtc_stream = self._config.get(CONF_GO2RTC_STREAM_NAME, "")
+        if not go2rtc_stream and self._audio_handler:
+            go2rtc_stream = getattr(self._audio_handler, "_stream_name", "") or ""
+        if not go2rtc_stream:
+            reolink_entry = self._config.get(CONF_REOLINK_ENTRY_ID, "")
+            if reolink_entry:
+                go2rtc_stream = f"jeeves_reolink_{reolink_entry.replace('-', '_')[:12]}"
+        if not go2rtc_stream:
+            go2rtc_stream = camera_entity
         if go2rtc_stream:
             try:
                 frame_bytes = await self._go2rtc_snapshot(go2rtc_stream)

@@ -2187,13 +2187,19 @@ async def _execute_notification(
         if not image_bytes and manager:
             try:
                 go2rtc_stream = ""
+                # Priority 1: audio handler's resolved stream name (the one actually registered in go2rtc)
                 if hasattr(manager, "_audio_handler") and manager._audio_handler:
-                    go2rtc_stream = getattr(manager._audio_handler, "_camera_unique_id", "") or ""
+                    go2rtc_stream = getattr(manager._audio_handler, "_stream_name", "") or ""
+                # Priority 2: config go2rtc stream name
                 if not go2rtc_stream:
                     from .const import CONF_GO2RTC_STREAM_NAME  # noqa: PLC0415
                     go2rtc_stream = (config or {}).get(CONF_GO2RTC_STREAM_NAME, "")
+                # Priority 3: construct from Reolink entry ID (same logic as session_manager)
                 if not go2rtc_stream:
-                    go2rtc_stream = camera_entity  # camera entity name as stream name
+                    from .const import CONF_REOLINK_ENTRY_ID  # noqa: PLC0415
+                    reolink_entry = (config or {}).get(CONF_REOLINK_ENTRY_ID, "")
+                    if reolink_entry:
+                        go2rtc_stream = f"jeeves_reolink_{reolink_entry.replace('-', '_')[:12]}"
                 _LOGGER.info(
                     "Notification go2rtc fallback: stream=%s, has_method=%s",
                     go2rtc_stream, hasattr(manager, "_go2rtc_snapshot"),
