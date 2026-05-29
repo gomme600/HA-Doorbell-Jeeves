@@ -340,6 +340,8 @@ class GeminiLiveClient(BaseRealtimeClient):
                         saw_message = True
                         await self._process(response)
                 except Exception as recv_err:
+                    # Clear generation flag on any error (stream is done)
+                    self._model_generating = False
                     err_str = str(recv_err)
                     _LOGGER.warning("Gemini receive() raised: %s (turns=%d)", err_str[:200], turns_completed)
                     if "close" in err_str.lower() or "1008" in err_str or "not implemented" in err_str.lower():
@@ -363,6 +365,9 @@ class GeminiLiveClient(BaseRealtimeClient):
                     # Transient error — try re-entering
                     await asyncio.sleep(0.2)
                     continue
+
+                # Full response stream consumed — safe to ungate vision/audio
+                self._model_generating = False
 
                 if not self._connected:
                     break
@@ -450,10 +455,12 @@ class GeminiLiveClient(BaseRealtimeClient):
             turn_complete = getattr(server_content, "turn_complete", None)
             if interrupted:
                 _LOGGER.debug("Gemini: model output was INTERRUPTED (user started speaking)")
-                self._model_generating = False
+                # Don't clear _model_generating here — wait for receive() to end
             if turn_complete:
                 _LOGGER.debug("Gemini: turn_complete signal received")
-                self._model_generating = False
+                # Don't clear _model_generating here — there may be a tool_call
+                # still pending in the same receive() stream. We clear it in
+                # _receive_loop after the async for completes.
 
         if tool_call:
             await self._handle_tool_call(tool_call)
