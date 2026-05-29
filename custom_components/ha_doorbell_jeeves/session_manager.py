@@ -575,6 +575,8 @@ class JeevesSessionManager:
                         "Do NOT call view_camera for this camera — you already see it live.",
                         turn_complete=False,
                     )
+                    # Brief pause between context injection and greeting trigger
+                    await asyncio.sleep(0.3)
 
                 await self._send_initial_greeting()
             else:
@@ -588,6 +590,7 @@ class JeevesSessionManager:
                         "Do NOT call view_camera for this camera — you already see it live.",
                         turn_complete=False,
                     )
+                    await asyncio.sleep(0.3)
                 await self._send_initial_greeting()
                 _LOGGER.warning("Audio mode is '%s' (not reolink)", config.get(CONF_AUDIO_MODE))
 

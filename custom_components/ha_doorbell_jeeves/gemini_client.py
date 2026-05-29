@@ -114,10 +114,11 @@ class GeminiLiveClient(BaseRealtimeClient):
         self._session = await self._session_cm.__aenter__()
         self._connected = True
 
-        # Brief pause to let the server fully initialize the session before sending content.
-        # Without this, send_client_content (reference images + greeting) can race with the
-        # server's session setup and trigger a 1008 policy violation.
-        await asyncio.sleep(0.5)
+        # Wait for the server to fully initialize the session.
+        # Gemini Live has an internal setup phase after WebSocket connect.
+        # Sending content too early triggers 1008 "policy violation" intermittently.
+        # 2s delay significantly reduces startup 1008 rate.
+        await asyncio.sleep(2.0)
 
         await self._inject_reference_images()
         self._receive_task = asyncio.create_task(self._receive_loop())
@@ -438,6 +439,8 @@ class GeminiLiveClient(BaseRealtimeClient):
                 turns=[types.Content(role="user", parts=parts)],
                 turn_complete=False,  # Context only — don't trigger a response
             )
+            # Small delay after injecting reference images to let server process
+            await asyncio.sleep(0.3)
         except Exception:
             _LOGGER.exception("Failed to inject reference images")
 
