@@ -1344,14 +1344,14 @@ class JeevesSessionManager:
                 # Inject monitoring prompt — model can speak, call tools, or stay silent
                 try:
                     await self._client.inject_context(
-                        "[MONITOR] Periodic check. You are continuously watching the live camera feed. "
-                        "Assess the situation silently. ONLY take action if something requires it:\n"
-                        "- If the visitor left or no one is visible → call end_conversation\n"
-                        "- If you see suspicious behavior → send an alert notification\n"
-                        "- If the visitor moved → consider switching cameras to follow them\n"
-                        "- If you notice something important → speak to the visitor\n"
-                        "- If nothing needs attention → call no_action_needed (do NOT speak)\n"
-                        "Do NOT repeat your greeting. Do NOT announce that you're monitoring.",
+                        "[MONITOR] Periodic security check. Assess the live camera feed NOW.\n"
+                        "RULES:\n"
+                        "1. If nothing unusual is happening → you MUST call no_action_needed tool. Do NOT speak.\n"
+                        "2. If the visitor left or no one is visible → call end_conversation tool.\n"
+                        "3. If suspicious behavior → call notify tool with alert.\n"
+                        "4. If visitor needs attention → speak briefly.\n"
+                        "CRITICAL: For option 1, call the no_action_needed tool. Do NOT generate any speech audio. "
+                        "Do NOT say 'let me check' or anything similar. Just call the tool silently.",
                         turn_complete=True,
                     )
                 except Exception:
