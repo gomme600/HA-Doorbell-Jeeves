@@ -116,6 +116,22 @@ class GeminiLiveClient(BaseRealtimeClient):
             ),
         )
 
+        # Warm-up connection: open and immediately close a session.
+        # The reconnect path (which reuses self._client) NEVER gets 1008.
+        # This pre-establishes HTTP/2 connections, auth state, etc. in the client.
+        try:
+            warmup_cm = self._client.aio.live.connect(
+                model=self._model, config=self._live_config,
+            )
+            warmup_session = await warmup_cm.__aenter__()
+            await warmup_cm.__aexit__(None, None, None)
+            await asyncio.sleep(0.3)
+            _LOGGER.warning("Warm-up connection completed — opening real session")
+        except Exception:
+            _LOGGER.warning("Warm-up connection failed (non-fatal)")
+            await asyncio.sleep(0.5)
+
+        # Real connection (equivalent to a reconnect from the client's perspective)
         self._session_cm = self._client.aio.live.connect(
             model=self._model, config=self._live_config,
         )
@@ -124,23 +140,20 @@ class GeminiLiveClient(BaseRealtimeClient):
         self._connect_time = time.time()
 
         # Atomic burst: ref images → greeting → receive loop (same as reconnect)
-        # NO sleep between session open and first message.
-        # The reconnect path (which NEVER gets 1008) uses this exact pattern.
         await self._inject_reference_images()
 
         if greeting_text:
-            # Send greeting in same burst as ref images (no gap)
             await self._session.send_client_content(
                 turns=[types.Content(role="user", parts=[types.Part(text=greeting_text)])],
                 turn_complete=True,
             )
             self._model_generating = True
-            _LOGGER.warning("Gemini connected + greeting sent at T+%.1f (atomic burst)", time.time() - self._connect_time)
+            _LOGGER.warning("Gemini connected + greeting sent at T+%.1f (post-warmup)", time.time() - self._connect_time)
 
-        # Start receive loop AFTER greeting (matching reconnect pattern)
+        # Start receive loop AFTER greeting
         self._receive_task = asyncio.create_task(self._receive_loop())
 
-        # Set startup grace period: block audio/video for 5s to let the model initialize
+        # Set startup grace period
         self._startup_grace_until = time.time() + 5.0
         _LOGGER.warning("Gemini Live connected at T+%.1f (model=%s)", time.time() - self._connect_time, self._model)
 
