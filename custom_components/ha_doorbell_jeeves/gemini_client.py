@@ -118,28 +118,19 @@ class GeminiLiveClient(BaseRealtimeClient):
         self._connect_time = time.time()
 
         # Brief stabilization pause — server needs time to initialize.
-        # 2.0s matches the proven v1.5.0 configuration.
         await asyncio.sleep(2.0)
 
         await self._inject_reference_images()
 
-        # NOTE: Do NOT start receive loop here. The receive loop must start AFTER
-        # the greeting is sent. In the reconnect path (which never gets 1008), the
-        # greeting is sent before the receive loop re-enters session.receive().
-        # This ordering is critical for avoiding 1008 errors.
+        # Start receive loop after reference images (v1.5.0 pattern)
+        self._receive_task = asyncio.create_task(self._receive_loop())
 
         # Set startup grace period: block audio/video for 5s to let the model initialize
         self._startup_grace_until = time.time() + 5.0
         _LOGGER.warning("Gemini Live connected at T+%.1f (model=%s)", time.time() - self._connect_time, self._model)
 
     def start_receive(self) -> None:
-        """Start the receive loop. Must be called AFTER the initial greeting is sent.
-
-        The receive loop must begin AFTER the first turn_complete=True message is sent,
-        not before. Starting it before greeting causes 100% 1008 error rate because
-        the server sees an active receiver on an idle session. The reconnect path
-        (which never gets 1008) naturally has this ordering: greeting → receive.
-        """
+        """Start the receive loop (no-op if already running)."""
         if self._receive_task and not self._receive_task.done():
             return
         self._receive_task = asyncio.create_task(self._receive_loop())

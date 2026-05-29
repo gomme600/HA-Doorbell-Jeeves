@@ -547,28 +547,40 @@ class JeevesSessionManager:
             reolink_mode = config.get(CONF_AUDIO_MODE) == AUDIO_MODE_REOLINK
 
             if reolink_mode:
-                # Send greeting FIRST, then start receive loop.
-                # Critical ordering: greeting MUST be sent before receive loop starts.
-                # In reconnect (which never gets 1008), this ordering is natural.
-                # On initial connect, we must ensure the same ordering.
-                camera_entity = self._resolve_camera_entity(config.get(CONF_CAMERA_ENTITY, ""))
-                await self._send_initial_greeting(camera_entity)
-
-                # NOW start the receive loop (after greeting is sent)
-                self._client.start_receive()
-
-                # Start audio setup in background (model generates while hardware initializes)
-                _LOGGER.warning("Starting Reolink audio (model already generating greeting)")
+                # v1.5.0 pattern: audio setup → vision context (partial) → greeting
+                # The 2-5s audio setup time creates a gap between ref images and greeting
+                # that appears important for server stability (20% 1008 in v1.5.0 vs 60%+ without).
+                _LOGGER.warning("Starting Reolink audio before greeting (v1.5.0 pattern)")
                 audio_task = asyncio.create_task(self._start_reolink_audio_background(config))
                 try:
-                    await asyncio.wait_for(asyncio.shield(audio_task), timeout=35.0)
+                    await asyncio.wait_for(asyncio.shield(audio_task), timeout=5.0)
                 except asyncio.TimeoutError:
-                    _LOGGER.error("Audio setup timed out after 35s")
+                    _LOGGER.warning("Audio setup >5s — continuing with greeting")
+                    # Don't send keepalive — just proceed. Audio will finish in background.
+
+                # Resolve camera and send vision context as SEPARATE partial turn (v1.5.0 pattern)
+                camera_entity = self._resolve_camera_entity(config.get(CONF_CAMERA_ENTITY, ""))
+                if camera_entity and self._client:
+                    await self._client.inject_context(
+                        f"[SYSTEM] Live camera feed is active from your primary camera: {camera_entity}. "
+                        "Image frames that follow are LIVE from this camera — use them as current visual evidence. "
+                        "Do NOT call view_camera for this camera — you already see it live.",
+                        turn_complete=False,
+                    )
+                    await asyncio.sleep(0.3)
+
+                # NOW send the greeting trigger
+                await self._send_initial_greeting(camera_entity)
+
+                # Wait for remaining audio setup if still running
+                if not audio_task.done():
+                    try:
+                        await asyncio.wait_for(audio_task, timeout=30.0)
+                    except asyncio.TimeoutError:
+                        _LOGGER.error("Audio setup timed out after 35s")
             else:
                 camera_entity = self._resolve_camera_entity(config.get(CONF_CAMERA_ENTITY, ""))
                 await self._send_initial_greeting(camera_entity)
-                # Start receive loop after greeting
-                self._client.start_receive()
                 _LOGGER.warning("Audio mode is '%s' (not reolink)", config.get(CONF_AUDIO_MODE))
 
             # Start vision loop — send frames to AI for visual context
@@ -1813,18 +1825,9 @@ class JeevesSessionManager:
         self._greeting_phase = True
         self._notify_after_greeting = True  # Trigger notification after greeting completes
 
-        # Build greeting with vision context included
-        vision_prefix = ""
-        if camera_entity:
-            vision_prefix = (
-                f"Live camera feed is active from your primary camera: {camera_entity}. "
-                "Image frames that follow are LIVE from this camera — use them as current visual evidence. "
-                "Do NOT call view_camera for this camera — you already see it live. "
-            )
-
+        # Greeting message — vision context is sent separately as partial turn before this
         trigger_msg = (
-            f"[SYSTEM] {vision_prefix}"
-            "A visitor just rang the doorbell. "
+            "[SYSTEM] A visitor just rang the doorbell. "
             "START SPEAKING YOUR GREETING IMMEDIATELY — do NOT call any tools first. "
             "A camera frame is being sent to you right now — use it to identify the visitor "
             "if you recognize them, but do NOT wait or call view_camera. "
