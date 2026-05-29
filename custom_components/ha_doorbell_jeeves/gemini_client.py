@@ -96,7 +96,7 @@ class GeminiLiveClient(BaseRealtimeClient):
                     silence_duration_ms=700,
                     prefix_padding_ms=300,
                 ),
-                activity_handling=types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
+                activity_handling=types.ActivityHandling.NO_INTERRUPTION,
             ),
         )
 
