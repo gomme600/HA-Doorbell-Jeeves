@@ -1252,14 +1252,34 @@ async def _execute_view_camera(
         return {"error": f"Camera '{camera_id}' not in managed entities."}
 
     try:
-        image = await ha_camera_get_image(hass, camera_id, timeout=10)
-        if not image:
-            return {"error": f"Could not get image from {camera_id}"}
+        raw_jpeg: bytes | None = None
+        # Try HA camera snapshot API
+        image = await ha_camera_get_image(hass, camera_id, timeout=8)
+        if image and image.content:
+            raw_jpeg = image.content
+            _LOGGER.info("Captured HA snapshot for %s: %d bytes", camera_id, len(raw_jpeg))
+        else:
+            # Fallback: try go2rtc snapshot
+            from .reolink_audio import _discover_go2rtc_url, _get_go2rtc_session  # noqa: PLC0415
+            base_url = await _discover_go2rtc_url(hass)
+            if base_url:
+                url = f"{base_url}/api/frame.jpeg?src={camera_id}"
+                session = _get_go2rtc_session(hass) or aiohttp.ClientSession()
+                try:
+                    async with session.get(url, timeout=5) as resp:
+                        if resp.status == 200:
+                            raw_jpeg = await resp.read()
+                            _LOGGER.info("Captured go2rtc fallback snapshot for %s: %d bytes", camera_id, len(raw_jpeg))
+                except Exception:
+                    pass
+
+        if not raw_jpeg:
+            return {"error": f"Could not get image from {camera_id} (all methods failed)"}
 
         # Process image (resize/optimize) to avoid sending huge images to the model
         from .frame_processor import process_frame  # noqa: PLC0415
         processed = await hass.async_add_executor_job(
-            process_frame, image.content, 1024, 768, 75
+            process_frame, raw_jpeg, 1024, 768, 75
         )
 
         # Return base64 image — the session manager will inject this into the model
