@@ -564,16 +564,10 @@ class JeevesSessionManager:
                         await asyncio.wait_for(audio_task, timeout=30.0)
                     except asyncio.TimeoutError:
                         _LOGGER.error("Audio setup timed out after 35s")
-                await self._send_initial_greeting()
-            else:
-                await self._send_initial_greeting()
-                _LOGGER.warning("Audio mode is '%s' (not reolink)", config.get(CONF_AUDIO_MODE))
 
-            # Start vision loop — send frames to AI for visual context
-            fps = config.get(CONF_VISION_FPS, DEFAULT_VISION_FPS)
-            camera_entity = self._resolve_camera_entity(config.get(CONF_CAMERA_ENTITY, ""))
-            if camera_entity:
-                if self._client:
+                # Inject vision context BEFORE greeting (to avoid 1008 during model generation)
+                camera_entity = self._resolve_camera_entity(config.get(CONF_CAMERA_ENTITY, ""))
+                if camera_entity and self._client:
                     await self._client.inject_context(
                         "[SYSTEM] Live camera feed starting. "
                         f"All image frames that follow are LIVE from your primary camera: {camera_entity}. "
@@ -581,6 +575,27 @@ class JeevesSessionManager:
                         "Do NOT call view_camera for this camera — you already see it live.",
                         turn_complete=False,
                     )
+
+                await self._send_initial_greeting()
+            else:
+                # Inject vision context BEFORE greeting
+                camera_entity = self._resolve_camera_entity(config.get(CONF_CAMERA_ENTITY, ""))
+                if camera_entity and self._client:
+                    await self._client.inject_context(
+                        "[SYSTEM] Live camera feed starting. "
+                        f"All image frames that follow are LIVE from your primary camera: {camera_entity}. "
+                        "Use these frames as current visual evidence of who/what is at the door. "
+                        "Do NOT call view_camera for this camera — you already see it live.",
+                        turn_complete=False,
+                    )
+                await self._send_initial_greeting()
+                _LOGGER.warning("Audio mode is '%s' (not reolink)", config.get(CONF_AUDIO_MODE))
+
+            # Start vision loop — send frames to AI for visual context
+            fps = config.get(CONF_VISION_FPS, DEFAULT_VISION_FPS)
+            if not camera_entity:
+                camera_entity = self._resolve_camera_entity(config.get(CONF_CAMERA_ENTITY, ""))
+            if camera_entity:
                 self._vision_task = asyncio.create_task(self._vision_loop(camera_entity, fps))
 
             if self._tool_router:
