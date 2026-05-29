@@ -129,7 +129,9 @@ class GeminiLiveClient(BaseRealtimeClient):
                     "[SYSTEM] The connection was briefly interrupted. "
                     "You are already in a conversation with the visitor. "
                     "Continue exactly where you left off. "
-                    "Do NOT repeat your initial greeting."
+                    "Do NOT repeat your initial greeting. "
+                    "If you were in the middle of executing a tool or waiting for vision, "
+                    "acknowledge that you are resuming your analysis."
                 ))])],
                 turn_complete=True,
             )
@@ -162,6 +164,9 @@ class GeminiLiveClient(BaseRealtimeClient):
     async def send_audio(self, pcm_bytes: bytes) -> None:
         if not self._session or not self._connected:
             return
+        # GATE: Prevent sending audio during tool processing to avoid 1008 policy violation
+        if self._tool_call_pending:
+            return
         try:
             await self._session.send_realtime_input(
                 audio=types.Blob(
@@ -175,6 +180,9 @@ class GeminiLiveClient(BaseRealtimeClient):
     async def send_image(self, image_base64: str, mime_type: str = "image/jpeg") -> None:
         """Send an image frame to the live session via realtime video input."""
         if not self._session or not self._connected:
+            return
+        # GATE: Prevent sending images during tool processing to avoid 1008 policy violation
+        if self._tool_call_pending:
             return
         try:
             image_bytes = base64.b64decode(image_base64)
@@ -276,7 +284,7 @@ class GeminiLiveClient(BaseRealtimeClient):
     async def _receive_loop(self) -> None:
         turns_completed = 0
         reconnect_attempts = 0
-        max_reconnects = 5
+        max_reconnects = 15  # INCREASED: more resilient to transient policy violations
         try:
             # NOTE: In the GenAI SDK, session.receive() can complete after a turn.
             # Re-enter receive() to keep the live session open across turns.
@@ -291,20 +299,20 @@ class GeminiLiveClient(BaseRealtimeClient):
                     err_str = str(recv_err)
                     _LOGGER.warning("Gemini receive() raised: %s (turns=%d)", err_str[:200], turns_completed)
                     if "close" in err_str.lower() or "1008" in err_str or "not implemented" in err_str.lower():
-                        # Early disconnect — try to reconnect if within first turn
-                        if turns_completed == 0 and reconnect_attempts < max_reconnects:
+                        # RECONNECT LOGIC: try to reconnect if within reconnection budget
+                        if reconnect_attempts < max_reconnects:
                             reconnect_attempts += 1
                             # Increasing delay to avoid rapid reconnect loops
-                            delay = 0.5 * reconnect_attempts
+                            delay = 0.5 * min(reconnect_attempts, 4)
                             _LOGGER.warning(
-                                "Early Gemini disconnect (attempt %d/%d) — reconnecting in %.1fs...",
+                                "Transient Gemini disconnect (attempt %d/%d) — reconnecting in %.1fs...",
                                 reconnect_attempts, max_reconnects, delay,
                             )
                             await asyncio.sleep(delay)
                             if await self._reconnect_session():
                                 consecutive_empty_iters = 0
                                 continue
-                        _LOGGER.warning("Gemini server closed connection (policy/model issue)")
+                        _LOGGER.warning("Gemini server closed connection permanently")
                         break
                     if not self._connected:
                         break
@@ -324,7 +332,7 @@ class GeminiLiveClient(BaseRealtimeClient):
                 consecutive_empty_iters += 1
                 if consecutive_empty_iters >= 3:
                     # Early empty-stream disconnect — try to reconnect
-                    if turns_completed == 0 and reconnect_attempts < max_reconnects:
+                    if reconnect_attempts < max_reconnects:
                         reconnect_attempts += 1
                         _LOGGER.warning(
                             "Empty-stream Gemini disconnect (attempt %d/%d) — reconnecting...",
