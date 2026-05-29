@@ -2168,14 +2168,27 @@ async def _execute_notification(
     if camera_entity:
         try:
             import os
+            import time as _time
             www_dir = hass.config.path("www")
-            os.makedirs(www_dir, exist_ok=True)
-            snapshot_path = os.path.join(www_dir, "jeeves_doorbell_snapshot.jpg")
+            await hass.async_add_executor_job(os.makedirs, www_dir, 0o755, True)
+            snapshot_filename = f"jeeves_snapshot_{int(_time.time())}.jpg"
+            snapshot_path = os.path.join(www_dir, snapshot_filename)
             image = await ha_camera_get_image(hass, camera_entity, timeout=8)
-            with open(snapshot_path, "wb") as f:
-                f.write(image.content)
+
+            def _write_snapshot() -> None:
+                with open(snapshot_path, "wb") as f:
+                    f.write(image.content)
+                # Clean up old snapshots (keep only current)
+                for fname in os.listdir(www_dir):
+                    if fname.startswith("jeeves_snapshot_") and fname != snapshot_filename:
+                        try:
+                            os.remove(os.path.join(www_dir, fname))
+                        except OSError:
+                            pass
+
+            await hass.async_add_executor_job(_write_snapshot)
             # /local/ maps to /config/www/ in HA
-            snapshot_url = "/local/jeeves_doorbell_snapshot.jpg"
+            snapshot_url = f"/local/{snapshot_filename}"
             _LOGGER.info(
                 "Notification snapshot captured from %s (%d bytes)",
                 camera_entity, len(image.content),
@@ -2246,6 +2259,10 @@ async def _execute_notification(
         if snapshot_url:
             data["data"]["image"] = snapshot_url
 
+        _LOGGER.info(
+            "Sending notification to %s.%s with image=%s",
+            domain, svc, snapshot_url or "(none)",
+        )
         await hass.services.async_call(domain, svc, data, blocking=True)
 
         return {
