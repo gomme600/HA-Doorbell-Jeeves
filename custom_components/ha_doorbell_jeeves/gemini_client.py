@@ -188,6 +188,8 @@ class GeminiLiveClient(BaseRealtimeClient):
                 turn_complete=False,
             )
             self._model_generating = False
+            # Set grace period to prevent vision/audio from racing with history restoration
+            self._startup_grace_until = time.time() + 2.0
             _LOGGER.warning("Gemini reconnected — history restored (%d turns, %d conversation entries)",
                           len(history_turns), len(self._conversation_turns))
             return True
@@ -274,7 +276,7 @@ class GeminiLiveClient(BaseRealtimeClient):
         self._keepalive_task = None
 
     async def _keepalive_loop(self) -> None:
-        """Send silent audio every 8s while waiting for model to generate.
+        """Send silent audio every 5s while waiting for model to generate.
 
         Keeps the WebSocket alive during tool execution AND during the gap
         between tool_response and model generation start.
@@ -294,7 +296,7 @@ class GeminiLiveClient(BaseRealtimeClient):
                     if not self._tool_call_pending and not self._model_generating:
                         break
                     continue
-                await asyncio.sleep(8)
+                await asyncio.sleep(5)
                 if not self._session or not self._connected or self._model_generating:
                     break
                 try:
@@ -444,8 +446,10 @@ class GeminiLiveClient(BaseRealtimeClient):
                         saw_message = True
                         await self._process(response)
                 except Exception as recv_err:
-                    # Clear generation flag on any error (stream is done)
+                    # Clear ALL state flags on error (stream is broken)
                     self._model_generating = False
+                    self._tool_call_pending = False
+                    self._vision_paused = False
                     err_str = str(recv_err)
                     _LOGGER.warning("Gemini receive() raised: %s (turns=%d)", err_str[:200], turns_completed)
                     if ("close" in err_str.lower() or "1008" in err_str
@@ -529,8 +533,9 @@ class GeminiLiveClient(BaseRealtimeClient):
             self._tool_call_pending = False
             # Stop keepalive now that model is generating (no idle timeout risk)
             self._stop_keepalive()
-            # Resume vision loop if it was paused for tool image injection
-            self._vision_paused = False
+            # NOTE: Do NOT clear _vision_paused here! If a tool image was injected,
+            # vision must stay paused until turn_complete so live frames don't flood
+            # the model's context while it's still analyzing the tool snapshot.
             for part in server_content.model_turn.parts:
                 if part.inline_data and part.inline_data.mime_type and "audio" in part.inline_data.mime_type:
                     # MUTE audio during monitor turns (proactive checks should be silent)
@@ -576,10 +581,15 @@ class GeminiLiveClient(BaseRealtimeClient):
             if interrupted:
                 _LOGGER.debug("Gemini: model output was INTERRUPTED (user started speaking)")
                 self._monitor_turn_active = False
+                # Resume vision on interrupt — the model won't finish analyzing anyway
+                self._vision_paused = False
             if turn_complete:
                 _LOGGER.debug("Gemini: turn_complete signal received")
                 # Clear monitor mute at end of turn
                 self._monitor_turn_active = False
+                # Resume vision loop now that the model has finished its response
+                # about the tool image (if any). Safe to send live frames again.
+                self._vision_paused = False
                 # Don't clear _model_generating here — there may be a tool_call
                 # still pending in the same receive() stream. We clear it in
                 # _receive_loop after the async for completes.
@@ -641,7 +651,7 @@ class GeminiLiveClient(BaseRealtimeClient):
                 # Do NOT use send_client_content during the tool response flow as it
                 # can cause 1008 policy violations.
                 if pending_image_bytes:
-                    num_frames = 3
+                    num_frames = 5  # More frames to dominate visual buffer over stale live feed
                     for frame_i in range(num_frames):
                         try:
                             await self._session.send_realtime_input(
@@ -653,7 +663,7 @@ class GeminiLiveClient(BaseRealtimeClient):
                             _LOGGER.warning("Failed to inject tool image frame %d", frame_i + 1)
                             break
                         if frame_i < num_frames - 1:
-                            await asyncio.sleep(0.3)
+                            await asyncio.sleep(0.15)
                     _LOGGER.warning(
                         "Tool image injected via send_realtime_input (%d bytes, %s, %d frames)",
                         len(pending_image_bytes), pending_image_mime, num_frames,
@@ -674,8 +684,9 @@ class GeminiLiveClient(BaseRealtimeClient):
                 except Exception:
                     _LOGGER.exception("Failed to send tool response")
         finally:
-            # Stop keepalive in case it's still running
-            self._stop_keepalive()
+            # NOTE: Do NOT stop keepalive here — the gap between send_tool_response
+            # and model generation starting is the most dangerous idle period.
+            # The keepalive loop self-terminates when _model_generating becomes True.
             # NOTE: We intentionally do NOT clear _tool_call_pending here.
             # It stays True until the model starts generating its response
             # (detected in _process via model_turn). This prevents mic audio
