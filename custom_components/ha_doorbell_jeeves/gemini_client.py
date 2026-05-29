@@ -428,7 +428,9 @@ class GeminiLiveClient(BaseRealtimeClient):
             image_b64, mime_type = self._pending_tool_image
             self._pending_tool_image = None
             await self.inject_context(
-                "[SYSTEM] The requested image has been captured and is attached below for your analysis.",
+                "[SYSTEM] IMAGE CAPTURED. The requested visual snapshot has been injected "
+                "into your context below. Analyze THIS IMAGE carefully for your response. "
+                "This snapshot is the ground truth for your current analysis.",
                 image_base64=image_b64,
                 mime_type=mime_type
             )

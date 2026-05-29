@@ -782,7 +782,7 @@ class JeevesSessionManager:
             from_state = trigger.from_state
 
             @callback
-            def _on_start_trigger(event: Event, _to: str = to_state, _from: str = from_state) -> None:
+            def _on_start_trigger(event: Event, _to: str = to_state, _from: str = from_state, _restart: bool = trigger.restart_session) -> None:
                 new_state = event.data.get("new_state")
                 old_state = event.data.get("old_state")
                 _LOGGER.warning(
@@ -798,11 +798,16 @@ class JeevesSessionManager:
                     return
                 if _from and old_state and old_state.state != _from:
                     return
-                if not self._active and not self._starting:
+                
+                if (self._active or self._starting) and _restart:
+                    _LOGGER.warning("Start trigger FIRED with RESTART → restarting session")
+                    self.hass.async_create_task(self.async_stop_session("restart requested by trigger"))
+                    self.hass.async_create_task(self._safe_start_session())
+                elif not self._active and not self._starting:
                     _LOGGER.warning("Start trigger FIRED → starting session")
                     self.hass.async_create_task(self._safe_start_session())
                 else:
-                    _LOGGER.warning("Start trigger matched but session already active/starting")
+                    _LOGGER.warning("Start trigger matched but session already active/starting and no restart requested")
 
             unsub = async_track_state_change_event(self.hass, [entity_id], _on_start_trigger)
             self._start_unsubs.append(unsub)

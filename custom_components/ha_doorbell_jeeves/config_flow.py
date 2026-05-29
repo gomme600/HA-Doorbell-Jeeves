@@ -616,8 +616,16 @@ class DoorbellJeevesConfigFlow(ConfigFlow, domain=DOMAIN):
 
     async def async_step_triggers_setup(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         if user_input is not None:
+            start_entities = user_input.get("start_entities", [])
+            restart_entities = user_input.get("restart_entities", [])
+            
             self._data["start_triggers_config"] = [
-                {"entity_id": entity_id, "to_state": "on"} for entity_id in user_input.get("start_entities", [])
+                {
+                    "entity_id": entity_id, 
+                    "to_state": "on",
+                    "restart_session": entity_id in restart_entities
+                } 
+                for entity_id in start_entities
             ]
             self._data[CONF_STOP_ENTITIES] = user_input.get(CONF_STOP_ENTITIES, [])
             return self._create_entry()
@@ -627,14 +635,25 @@ class DoorbellJeevesConfigFlow(ConfigFlow, domain=DOMAIN):
             for trigger in self._data.get("start_triggers_config", [])
             if trigger.get("entity_id")
         ]
+        restart_entities = [
+            trigger["entity_id"]
+            for trigger in self._data.get("start_triggers_config", [])
+            if trigger.get("entity_id") and trigger.get("restart_session")
+        ]
         if not start_entities and self._data.get("doorbell_trigger_entity"):
             start_entities = [self._data["doorbell_trigger_entity"]]
+            restart_entities = [self._data["doorbell_trigger_entity"]]
 
         return self.async_show_form(
             step_id="triggers_setup",
             data_schema=vol.Schema(
                 {
                     vol.Optional("start_entities", default=start_entities): EntitySelector(
+                        EntitySelectorConfig(
+                            domain=["binary_sensor", "input_boolean", "button"], multiple=True
+                        )
+                    ),
+                    vol.Optional("restart_entities", default=restart_entities): EntitySelector(
                         EntitySelectorConfig(
                             domain=["binary_sensor", "input_boolean", "button"], multiple=True
                         )

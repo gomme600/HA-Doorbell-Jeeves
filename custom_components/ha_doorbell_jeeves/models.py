@@ -146,12 +146,14 @@ class StartTrigger:
     entity_id: str
     to_state: str = "on"  # Start session when entity reaches this state
     from_state: str = ""  # Optional: only trigger if coming from this state
+    restart_session: bool = False  # If True, restart even if session is active
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "entity_id": self.entity_id,
             "to_state": self.to_state,
             "from_state": self.from_state,
+            "restart_session": self.restart_session,
         }
 
     @classmethod
@@ -160,6 +162,7 @@ class StartTrigger:
             entity_id=data["entity_id"],
             to_state=data.get("to_state", "on"),
             from_state=data.get("from_state", ""),
+            restart_session=data.get("restart_session", False),
         )
 
 
