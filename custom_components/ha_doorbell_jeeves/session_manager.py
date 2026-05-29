@@ -1336,7 +1336,7 @@ class JeevesSessionManager:
                     audio_config[CONF_REOLINK_MIC_METHOD] = ""
                     audio_config[CONF_REOLINK_MIC_URL] = ""
 
-                await self._start_reolink_audio(audio_config, skip_talk_monitor=True)
+                await self._start_reolink_audio(audio_config, skip_talk_monitor=False)
 
                 # Verify audio is actually connected AND output pipeline is working
                 if self._audio_handler and self._audio_handler.output_pipeline_ready:

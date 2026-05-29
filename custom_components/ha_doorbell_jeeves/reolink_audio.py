@@ -1580,7 +1580,10 @@ class ReolinkAudioHandler:
 
         # On-demand talk: track when last audio was sent to detect silence
         TALK_RELEASE_DELAY = 1.5  # Release speaker after 1.5s of silence
+        COOPERATIVE_YIELD_INTERVAL = 2.0  # Yield talk session every 2s during speech
+        COOPERATIVE_YIELD_WINDOW = 0.35  # Release for 350ms to let Reolink app connect
         last_audio_sent_time = 0.0
+        last_yield_time = 0.0
         consecutive_send_failures = 0
         TAKEOVER_FAILURE_THRESHOLD = 3  # After 3 consecutive send failures, assume app takeover
 
@@ -1611,6 +1614,7 @@ class ReolinkAudioHandler:
                         continue
                     # Reset timing after re-acquisition
                     expected_stream_end = time_mod.monotonic()
+                    last_yield_time = time_mod.monotonic()
                     chunks_sent_before_acquire = chunks_sent
 
                 # Resample in-process: linear interpolation 24kHz → target rate
@@ -1715,6 +1719,27 @@ class ReolinkAudioHandler:
                     sleep_time = expected_stream_end - time_mod.monotonic()
                     if sleep_time > 0.001:
                         await asyncio.sleep(sleep_time)
+
+                # Cooperative yielding: briefly release talk session every N seconds
+                # during continuous speech to let the Reolink app connect.
+                # If re-acquire fails after yield, someone else took over.
+                if (
+                    self._talk_held
+                    and last_audio_sent_time > 0
+                    and (time_mod.monotonic() - last_yield_time) > COOPERATIVE_YIELD_INTERVAL
+                ):
+                    last_yield_time = time_mod.monotonic()
+                    await self._release_talk()
+                    await asyncio.sleep(COOPERATIVE_YIELD_WINDOW)
+                    # Try to re-acquire
+                    if not await self._acquire_talk():
+                        _LOGGER.warning(
+                            "Talk session NOT re-acquired after cooperative yield — "
+                            "Reolink app likely connected (human takeover)"
+                        )
+                        if self._on_takeover:
+                            self._hass.async_create_task(self._on_takeover())
+                        return  # Exit — let human take over
 
         except asyncio.CancelledError:
             pass
@@ -4698,6 +4723,7 @@ class ReolinkTalkMonitor:
         self._poll_interval = poll_interval
         self._poll_task: asyncio.Task[None] | None = None
         self._session: aiohttp.ClientSession | None = None
+        self._owns_session: bool = False  # Whether we created the session (vs HA shared)
         self._token: str | None = None
         self._active = False
         self._talk_was_active = False
@@ -4711,9 +4737,18 @@ class ReolinkTalkMonitor:
         if self._active:
             return
         self._active = True
-        self._session = aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(limit=1, limit_per_host=1)
-        )
+        # Use HA's shared aiohttp session to avoid consuming an extra TCP connection
+        # slot on the camera. The shared session uses keep-alive efficiently.
+        try:
+            from homeassistant.helpers.aiohttp_client import async_get_clientsession  # noqa: PLC0415
+            self._session = async_get_clientsession(self._hass)
+            self._owns_session = False
+        except Exception:
+            # Fallback: create our own session (shouldn't happen in normal HA)
+            self._session = aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(limit=1, limit_per_host=1)
+            )
+            self._owns_session = True
         self._poll_task = asyncio.create_task(self._poll_loop())
         _LOGGER.info("Reolink talk monitor started (host=%s)", self._host)
 
@@ -4736,9 +4771,10 @@ class ReolinkTalkMonitor:
                     _LOGGER.debug("Reolink talk monitor logout: status=%s", resp.status)
             except Exception:
                 _LOGGER.debug("Reolink talk monitor logout failed", exc_info=True)
-        if self._session:
+        # Only close session if we created it (don't close HA's shared session)
+        if self._session and self._owns_session:
             await self._session.close()
-            self._session = None
+        self._session = None
         self._token = None
         _LOGGER.info("Reolink talk monitor stopped")
 
