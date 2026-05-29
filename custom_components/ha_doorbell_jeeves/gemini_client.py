@@ -118,7 +118,7 @@ class GeminiLiveClient(BaseRealtimeClient):
         self._receive_task = asyncio.create_task(self._receive_loop())
         # Set startup grace period: block audio/video for 3s to let the model initialize
         # and avoid 1008 policy violation from audio racing with session setup
-        self._startup_grace_until = time.time() + 3.0
+        self._startup_grace_until = time.time() + 5.0
         _LOGGER.info("Gemini Live connected (model=%s, voice=%s)", self._model, self._voice)
 
     async def _reconnect_session(self) -> bool:
@@ -608,40 +608,33 @@ class GeminiLiveClient(BaseRealtimeClient):
                 self._stop_keepalive()
 
                 # CRITICAL: Inject tool image via send_realtime_input (media channel).
-                # The Gemini Live API only processes images sent through the realtime
-                # media channel — send_client_content inline_data does NOT show images
-                # to the model. We send the image BEFORE the tool_response so the model
-                # has the visual context available when it starts generating.
+                # Send multiple frames to ensure the model's visual buffer is dominated
+                # by the tool image rather than previous live feed frames.
+                # Do NOT use send_client_content during the tool response flow as it
+                # can cause 1008 policy violations.
                 if pending_image_bytes:
-                    try:
-                        await self._session.send_realtime_input(
-                            media=types.Blob(
-                                data=pending_image_bytes, mime_type=pending_image_mime
-                            )
-                        )
-                        _LOGGER.warning(
-                            "Tool image injected via send_realtime_input (%d bytes, %s)",
-                            len(pending_image_bytes), pending_image_mime,
-                        )
-                    except Exception:
-                        _LOGGER.warning("Failed to inject tool image via send_realtime_input")
-
-                    # Also send the context text via send_client_content so the model
-                    # knows what the image is (which camera, analysis instructions)
-                    if pending_image_ctx:
+                    num_frames = 3
+                    for frame_i in range(num_frames):
                         try:
-                            await self._session.send_client_content(
-                                turns=[types.Content(role="user", parts=[
-                                    types.Part(text=pending_image_ctx),
-                                ])],
-                                turn_complete=False,
+                            await self._session.send_realtime_input(
+                                media=types.Blob(
+                                    data=pending_image_bytes, mime_type=pending_image_mime
+                                )
                             )
                         except Exception:
-                            _LOGGER.debug("Failed to send tool image context text")
+                            _LOGGER.warning("Failed to inject tool image frame %d", frame_i + 1)
+                            break
+                        if frame_i < num_frames - 1:
+                            await asyncio.sleep(0.3)
+                    _LOGGER.warning(
+                        "Tool image injected via send_realtime_input (%d bytes, %s, %d frames)",
+                        len(pending_image_bytes), pending_image_mime, num_frames,
+                    )
 
                 # Send tool_response (this triggers model generation)
-                # Don't include image in FunctionResponse.parts — it doesn't work
-                # reliably in the Live API. The realtime_input above is authoritative.
+                # All image context and analysis instructions are included in the
+                # tool response text (result dict). The model sees the image in its
+                # realtime media buffer and the instructions in the tool response.
                 try:
                     plain = [
                         types.FunctionResponse(id=fr.id, name=fr.name, response=fr.response)

@@ -117,6 +117,11 @@ class JeevesSessionManager:
         self._normalize_manual_audio_config()
         # Save the original primary camera so we always reset to it at session start
         self._primary_camera_entity = self._config.get(CONF_CAMERA_ENTITY, "")
+        # Also save audio routing config that gets modified during camera switches
+        self._primary_go2rtc_stream = self._config.get(CONF_GO2RTC_STREAM_NAME, "")
+        self._primary_go2rtc_input = self._config.get(CONF_GO2RTC_INPUT_STREAM_NAME, "")
+        self._primary_go2rtc_output = self._config.get(CONF_GO2RTC_OUTPUT_STREAM_NAME, "")
+        self._primary_reolink_entry = self._config.get(CONF_REOLINK_ENTRY_ID, "")
 
         # Data store (entities, actions, identities)
         self.store = DataStore(hass, entry.entry_id)
@@ -385,6 +390,10 @@ class JeevesSessionManager:
             # Always reset to primary camera at session start (switch_camera may have changed it)
             if self._primary_camera_entity:
                 self._config[CONF_CAMERA_ENTITY] = self._primary_camera_entity
+                self._config[CONF_GO2RTC_STREAM_NAME] = self._primary_go2rtc_stream
+                self._config[CONF_GO2RTC_INPUT_STREAM_NAME] = self._primary_go2rtc_input
+                self._config[CONF_GO2RTC_OUTPUT_STREAM_NAME] = self._primary_go2rtc_output
+                self._config[CONF_REOLINK_ENTRY_ID] = self._primary_reolink_entry
 
             # Lazy Reolink go2rtc setup (deferred from entry load for timing)
             if getattr(self, "reolink_needs_setup", False):
