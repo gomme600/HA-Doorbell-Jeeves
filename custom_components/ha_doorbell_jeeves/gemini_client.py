@@ -122,20 +122,38 @@ class GeminiLiveClient(BaseRealtimeClient):
             )
             self._session = await self._session_cm.__aenter__()
             await self._inject_reference_images()
-            # Send a continuation prompt (not full greeting — visitor already
-            # heard part of it). This avoids the greeting repeating.
+
+            # Build context of what was said so the model has conversation history
+            history_parts: list[types.Part] = []
+            if self._conversation_turns:
+                recent = self._conversation_turns[-10:]
+                transcript_text = "\n".join(
+                    f"{t['role'].upper()}: {t['text']}" for t in recent
+                )
+                history_parts.append(types.Part(text=(
+                    "[SYSTEM] CONNECTION RESUMED — DO NOT REPEAT YOUR GREETING.\n"
+                    "You are Jeeves, already mid-conversation with a visitor at the door. "
+                    "The connection was briefly interrupted but the visitor is still here.\n\n"
+                    "CONVERSATION SO FAR:\n"
+                    f"{transcript_text}\n\n"
+                    "RULES FOR RESUMING:\n"
+                    "- Do NOT say hello again or re-introduce yourself.\n"
+                    "- Do NOT say 'Je préviens le propriétaire' again if you already said it.\n"
+                    "- Simply continue naturally from where you left off.\n"
+                    "- If you were waiting for a tool result, say you're still checking.\n"
+                    "- Keep it brief — just one short sentence acknowledging you're back, or stay silent."
+                )))
+            else:
+                history_parts.append(types.Part(text=(
+                    "[SYSTEM] CONNECTION RESUMED. You already greeted the visitor. "
+                    "Do NOT repeat your greeting. Continue the conversation naturally."
+                )))
+
             await self._session.send_client_content(
-                turns=[types.Content(role="user", parts=[types.Part(text=(
-                    "[SYSTEM] The connection was briefly interrupted. "
-                    "You are already in a conversation with the visitor. "
-                    "Continue exactly where you left off. "
-                    "Do NOT repeat your initial greeting. "
-                    "If you were in the middle of executing a tool or waiting for vision, "
-                    "acknowledge that you are resuming your analysis."
-                ))])],
+                turns=[types.Content(role="user", parts=history_parts)],
                 turn_complete=True,
             )
-            _LOGGER.warning("Gemini reconnected — continuation prompt sent")
+            _LOGGER.warning("Gemini reconnected — continuation prompt sent (with %d history turns)", len(self._conversation_turns))
             return True
         except Exception:
             _LOGGER.exception("Gemini reconnect failed")
@@ -417,25 +435,27 @@ class GeminiLiveClient(BaseRealtimeClient):
                     )
                 except Exception:
                     _LOGGER.exception("Failed to send tool response")
+
+            # Inject pending tool image IMMEDIATELY after the tool response
+            # (before releasing the gate) so the model processes the image
+            # without interference from the live video stream.
+            if self._session and self._connected and self._pending_tool_image:
+                if len(self._pending_tool_image) == 2:
+                    image_b64, mime_type = self._pending_tool_image
+                    image_context = (
+                        "[SYSTEM] IMAGE CAPTURED. The requested visual snapshot has been injected "
+                        "below. Analyze THIS IMAGE carefully for your response."
+                    )
+                else:
+                    image_b64, mime_type, image_context = self._pending_tool_image
+                self._pending_tool_image = None
+                await self.inject_context(
+                    image_context,
+                    image_base64=image_b64,
+                    mime_type=mime_type
+                )
+                # Keep gate closed briefly so live frames don't immediately drown
+                # out the high-quality tool snapshot the model needs to analyze
+                await asyncio.sleep(2.0)
         finally:
             self._tool_call_pending = False
-
-        # Inject pending tool image AFTER the tool response so the model
-        # correlates the image with the tool call context.
-        # We use inject_context (user role) for tool images (like snapshots)
-        # to ensure they are captured in history and not lost in the live stream.
-        if self._session and self._connected and self._pending_tool_image:
-            if len(self._pending_tool_image) == 2:
-                image_b64, mime_type = self._pending_tool_image
-                image_context = (
-                    "[SYSTEM] IMAGE CAPTURED. The requested visual snapshot has been injected "
-                    "below. Analyze THIS IMAGE carefully for your response."
-                )
-            else:
-                image_b64, mime_type, image_context = self._pending_tool_image
-            self._pending_tool_image = None
-            await self.inject_context(
-                image_context,
-                image_base64=image_b64,
-                mime_type=mime_type
-            )

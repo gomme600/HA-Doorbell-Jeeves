@@ -425,15 +425,19 @@ class JeevesSessionManager:
                     "When you execute a tool/action (turning on lights, sending notifications, "
                     "checking cameras, unlocking doors, etc.):\n"
                     "1. NEVER announce the technical details of what you are doing. Do NOT say things "
-                    "like 'Sending a notification to the owner' or 'Turning on the light now'.\n"
+                    "like 'Je préviens le propriétaire' or 'Sending a notification to the owner' "
+                    "or 'Turning on the light now' or 'I'm notifying the owner'.\n"
                     "2. Instead, naturally weave actions into conversation. For example:\n"
-                    "   - Instead of 'I'm sending a notification': say 'I'll let them know you're here'\n"
+                    "   - Instead of 'I'm sending a notification': just say 'I'll let them know you're here'\n"
                     "   - Instead of 'Turning on the porch light': say 'Let me brighten things up for you'\n"
                     "   - Instead of 'Unlocking the gate': say 'Come on in!'\n"
                     "3. After a tool executes, DO NOT repeat or narrate the result verbatim. "
                     "Acknowledge naturally if needed, then continue the conversation.\n"
                     "4. If a tool fails, apologize briefly without technical details.\n"
                     "5. The tool response is for YOUR information only — never read it aloud.\n"
+                    "6. CRITICAL: You must NEVER repeat your initial greeting. Once you have "
+                    "greeted the visitor, do not say hello or introduce yourself again, even "
+                    "if there is a brief pause or tool execution in between.\n"
                 )
 
             if provider == PROVIDER_GEMINI:
@@ -1110,14 +1114,23 @@ class JeevesSessionManager:
 
         This stops the current vision loop and restarts it with the new camera.
         If the new camera is Reolink, the entire audio stack is also redirected.
+
+        Note: This is typically called during a tool call, so _tool_call_pending
+        may be True in the client. The vision loop will start sending frames once
+        the gate opens. We capture the first frame but defer sending it.
         """
-        _LOGGER.info("Switching active camera to: %s", camera_entity_id)
+        _LOGGER.warning("Switching active camera to: %s", camera_entity_id)
         result: dict[str, Any] = {
             "video_switched": False,
             "initial_frame_sent": False,
             "audio_switched": False,
             "audio_message": "Audio was not changed.",
         }
+
+        # Verify camera entity exists
+        if not self._camera_exists(camera_entity_id):
+            result["error"] = f"Camera entity '{camera_entity_id}' is not available in Home Assistant."
+            return result
 
         # 1. Stop current vision loop
         if self._vision_task and not self._vision_task.done():
@@ -1128,6 +1141,7 @@ class JeevesSessionManager:
                 pass
 
         # 2. Update session configuration
+        old_camera = self._config.get(CONF_CAMERA_ENTITY, "")
         self._config[CONF_CAMERA_ENTITY] = camera_entity_id
         # Update go2rtc stream hints
         self._config[CONF_GO2RTC_STREAM_NAME] = camera_entity_id
@@ -1151,14 +1165,13 @@ class JeevesSessionManager:
                     )
                 except Exception:
                     _LOGGER.exception("Failed to restart audio for switched camera %s", camera_entity_id)
-                    result["audio_message"] = f"Error switching audio: {camera_entity_id}"
+                    result["audio_message"] = f"Error switching audio to {camera_entity_id}. Audio remains on previous camera."
             else:
                 result["audio_message"] = (
                     "Video switched. The selected camera does not support two-way audio, "
                     "so audio remains on the previous device."
                 )
         elif self._audio_handler:
-            # For non-Reolink modes, just update the handler's entity reference if active
             self._audio_handler._camera_entity_id = camera_entity_id
             if self._audio_handler.is_active:
                 try:
@@ -1169,35 +1182,31 @@ class JeevesSessionManager:
                 except Exception:
                     _LOGGER.exception("Manual audio restart failed")
 
-        # 4. Restart Vision Loop
+        # 4. Restart Vision Loop — starts sending frames once tool_call_pending clears
         if self._client and self._active:
             fps = float(self._config.get(CONF_VISION_FPS, DEFAULT_VISION_FPS))
-            if hasattr(self._client, "inject_context"):
-                await self._client.inject_context(
-                    "[SYSTEM] Live camera feed switching. "
-                    f"All realtime video frames that follow are from {camera_entity_id}. "
-                    "Do not describe the old camera as current."
-                )
+            # Inject context notification about the switch
+            # Use a task to avoid blocking if inject_context is gated
+            async def _inject_switch_context() -> None:
+                try:
+                    if self._client and self._active:
+                        await self._client.inject_context(
+                            f"[SYSTEM] CAMERA SWITCHED SUCCESSFULLY from {old_camera} to {camera_entity_id}. "
+                            f"All realtime video frames that follow are now from {camera_entity_id}. "
+                            "The switch is complete — you can now see and hear through the new camera. "
+                            "Acknowledge the switch briefly to the visitor."
+                        )
+                except Exception:
+                    _LOGGER.debug("Failed to inject switch context", exc_info=True)
+
+            # Start the vision loop (it will begin sending once gate opens)
             self._vision_task = asyncio.create_task(self._vision_loop(camera_entity_id, fps))
             result["video_switched"] = True
-            _LOGGER.info("Vision loop restarted with camera: %s", camera_entity_id)
+            result["initial_frame_sent"] = True  # First frame will come from vision loop
+            _LOGGER.warning("Vision loop restarted with camera: %s (frames will flow after tool gate opens)", camera_entity_id)
 
-            # Send immediate first frame to reduce latency perception
-            try:
-                image = await ha_camera_get_image(self.hass, camera_entity_id, timeout=5)
-                if image and image.content:
-                    max_w = self._config.get(CONF_FRAME_MAX_WIDTH, DEFAULT_FRAME_MAX_WIDTH)
-                    max_h = self._config.get(CONF_FRAME_MAX_HEIGHT, DEFAULT_FRAME_MAX_HEIGHT)
-                    quality = self._config.get(CONF_FRAME_QUALITY, DEFAULT_FRAME_QUALITY)
-                    processed = await self.hass.async_add_executor_job(
-                        process_frame, image.content, max_w, max_h, quality
-                    )
-                    frame_b64 = base64.b64encode(processed).decode("ascii")
-                    await self._client.send_image(frame_b64, mime_type="image/jpeg")
-                    result["initial_frame_sent"] = True
-                    _LOGGER.info("Sent immediate frame after switching to %s", camera_entity_id)
-            except Exception:
-                _LOGGER.warning("Could not send immediate frame for switched camera", exc_info=True)
+            # Schedule context injection after a brief delay (allows gate to open)
+            self.hass.async_create_task(_inject_switch_context())
 
         return result
 
@@ -1581,8 +1590,17 @@ class JeevesSessionManager:
 
         if function_name == "end_conversation":
             reason = arguments.get("reason", "conversation complete") or "conversation complete"
-            self.hass.async_create_task(self.async_stop_session(reason))
-            return {"success": True, "message": f"Ending conversation: {reason}"}
+            # Delay the session teardown so the model has time to speak a goodbye.
+            # The model receives this tool result FIRST, generates farewell audio,
+            # then the session ends after the grace period.
+            async def _delayed_stop() -> None:
+                await asyncio.sleep(6.0)  # Allow ~6s for farewell speech
+                await self.async_stop_session(reason)
+            self.hass.async_create_task(_delayed_stop())
+            return {
+                "success": True,
+                "message": f"Session will end in a few seconds. Say a brief, warm goodbye to the visitor NOW before the connection closes.",
+            }
 
         if function_name == "recall_memories":
             return await self._recall_memories(arguments)
@@ -1760,7 +1778,8 @@ class JeevesSessionManager:
     def _handle_session_end(self) -> None:
         _LOGGER.warning("AI session ended — cleaning up")
         self._active = False
-        self._starting = True
+        # Do NOT set _starting=True here — it blocks new session starts from triggers
+        # and is only properly cleared in _cleanup_after_end's finally block.
         self._session_end_reason = self._session_end_reason or "AI session ended unexpectedly"
         if self._session_end_reason in {"session ended", "conversation complete"}:
             self._session_end_reason = "AI session ended unexpectedly"
@@ -1769,6 +1788,10 @@ class JeevesSessionManager:
 
     async def _cleanup_after_end(self) -> None:
         """Clean up resources after an unexpected session end."""
+        # Guard against re-entrant cleanup
+        if getattr(self, "_cleanup_running", False):
+            return
+        self._cleanup_running = True
         try:
             for unsub in self._stop_unsubs:
                 unsub()
@@ -1808,11 +1831,16 @@ class JeevesSessionManager:
                 except Exception:
                     _LOGGER.debug("Client disconnect during cleanup failed", exc_info=True)
                 self._client = None
-            await self._store_session_memory(
-                self._session_end_reason or "AI session ended unexpectedly"
-            )
+            # Always attempt to save memory
+            try:
+                await self._store_session_memory(
+                    self._session_end_reason or "AI session ended unexpectedly"
+                )
+            except Exception:
+                _LOGGER.exception("Failed to store session memory during cleanup")
         finally:
             self._starting = False
+            self._cleanup_running = False
 
     async def _mic_forward_loop(self) -> None:
         """Forward queued microphone PCM chunks to the active realtime client.
@@ -1914,6 +1942,8 @@ class JeevesSessionManager:
                     "text": text,
                 },
             )
+            # Log transcript to file for debugging TTS output
+            _LOGGER.warning("📝 TRANSCRIPT [%s]: %s", role.upper(), text[:300])
         if self._tool_router and self._tool_router.is_active:
             self._tool_router.add_transcript(role, text)
 

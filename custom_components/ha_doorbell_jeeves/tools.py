@@ -501,8 +501,10 @@ def build_gemini_tools(
     declarations.append(types.FunctionDeclaration(
         name="end_conversation",
         description=(
-            "End the doorbell conversation. Call this when the visitor says goodbye, "
-            "leaves, or the conversation is complete."
+            "End the doorbell conversation gracefully. IMPORTANT: Say your goodbye/farewell "
+            "to the visitor BEFORE calling this tool, OR the system will give you a few seconds "
+            "to say goodbye after you call it. Call when the visitor says goodbye, "
+            "leaves, asks to hang up, or the conversation is naturally complete."
         ),
         parameters={
             "type": "object",
@@ -1092,8 +1094,10 @@ def build_openai_tools(
         "type": "function",
         "name": "end_conversation",
         "description": (
-            "End the doorbell conversation. Call this when the visitor says goodbye, "
-            "leaves, or the conversation is complete."
+            "End the doorbell conversation gracefully. IMPORTANT: Say your goodbye/farewell "
+            "to the visitor BEFORE calling this tool, OR the system will give you a few seconds "
+            "to say goodbye after you call it. Call when the visitor says goodbye, "
+            "leaves, asks to hang up, or the conversation is naturally complete."
         ),
         "parameters": {
             "type": "object",
@@ -1293,10 +1297,11 @@ async def _execute_view_camera(
         if not raw_jpeg:
             return {"error": f"Could not get image from {camera_id} (all methods failed)"}
 
-        # Process image (resize/optimize) to avoid sending huge images to the model
+        # Process image (resize/optimize) — use higher quality for on-demand analysis
+        # than the live feed (which is optimized for bandwidth at lower quality)
         from .frame_processor import process_frame  # noqa: PLC0415
         processed = await hass.async_add_executor_job(
-            process_frame, raw_jpeg, 1024, 768, 75
+            process_frame, raw_jpeg, 1280, 960, 85
         )
 
         # Return base64 image — the session manager will inject this into the model
@@ -1312,15 +1317,24 @@ async def _execute_view_camera(
             "_image_base64": image_b64,  # Special key: session manager injects as image
             "_image_mime": "image/jpeg",
             "_image_context": (
-                "[SYSTEM] IMAGE CAPTURED BY TOOL: view_camera.\n"
-                f"Camera name: {cam_name}\n"
-                f"Camera entity: {camera_id}\n"
-                f"Reason: {reason}\n"
-                "The image immediately following this text is the live snapshot from that camera. "
-                "Use only this image as ground truth for questions about this camera view. "
-                "If the requested object/person is not visible, say that it is not visible; do not infer it."
+                f"[SYSTEM] ON-DEMAND CAMERA SNAPSHOT — {cam_name} ({camera_id})\n"
+                f"Capture reason: {reason}\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "CRITICAL INSTRUCTION: The image immediately following this message is a "
+                "HIGH-RESOLUTION snapshot captured just now from this specific camera.\n"
+                "• Count objects CAREFULLY — look at the ENTIRE image systematically.\n"
+                "• If asked 'how many cars', count each distinct vehicle you can see.\n"
+                "• Do NOT rely on memory or previous frames — use ONLY this snapshot.\n"
+                "• If something is not visible in this image, say it is NOT visible.\n"
+                "• Do NOT hallucinate or invent objects that are not clearly in the image.\n"
+                "• Describe what you ACTUALLY see, even if it contradicts expectations.\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             ),
-            "message": f"Here is the current view from {cam_name}. Analyze what you see.",
+            "message": (
+                f"A high-resolution snapshot from {cam_name} has been captured and injected. "
+                "Analyze ONLY this snapshot image to answer the visitor's question. "
+                "Count all objects carefully and report exactly what you see."
+            ),
         }
     except asyncio.TimeoutError:
         return {
