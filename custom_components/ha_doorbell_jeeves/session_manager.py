@@ -1292,6 +1292,16 @@ class JeevesSessionManager:
             if self._client._model_generating:
                 _LOGGER.warning("AI still speaking after 10s — proceeding with switch anyway")
 
+        # Wait for audio buffer to drain (audio may still be playing after model stops)
+        if self._audio_handler and self._audio_handler.has_pending_audio:
+            _LOGGER.info("Waiting for audio buffer to drain before camera switch...")
+            for _ in range(30):  # Max 3 seconds (30 × 100ms)
+                if not self._audio_handler.has_pending_audio:
+                    break
+                await asyncio.sleep(0.1)
+            if self._audio_handler and self._audio_handler.has_pending_audio:
+                _LOGGER.warning("Audio buffer still has data after 3s — proceeding with switch")
+
         # Verify camera entity exists
         if not self._camera_exists(camera_entity_id):
             result["error"] = f"Camera entity '{camera_entity_id}' is not available in Home Assistant."

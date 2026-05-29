@@ -503,6 +503,11 @@ class ReolinkAudioHandler:
             and self._talk_baichuan is not None
         )
 
+    @property
+    def has_pending_audio(self) -> bool:
+        """True if there is buffered audio waiting to be sent to the speaker."""
+        return len(self._pcm_buffer) > 0
+
     async def start(self) -> None:
         """Start 2-way audio: output via Baichuan, input via cached method.
 
