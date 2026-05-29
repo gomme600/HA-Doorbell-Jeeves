@@ -530,7 +530,21 @@ class JeevesSessionManager:
             self._security.start_session()
 
             _LOGGER.warning("Connecting to %s API...", provider)
-            await self._client.connect()
+
+            # Build greeting text to pass to connect() for atomic burst pattern
+            camera_entity = self._resolve_camera_entity(config.get(CONF_CAMERA_ENTITY, ""))
+            greeting_text = (
+                "[SYSTEM] A visitor just rang the doorbell. "
+                "START SPEAKING YOUR GREETING IMMEDIATELY — do NOT call any tools first. "
+                "A camera frame is being sent to you right now — use it to identify the visitor "
+                "if you recognize them, but do NOT wait or call view_camera. "
+                "Just greet them warmly and ask how you can help. "
+                "Do NOT tell the visitor you are notifying anyone. "
+                "Speak now."
+            )
+
+            # Connect with greeting in atomic burst (matches reconnect pattern that never gets 1008)
+            await self._client.connect(greeting_text=greeting_text)
             self._active = True
             self._session_started_at = time.time()
             self._session_end_reason = "conversation complete"
@@ -540,47 +554,22 @@ class JeevesSessionManager:
             self._touch_audio_activity()
             _LOGGER.warning("Connected! Session is now active.")
 
-            # Send greeting trigger AFTER audio is ready (prevents cut-off)
-            # BUT we must send SOMETHING within ~15s or Gemini's idle timeout kills
-            # the session. Strategy: if audio setup takes longer than 5s, send
-            # a keep-alive context message to prevent idle disconnect.
+            # Set greeting phase flags
+            self._greeting_phase = True
+            self._notify_after_greeting = True
+            self._ai_last_output_time = time.time() + 8.0  # Pre-close echo gate
+
+            # Start audio setup in background (model is already generating greeting)
             reolink_mode = config.get(CONF_AUDIO_MODE) == AUDIO_MODE_REOLINK
 
             if reolink_mode:
-                # v1.5.0 pattern: audio setup → vision context (partial) → greeting
-                # The 2-5s audio setup time creates a gap between ref images and greeting
-                # that appears important for server stability (20% 1008 in v1.5.0 vs 60%+ without).
-                _LOGGER.warning("Starting Reolink audio before greeting (v1.5.0 pattern)")
+                _LOGGER.warning("Starting Reolink audio (model already generating greeting)")
                 audio_task = asyncio.create_task(self._start_reolink_audio_background(config))
                 try:
-                    await asyncio.wait_for(asyncio.shield(audio_task), timeout=5.0)
+                    await asyncio.wait_for(asyncio.shield(audio_task), timeout=35.0)
                 except asyncio.TimeoutError:
-                    _LOGGER.warning("Audio setup >5s — continuing with greeting")
-                    # Don't send keepalive — just proceed. Audio will finish in background.
-
-                # Resolve camera and send vision context as SEPARATE partial turn (v1.5.0 pattern)
-                camera_entity = self._resolve_camera_entity(config.get(CONF_CAMERA_ENTITY, ""))
-                if camera_entity and self._client:
-                    await self._client.inject_context(
-                        f"[SYSTEM] Live camera feed is active from your primary camera: {camera_entity}. "
-                        "Image frames that follow are LIVE from this camera — use them as current visual evidence. "
-                        "Do NOT call view_camera for this camera — you already see it live.",
-                        turn_complete=False,
-                    )
-                    await asyncio.sleep(0.3)
-
-                # NOW send the greeting trigger
-                await self._send_initial_greeting(camera_entity)
-
-                # Wait for remaining audio setup if still running
-                if not audio_task.done():
-                    try:
-                        await asyncio.wait_for(audio_task, timeout=30.0)
-                    except asyncio.TimeoutError:
-                        _LOGGER.error("Audio setup timed out after 35s")
+                    _LOGGER.error("Audio setup timed out after 35s")
             else:
-                camera_entity = self._resolve_camera_entity(config.get(CONF_CAMERA_ENTITY, ""))
-                await self._send_initial_greeting(camera_entity)
                 _LOGGER.warning("Audio mode is '%s' (not reolink)", config.get(CONF_AUDIO_MODE))
 
             # Start vision loop — send frames to AI for visual context

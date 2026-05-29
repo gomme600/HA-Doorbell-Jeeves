@@ -82,7 +82,13 @@ class GeminiLiveClient(BaseRealtimeClient):
         recent = self._conversation_turns[-5:]
         return " | ".join(f"[{t['role']}]: {t['text'][:100]}" for t in recent)
 
-    async def connect(self) -> None:
+    async def connect(self, greeting_text: str = "") -> None:
+        """Connect to Gemini Live API.
+
+        If greeting_text is provided, the greeting is sent as part of the initial
+        connection burst (ref images → greeting → receive loop) with NO delay.
+        This matches the reconnect pattern which NEVER gets 1008 errors.
+        """
         # genai.Client() does blocking I/O (SSL cert loading) — run in executor
         loop = asyncio.get_event_loop()
         self._client = await loop.run_in_executor(
@@ -117,12 +123,21 @@ class GeminiLiveClient(BaseRealtimeClient):
         self._connected = True
         self._connect_time = time.time()
 
-        # Brief stabilization pause — server needs time to initialize.
-        await asyncio.sleep(2.0)
-
+        # Atomic burst: ref images → greeting → receive loop (same as reconnect)
+        # NO sleep between session open and first message.
+        # The reconnect path (which NEVER gets 1008) uses this exact pattern.
         await self._inject_reference_images()
 
-        # Start receive loop after reference images (v1.5.0 pattern)
+        if greeting_text:
+            # Send greeting in same burst as ref images (no gap)
+            await self._session.send_client_content(
+                turns=[types.Content(role="user", parts=[types.Part(text=greeting_text)])],
+                turn_complete=True,
+            )
+            self._model_generating = True
+            _LOGGER.warning("Gemini connected + greeting sent at T+%.1f (atomic burst)", time.time() - self._connect_time)
+
+        # Start receive loop AFTER greeting (matching reconnect pattern)
         self._receive_task = asyncio.create_task(self._receive_loop())
 
         # Set startup grace period: block audio/video for 5s to let the model initialize
