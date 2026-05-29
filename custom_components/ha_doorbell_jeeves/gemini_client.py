@@ -366,7 +366,9 @@ class GeminiLiveClient(BaseRealtimeClient):
                     self._model_generating = False
                     err_str = str(recv_err)
                     _LOGGER.warning("Gemini receive() raised: %s (turns=%d)", err_str[:200], turns_completed)
-                    if "close" in err_str.lower() or "1008" in err_str or "not implemented" in err_str.lower():
+                    if ("close" in err_str.lower() or "1008" in err_str
+                            or "1011" in err_str or "deadline" in err_str.lower()
+                            or "not implemented" in err_str.lower()):
                         # RECONNECT LOGIC: try to reconnect if within reconnection budget
                         if reconnect_attempts < max_reconnects:
                             reconnect_attempts += 1
@@ -475,8 +477,10 @@ class GeminiLiveClient(BaseRealtimeClient):
             if t and hasattr(t, "text") and t.text:
                 # Filter out thinking/planning text from output transcription
                 if not self._is_thinking_text(t.text):
-                    self._conversation_turns.append({"role": "assistant", "text": t.text})
-                    self._on_transcript("assistant", t.text)
+                    # Don't pollute conversation history with muted monitor chatter
+                    if not self._monitor_turn_active:
+                        self._conversation_turns.append({"role": "assistant", "text": t.text})
+                        self._on_transcript("assistant", t.text)
                 # Resolve recap future from transcription (thinking or not)
                 if hasattr(self, "_recap_future") and self._recap_future and not self._recap_future.done():
                     self._recap_future.set_result(t.text)

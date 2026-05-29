@@ -1495,6 +1495,9 @@ class JeevesSessionManager:
                         turn_complete=True,
                         monitor=True,
                     )
+                    # Update activity timestamp even for muted turns (keeps cooldown accurate
+                    # and prevents the Gemini session from timing out due to perceived inactivity)
+                    self._last_model_activity = time.time()
                 except Exception:
                     _LOGGER.warning("Monitor inject failed (session may have ended)")
                     break
