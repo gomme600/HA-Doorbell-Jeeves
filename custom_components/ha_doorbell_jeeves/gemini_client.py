@@ -116,17 +116,28 @@ class GeminiLiveClient(BaseRealtimeClient):
             ),
         )
 
-        # Warm-up connection: open and immediately close a session.
+        # Warm-up connection: open a session, trigger a brief generation, receive it.
         # The reconnect path (which reuses self._client) NEVER gets 1008.
-        # This pre-establishes HTTP/2 connections, auth state, etc. in the client.
+        # Hypothesis: server needs to pre-allocate audio generation resources.
         try:
             warmup_cm = self._client.aio.live.connect(
                 model=self._model, config=self._live_config,
             )
             warmup_session = await warmup_cm.__aenter__()
+            # Trigger a minimal generation to pre-allocate audio resources
+            await warmup_session.send_client_content(
+                turns=[types.Content(role="user", parts=[types.Part(text="[System test. Reply with one word: Ready.")])],
+                turn_complete=True,
+            )
+            # Receive the response (pre-allocates audio pipeline)
+            try:
+                async for _ in warmup_session.receive():
+                    break  # Just need first chunk to confirm pipeline works
+            except Exception:
+                pass
             await warmup_cm.__aexit__(None, None, None)
             await asyncio.sleep(0.3)
-            _LOGGER.warning("Warm-up connection completed — opening real session")
+            _LOGGER.warning("Warm-up connection completed (with generation) — opening real session")
         except Exception:
             _LOGGER.warning("Warm-up connection failed (non-fatal)")
             await asyncio.sleep(0.5)
