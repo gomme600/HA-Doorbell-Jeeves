@@ -350,6 +350,13 @@ class GeminiLiveClient(BaseRealtimeClient):
                 image_bytes = base64.b64decode(image_base64)
                 parts.append(types.Part(inline_data=types.Blob(data=image_bytes, mime_type=mime_type)))
 
+            # Pre-block vision/audio BEFORE sending turn_complete=True.
+            # This closes the gap between send_client_content and the first model_turn
+            # event. Without this, the vision loop can send frames during server-side
+            # processing, triggering a 1008 policy violation.
+            if turn_complete:
+                self._model_generating = True
+
             await self._session.send_client_content(
                 turns=[types.Content(role="user", parts=parts)],
                 turn_complete=turn_complete,
@@ -358,6 +365,9 @@ class GeminiLiveClient(BaseRealtimeClient):
             _LOGGER.exception("Failed to inject context")
             if monitor:
                 self._monitor_turn_active = False
+            # Reset pre-block on failure
+            if turn_complete:
+                self._model_generating = False
 
     async def request_recap(self, outcome: str, timeout: float = 8.0) -> dict[str, str] | None:
         """Ask the live model to generate a session recap.
@@ -634,6 +644,8 @@ class GeminiLiveClient(BaseRealtimeClient):
                     except Exception as img_err:
                         _LOGGER.warning("Failed to decode tool image: %s", img_err)
                         pending_image_bytes = None
+                elif fc.name == "view_camera":
+                    _LOGGER.warning("view_camera completed but no _pending_tool_image was set!")
 
                 # Build FunctionResponse (text-only — image goes via realtime_input)
                 function_responses.append(
