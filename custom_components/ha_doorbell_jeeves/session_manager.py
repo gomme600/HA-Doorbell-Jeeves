@@ -115,6 +115,8 @@ class JeevesSessionManager:
         self._config = dict(entry.data) | dict(entry.options)
         self._config["_entry_id"] = entry.entry_id
         self._normalize_manual_audio_config()
+        # Save the original primary camera so we always reset to it at session start
+        self._primary_camera_entity = self._config.get(CONF_CAMERA_ENTITY, "")
 
         # Data store (entities, actions, identities)
         self.store = DataStore(hass, entry.entry_id)
@@ -362,6 +364,10 @@ class JeevesSessionManager:
         self._starting = True
         try:
             _LOGGER.warning("async_start_session: beginning startup sequence")
+
+            # Always reset to primary camera at session start (switch_camera may have changed it)
+            if self._primary_camera_entity:
+                self._config[CONF_CAMERA_ENTITY] = self._primary_camera_entity
 
             # Lazy Reolink go2rtc setup (deferred from entry load for timing)
             if getattr(self, "reolink_needs_setup", False):
@@ -925,7 +931,7 @@ class JeevesSessionManager:
                                 msg = (
                                     f"[SYSTEM] Motion detected on '{sensor_name}'. "
                                     f"The visitor may have moved to the area covered by {cam}. "
-                                    f"Use 'switch_camera' if you want to follow them."
+                                    f"Use 'view_camera' to check that area."
                                 )
                                 if self._client and self._active:
                                     self.hass.async_create_task(self._client.inject_context(msg))

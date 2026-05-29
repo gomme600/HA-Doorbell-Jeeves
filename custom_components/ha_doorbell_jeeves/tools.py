@@ -206,9 +206,9 @@ def build_system_context(
             lines.append(f"• {cam.name} [{cam.entity_id}]: {cam.description}{marker}")
         lines.append(
             "Your primary camera provides a LIVE video feed — you can already see it. "
-            "Use 'view_camera' ONLY to check OTHER cameras (carport, garden, etc)."
+            "Use 'view_camera' ONLY to check OTHER cameras (carport, garden, etc). "
+            "Your live video/audio stream ALWAYS stays on the primary doorbell camera."
         )
-        lines.append("Use 'switch_camera' to change which camera provides the live video/audio feed.")
 
     # Camera placement map (spatial context)
     if store.camera_placements:
@@ -244,8 +244,8 @@ def build_system_context(
         if audio_cameras:
             names = ", ".join(c.name for c in audio_cameras)
             lines.append(
-                f"\n2-way audio cameras ({names}): You can switch_camera to talk/listen "
-                "from these cameras in addition to the doorbell."
+                f"\n2-way audio cameras ({names}): Audio is ONLY available on the primary "
+                "doorbell camera. Use view_camera for snapshots from other cameras."
             )
         ptz_cameras = [cp for cp in store.camera_placements if cp.has_ptz]
         if ptz_cameras:
@@ -1242,7 +1242,19 @@ async def execute_tool_call(
         if function_name == TOOL_VIEW_CAMERA:
             return await _execute_view_camera(hass, store, arguments, config)
         if function_name == TOOL_SWITCH_CAMERA:
-            return await _execute_switch_camera(hass, store, arguments)
+            return {
+                "success": False,
+                "error": (
+                    "Camera switching is disabled. Two-way audio is only available on the "
+                    "primary doorbell camera. Use 'view_camera' to take snapshots from other "
+                    "cameras without switching the live stream. Your live video and audio feed "
+                    "always stays on the doorbell."
+                ),
+                "instruction": (
+                    "Tell the visitor you cannot switch cameras but can check other camera "
+                    "views via snapshots. Use view_camera instead."
+                ),
+            }
         if function_name == TOOL_PTZ_MOVE:
             return await _execute_ptz_move(hass, store, arguments)
         if function_name == TOOL_PTZ_RETURN:
@@ -1397,9 +1409,10 @@ async def _execute_view_camera(
                 "Analyze the attached image NOW. What do you ACTUALLY see?"
             ),
             "message": (
-                f"Snapshot captured from {cam_name}. "
+                f"Snapshot captured from {cam_name}. The image has been injected into your "
+                "video stream — you should see it as the most recent frame. "
                 "IMPORTANT: Describe ONLY what is visible in the actual image pixels. "
-                "If no person is visible, say so clearly. Do NOT fabricate descriptions "
+                "If no cars/people are visible, say so clearly. Do NOT fabricate descriptions "
                 "based on expected context or camera metadata."
             ),
         }
@@ -1907,19 +1920,25 @@ async def _query_llmvision_events_with_timeline(
         raise RuntimeError("No loaded LLM Vision config entry found.")
 
     timeline = Timeline(hass, settings_entry)
-    events = await timeline.get_events_json(
-        start=payload.get("start"),
-        end=payload.get("end"),
-        cameras=[str(camera).lower() for camera in payload.get("cameras", []) if str(camera).strip()],
-        categories=[
+    # Build kwargs, only including parameters the Timeline API supports
+    kwargs: dict[str, Any] = {
+        "start": payload.get("start"),
+        "end": payload.get("end"),
+        "cameras": [str(camera).lower() for camera in payload.get("cameras", []) if str(camera).strip()],
+        "categories": [
             str(category).lower()
             for category in payload.get("categories", [])
             if str(category).strip()
         ],
-        labels=[str(label).lower() for label in payload.get("labels", []) if str(label).strip()],
-        limit=payload.get("limit"),
-        include_no_activity=payload.get("include_no_activity", True),
-    )
+        "limit": payload.get("limit"),
+        "include_no_activity": payload.get("include_no_activity", True),
+    }
+    # Only include 'labels' if the API supports it (newer versions)
+    import inspect  # noqa: PLC0415
+    sig = inspect.signature(timeline.get_events_json)
+    if "labels" in sig.parameters:
+        kwargs["labels"] = [str(label).lower() for label in payload.get("labels", []) if str(label).strip()]
+    events = await timeline.get_events_json(**kwargs)
     return {"events": events or []}
 
 

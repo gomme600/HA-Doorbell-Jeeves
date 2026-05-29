@@ -480,6 +480,25 @@ class GeminiLiveClient(BaseRealtimeClient):
                 function_responses.append(
                     types.FunctionResponse(id=fc.id, name=fc.name, response=result)
                 )
+
+            # Send tool snapshot image BEFORE tool_response so the model sees
+            # it in context when generating its response. Using send_realtime_input
+            # (same as vision loop) is safe during tool_call pending state.
+            if self._session and self._connected and self._pending_tool_image:
+                if len(self._pending_tool_image) == 2:
+                    image_b64, mime_type = self._pending_tool_image
+                else:
+                    image_b64, mime_type, _image_context = self._pending_tool_image
+                self._pending_tool_image = None
+                try:
+                    image_bytes = base64.b64decode(image_b64)
+                    await self._session.send_realtime_input(
+                        media=types.Blob(data=image_bytes, mime_type=mime_type)
+                    )
+                    _LOGGER.debug("Tool snapshot sent via realtime_input (before tool_response)")
+                except Exception:
+                    _LOGGER.warning("Failed to send tool snapshot via realtime_input")
+
             if self._session and self._connected:
                 try:
                     await self._session.send_tool_response(
@@ -487,28 +506,6 @@ class GeminiLiveClient(BaseRealtimeClient):
                     )
                 except Exception:
                     _LOGGER.exception("Failed to send tool response")
-
-            # Inject pending tool image IMMEDIATELY after the tool response
-            # (before releasing the gate) so the model processes the image
-            # without interference from the live video stream.
-            if self._session and self._connected and self._pending_tool_image:
-                if len(self._pending_tool_image) == 2:
-                    image_b64, mime_type = self._pending_tool_image
-                    image_context = (
-                        "[SYSTEM] IMAGE CAPTURED. The requested visual snapshot has been injected "
-                        "below. Analyze THIS IMAGE carefully for your response."
-                    )
-                else:
-                    image_b64, mime_type, image_context = self._pending_tool_image
-                self._pending_tool_image = None
-                await self.inject_context(
-                    image_context,
-                    image_base64=image_b64,
-                    mime_type=mime_type
-                )
-                # Keep gate closed briefly so live frames don't immediately drown
-                # out the high-quality tool snapshot the model needs to analyze
-                await asyncio.sleep(2.0)
         finally:
             # NOTE: We intentionally do NOT clear _tool_call_pending here.
             # It stays True until the model starts generating its response
