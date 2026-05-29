@@ -368,6 +368,7 @@ class GeminiLiveClient(BaseRealtimeClient):
 
                 # Full response stream consumed — safe to ungate vision/audio
                 self._model_generating = False
+                self._tool_call_pending = False  # Safety: ensure not stuck
 
                 if not self._connected:
                     break
@@ -417,6 +418,8 @@ class GeminiLiveClient(BaseRealtimeClient):
         if server_content and server_content.model_turn:
             # Track model generation state (informational)
             self._model_generating = True
+            # Model is responding — tool call cycle is complete
+            self._tool_call_pending = False
             for part in server_content.model_turn.parts:
                 if part.inline_data and part.inline_data.mime_type and "audio" in part.inline_data.mime_type:
                     self._on_audio_output(part.inline_data.data)
@@ -507,4 +510,9 @@ class GeminiLiveClient(BaseRealtimeClient):
                 # out the high-quality tool snapshot the model needs to analyze
                 await asyncio.sleep(2.0)
         finally:
-            self._tool_call_pending = False
+            # NOTE: We intentionally do NOT clear _tool_call_pending here.
+            # It stays True until the model starts generating its response
+            # (detected in _process via model_turn). This prevents mic audio
+            # from flowing in the gap between tool_response and model output,
+            # which would cause a 1008 policy violation.
+            pass

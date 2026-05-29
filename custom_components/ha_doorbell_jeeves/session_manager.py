@@ -1608,6 +1608,9 @@ class JeevesSessionManager:
 
         # Echo gate: record when AI output arrives (mic muted until hold expires)
         self._ai_last_output_time = time.time()
+        # Also update turn_end_time so the turn-end cooldown in mic loop works
+        # even if the model_generating check was never reached (echo gate caught it first)
+        self._turn_end_time = time.time()
 
         if self._interrupt_detector:
             self._interrupt_detector.set_ai_speaking(True)
@@ -1969,11 +1972,11 @@ class JeevesSessionManager:
 
                 # Model generation gate: suppress mic while model is actively generating
                 # (prevents 1008 policy violations from audio input during generation)
-                if self._client and self._client.model_generating:
+                if self._client and (self._client.model_generating or self._client._tool_call_pending):
                     echo_suppressed += 1
                     gate_was_closed = True
                     if echo_suppressed == 1:
-                        _LOGGER.debug("Echo gate: suppressing mic (model generating)")
+                        _LOGGER.debug("Echo gate: suppressing mic (model generating or tool pending)")
                     # Track when model was last generating (for turn-end cooldown)
                     self._turn_end_time = now
                     continue
