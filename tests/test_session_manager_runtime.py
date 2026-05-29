@@ -98,3 +98,24 @@ def test_restart_session_from_trigger_waits_for_stop_before_start() -> None:
 
     asyncio.run(_run())
 
+
+def test_resolve_camera_entity_falls_back_to_managed_camera() -> None:
+    manager = JeevesSessionManager.__new__(JeevesSessionManager)
+    manager._config = {}
+    manager.hass = SimpleNamespace(
+        states=SimpleNamespace(
+            get=lambda entity_id: object() if entity_id == "camera.entree" else None
+        )
+    )
+    manager.store = SimpleNamespace(
+        camera_placements=[
+            SimpleNamespace(entity_id="camera.entree", is_doorbell=True),
+        ],
+        managed_entities=[
+            SimpleNamespace(entity_id="camera.entree"),
+        ],
+    )
+
+    assert manager._resolve_camera_entity("camera.missing") == "camera.entree"
+    assert manager._config[CONF_CAMERA_ENTITY] == "camera.entree"
+

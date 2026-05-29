@@ -179,6 +179,37 @@ class JeevesSessionManager:
         if output_stream:
             self._config[CONF_GO2RTC_STREAM_NAME] = output_stream
 
+    def _camera_exists(self, camera_entity: str) -> bool:
+        """Return True if Home Assistant currently knows this camera entity."""
+        return bool(camera_entity and self.hass.states.get(camera_entity) is not None)
+
+    def _resolve_camera_entity(self, preferred_entity: str) -> str:
+        """Use the preferred camera when available, otherwise fall back to a managed camera."""
+        if self._camera_exists(preferred_entity):
+            return preferred_entity
+
+        candidates: list[str] = []
+        for placement in getattr(self.store, "camera_placements", []):
+            if placement.is_doorbell:
+                candidates.append(placement.entity_id)
+        candidates.extend(
+            entity.entity_id
+            for entity in getattr(self.store, "managed_entities", [])
+            if entity.entity_id.startswith("camera.")
+        )
+
+        for candidate in candidates:
+            if candidate != preferred_entity and self._camera_exists(candidate):
+                _LOGGER.warning(
+                    "Configured camera %s is unavailable; using fallback camera %s",
+                    preferred_entity or "none",
+                    candidate,
+                )
+                self._config[CONF_CAMERA_ENTITY] = candidate
+                return candidate
+
+        return preferred_entity
+
     @property
     def is_active(self) -> bool:
         return self._active
@@ -470,7 +501,7 @@ class JeevesSessionManager:
 
             # Start vision loop — send frames to AI for visual context
             fps = config.get(CONF_VISION_FPS, DEFAULT_VISION_FPS)
-            camera_entity = config.get(CONF_CAMERA_ENTITY, "")
+            camera_entity = self._resolve_camera_entity(config.get(CONF_CAMERA_ENTITY, ""))
             if camera_entity:
                 if self._client:
                     await self._client.inject_context(
@@ -1948,7 +1979,7 @@ class JeevesSessionManager:
 
         Tries HA camera API first, falls back to go2rtc JPEG snapshot.
         """
-        camera_entity = self._config.get(CONF_CAMERA_ENTITY, "")
+        camera_entity = self._resolve_camera_entity(self._config.get(CONF_CAMERA_ENTITY, ""))
         if not camera_entity:
             _LOGGER.warning("No camera entity configured for memory snapshot")
             return ""
@@ -1966,7 +1997,7 @@ class JeevesSessionManager:
         except Exception:
             _LOGGER.debug("HA camera API failed for snapshot, trying go2rtc fallback", exc_info=True)
         # Fallback: go2rtc JPEG snapshot
-        go2rtc_stream = self._config.get(CONF_GO2RTC_STREAM_NAME, "")
+        go2rtc_stream = self._config.get(CONF_GO2RTC_STREAM_NAME, "") or camera_entity
         if go2rtc_stream:
             try:
                 frame_bytes = await self._go2rtc_snapshot(go2rtc_stream)
