@@ -97,7 +97,7 @@ from .tools import build_gemini_tools, build_openai_tools, build_system_context,
 
 _LOGGER = logging.getLogger(__name__)
 TOOL_CALL_TIMEOUT = 25.0
-CAMERA_SWITCH_TIMEOUT = 30.0
+CAMERA_SWITCH_TIMEOUT = 20.0
 
 
 class JeevesSessionManager:
@@ -1209,14 +1209,33 @@ class JeevesSessionManager:
         except asyncio.CancelledError:
             pass
 
-    async def _switch_active_camera(self, camera_entity_id: str) -> dict[str, Any]:
+    async def _switch_active_camera(self, camera_entity_id: str, silent: bool = False) -> dict[str, Any]:
         """Switch the live video and 2-way audio feed to a different camera.
 
         Strategy: Keep old stream active during transition. Only tear it down
         once the new stream is confirmed working. If new audio fails, rollback
         everything to the original camera.
+
+        Args:
+            camera_entity_id: Target camera entity to switch to.
+            silent: If True, don't announce the switch (agent-initiated security switch).
         """
-        _LOGGER.warning("Switching active camera to: %s", camera_entity_id)
+        _LOGGER.warning("Switching active camera to: %s (silent=%s)", camera_entity_id, silent)
+        result: dict[str, Any] = {
+            "video_switched": False,
+            "initial_frame_sent": False,
+            "audio_switched": False,
+        }
+
+        # Wait for AI to finish speaking before cutting audio
+        if self._client and self._client._model_generating:
+            _LOGGER.info("Waiting for AI speech to finish before camera switch...")
+            for _ in range(50):  # Max 10 seconds (50 × 200ms)
+                if not self._client._model_generating:
+                    break
+                await asyncio.sleep(0.2)
+            if self._client._model_generating:
+                _LOGGER.warning("AI still speaking after 10s — proceeding with switch anyway")
         result: dict[str, Any] = {
             "video_switched": False,
             "initial_frame_sent": False,
@@ -1372,10 +1391,20 @@ class JeevesSessionManager:
             )
 
         result["audio_switched"] = audio_started
-        result["message"] = (
-            f"Successfully switched to {camera_entity_id}. "
-            "Both video feed and 2-way audio are now on the new camera."
-        )
+        if silent:
+            result["message"] = (
+                f"Silently switched to {camera_entity_id}. "
+                "Video and audio are now on the new camera. "
+                "Do NOT announce the switch — you are in stealth/security mode. "
+                "Observe silently and report via notifications if needed."
+            )
+        else:
+            result["message"] = (
+                f"Successfully switched to {camera_entity_id}. "
+                "Both video feed and 2-way audio are now on the new camera. "
+                "You MUST now announce yourself on the new camera by saying something like "
+                "'Je suis maintenant sur la caméra [nom]' so the person near this camera knows you're there."
+            )
         return result
 
     async def _restart_reolink_audio_for_camera(self, camera_entity_id: str, placement: Any) -> None:
@@ -1992,10 +2021,11 @@ class JeevesSessionManager:
 
         # Handle camera switching
         switch_camera_id = result.pop("_switch_camera", None)
+        switch_silent = result.pop("_switch_silent", False)
         if switch_camera_id:
             try:
                 switch_result = await asyncio.wait_for(
-                    self._switch_active_camera(switch_camera_id),
+                    self._switch_active_camera(switch_camera_id, silent=switch_silent),
                     timeout=CAMERA_SWITCH_TIMEOUT,
                 )
             except asyncio.TimeoutError:
@@ -2033,11 +2063,16 @@ class JeevesSessionManager:
             self._security.record_action(function_name)
 
         # Add instruction to prevent model from narrating tool results aloud
+        # EXCEPT for switch_camera (non-silent) which should announce itself
         if function_name not in read_only_tools:
-            result["_system_note"] = (
-                "Action completed. Do NOT announce or narrate this result to the visitor. "
-                "Continue the conversation naturally without reading this response aloud."
-            )
+            if function_name == "switch_camera" and not switch_silent:
+                # Let the model announce the switch naturally
+                pass
+            else:
+                result["_system_note"] = (
+                    "Action completed. Do NOT announce or narrate this result to the visitor. "
+                    "Continue the conversation naturally without reading this response aloud."
+                )
         return result
 
     def _handle_session_end(self) -> None:

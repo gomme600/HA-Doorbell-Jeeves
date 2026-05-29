@@ -898,7 +898,9 @@ def build_openai_tools(
             "name": TOOL_SWITCH_CAMERA,
             "description": (
                 "Switch the live video and 2-way audio feed to a different camera. "
-                "Use this to follow a person or monitor a different area."
+                "Use this to follow a person or monitor a different area. "
+                "Set silent=true when switching autonomously for security (don't announce). "
+                "Set silent=false (default) when the user asked you to switch (announce on new camera)."
             ),
             "parameters": {
                 "type": "object",
@@ -911,6 +913,10 @@ def build_openai_tools(
                     "reason": {
                         "type": "string",
                         "description": "Why switching cameras",
+                    },
+                    "silent": {
+                        "type": "boolean",
+                        "description": "If true, switch silently (security/autonomous). If false, announce on new camera.",
                     },
                 },
                 "required": ["camera_entity_id", "reason"],
@@ -1302,10 +1308,10 @@ async def _execute_view_camera(
     hass: HomeAssistant, store: DataStore, arguments: dict[str, Any],
     config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Capture a snapshot from a camera and return it for AI analysis.
+    """Capture snapshots from a camera and return them for AI analysis.
 
-    The image is injected into the conversation as an inline image so the AI
-    can visually analyze it (look for objects, people, etc.).
+    Captures 2-3 frames with a short delay between them for reliability.
+    The images are injected into the conversation so the AI can visually analyze them.
     """
     camera_id = arguments.get("camera_entity_id", "")
     reason = arguments.get("reason", "on-demand check")
@@ -1320,47 +1326,70 @@ async def _execute_view_camera(
     # Validate entity is managed
     allowed = [e.entity_id for e in store.managed_entities if e.entity_id.startswith("camera.")]
     if camera_id not in allowed:
-        return {"error": f"Camera '{camera_id}' not in managed entities."}
+        return {"error": f"Camera '{camera_id}' not in managed entities. FAILED — no image was captured."}
 
     try:
-        raw_jpeg: bytes | None = None
-        # Try HA camera snapshot API
-        image = await asyncio.wait_for(
-            ha_camera_get_image(hass, camera_id, timeout=8),
-            timeout=10,
-        )
-        if image and image.content:
-            raw_jpeg = image.content
-            _LOGGER.info("Captured HA snapshot for %s: %d bytes", camera_id, len(raw_jpeg))
-        else:
-            # Fallback: try go2rtc snapshot
-            import aiohttp  # noqa: PLC0415
+        frames: list[bytes] = []
+        num_captures = 3  # Capture multiple frames for reliability
 
-            from homeassistant.helpers.aiohttp_client import async_get_clientsession  # noqa: PLC0415
+        for attempt in range(num_captures):
+            raw_jpeg: bytes | None = None
+            # Try HA camera snapshot API
+            try:
+                image = await asyncio.wait_for(
+                    ha_camera_get_image(hass, camera_id, timeout=8),
+                    timeout=10,
+                )
+                if image and image.content:
+                    raw_jpeg = image.content
+            except Exception:
+                pass
 
-            from .reolink_audio import _discover_go2rtc_url, _get_go2rtc_session  # noqa: PLC0415
-            base_url = await _discover_go2rtc_url(hass)
-            if base_url:
-                url = f"{base_url}/api/frame.jpeg?src={camera_id}"
-                session = _get_go2rtc_session(hass)
-                if session is None:
-                    session = async_get_clientsession(hass)
-                try:
-                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                        if resp.status == 200:
-                            raw_jpeg = await resp.read()
-                            _LOGGER.info("Captured go2rtc fallback snapshot for %s: %d bytes", camera_id, len(raw_jpeg))
-                except Exception:
-                    _LOGGER.debug("go2rtc snapshot fallback failed for %s", camera_id, exc_info=True)
+            if not raw_jpeg:
+                # Fallback: try go2rtc snapshot
+                import aiohttp  # noqa: PLC0415
 
-        if not raw_jpeg:
-            return {"error": f"Could not get image from {camera_id} (all methods failed)"}
+                from homeassistant.helpers.aiohttp_client import async_get_clientsession  # noqa: PLC0415
 
-        # Process image (resize/optimize) — use higher quality for on-demand analysis
-        # than the live feed (which is optimized for bandwidth at lower quality)
+                from .reolink_audio import _discover_go2rtc_url, _get_go2rtc_session  # noqa: PLC0415
+                base_url = await _discover_go2rtc_url(hass)
+                if base_url:
+                    url = f"{base_url}/api/frame.jpeg?src={camera_id}"
+                    session = _get_go2rtc_session(hass)
+                    if session is None:
+                        session = async_get_clientsession(hass)
+                    try:
+                        async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                            if resp.status == 200:
+                                raw_jpeg = await resp.read()
+                    except Exception:
+                        pass
+
+            if raw_jpeg and len(raw_jpeg) > 1000:
+                frames.append(raw_jpeg)
+
+            # Small delay between captures for temporal diversity
+            if attempt < num_captures - 1:
+                await asyncio.sleep(0.5)
+
+        if not frames:
+            return {
+                "success": False,
+                "error": (
+                    f"FAILED to capture any image from camera '{camera_id}'. "
+                    "All snapshot methods failed. No image was provided to you. "
+                    "Do NOT describe what you think might be there — you have NO visual data from this camera."
+                ),
+            }
+
+        _LOGGER.info("view_camera: captured %d frames from %s (sizes: %s)",
+                     len(frames), camera_id, [len(f) for f in frames])
+
+        # Process the best frame (largest = most detail) at high quality
         from .frame_processor import process_frame  # noqa: PLC0415
+        best_frame = max(frames, key=len)
         processed = await hass.async_add_executor_job(
-            process_frame, raw_jpeg, 1280, 960, 85
+            process_frame, best_frame, 1280, 960, 85
         )
 
         # Return base64 image — the session manager will inject this into the model
@@ -1373,33 +1402,31 @@ async def _execute_view_camera(
             "camera": cam_name,
             "camera_entity_id": camera_id,
             "reason": reason,
+            "frames_captured": len(frames),
             "_image_base64": image_b64,  # Special key: session manager injects as image
             "_image_mime": "image/jpeg",
             "_image_context": (
-                f"[VISUAL ANALYSIS REQUIRED] Camera: {cam_name} ({camera_id})\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "MANDATORY RULES FOR THIS IMAGE:\n"
-                "1. Describe ONLY what you can ACTUALLY SEE in the pixel data.\n"
-                "2. Do NOT use camera area descriptions, location metadata, or "
-                "expectations to fabricate what should be visible.\n"
-                "3. If NO PERSON is clearly visible in the image, you MUST say "
-                "'No person is visible in this image' — do NOT invent one.\n"
-                "4. If the image shows an empty scene (hallway, garden, room), "
-                "describe it as empty. Do NOT assume someone 'must be there'.\n"
-                "5. Do NOT copy descriptions from system prompts or camera configs "
-                "(like 'near the letterbox' or 'at the front door') unless you can "
-                "genuinely see those objects AND a person next to them.\n"
-                "6. Before notifying anyone about a visitor, VERIFY you can see a "
-                "human figure. If unsure, say 'I cannot clearly identify a person'.\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "Analyze the attached image NOW. What do you ACTUALLY see?"
+                f"╔══════════════════════════════════════════════════════════╗\n"
+                f"║  IMAGE SOURCE: {cam_name} ({camera_id})\n"
+                f"║  THIS IS NOT YOUR LIVE FEED — this is a dedicated snapshot.\n"
+                f"╚══════════════════════════════════════════════════════════╝\n"
+                f"\n"
+                f"MANDATORY ANALYSIS RULES:\n"
+                f"1. This image is from camera '{cam_name}'. It is NOT from your primary live stream.\n"
+                f"2. Describe ONLY what you can ACTUALLY SEE in the pixel data below.\n"
+                f"3. Do NOT use your live feed memory or camera area descriptions to fabricate content.\n"
+                f"4. If the image shows an empty scene, say it is empty.\n"
+                f"5. Count objects (cars, people, animals) by carefully examining the image.\n"
+                f"6. If you cannot clearly identify something, say so.\n"
+                f"7. {len(frames)} frame(s) were captured to verify consistency.\n"
+                f"\n"
+                f"Analyze this image from {cam_name} NOW. What do you ACTUALLY see in it?"
             ),
             "message": (
-                f"Snapshot captured from {cam_name}. The image has been injected into your "
-                "video stream — you should see it as the most recent frame. "
-                "IMPORTANT: Describe ONLY what is visible in the actual image pixels. "
-                "If no cars/people are visible, say so clearly. Do NOT fabricate descriptions "
-                "based on expected context or camera metadata."
+                f"Snapshot captured from {cam_name} ({len(frames)} frames taken for verification). "
+                f"The image has been injected — analyze ONLY what is visible in THIS specific image. "
+                f"This image is from {cam_name}, NOT from your primary live feed camera. "
+                f"If no cars/people/objects are visible, say so clearly. Do NOT fabricate."
             ),
         }
     except asyncio.TimeoutError:
@@ -1407,13 +1434,16 @@ async def _execute_view_camera(
             "success": False,
             "error": (
                 f"Timed out while capturing image from {camera_id}. "
-                "No current image was provided to the model."
+                "FAILED — no image was provided to you. Do NOT describe what you think is there."
             ),
         }
     except Exception as err:
         return {
             "success": False,
-            "error": f"Failed to capture from {camera_id}: {err}. No current image was provided to the model.",
+            "error": (
+                f"Failed to capture from {camera_id}: {err}. "
+                "FAILED — no image was provided to you. Do NOT describe what you think is there."
+            ),
         }
 
 
@@ -1427,6 +1457,7 @@ async def _execute_switch_camera(
     """
     camera_id = arguments.get("camera_entity_id", "")
     reason = arguments.get("reason", "")
+    silent = arguments.get("silent", False)
 
     allowed = [e.entity_id for e in store.managed_entities if e.entity_id.startswith("camera.")]
     if camera_id not in allowed:
@@ -1440,12 +1471,13 @@ async def _execute_switch_camera(
         if placement and placement.has_audio
         else "This camera is not marked as two-way-audio capable, so only video is expected to switch."
     )
-    _LOGGER.info("Switching active camera to %s (%s): %s", cam_name, camera_id, reason)
+    _LOGGER.info("Switching active camera to %s (%s): %s (silent=%s)", cam_name, camera_id, reason, silent)
 
     return {
         "success": True,
         "message": f"Switching live video feed to {cam_name}. {audio_note}",
         "_switch_camera": camera_id,  # Special key: session manager processes this
+        "_switch_silent": silent,  # Controls announcement behavior
     }
 
 

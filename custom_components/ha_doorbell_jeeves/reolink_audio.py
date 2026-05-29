@@ -406,43 +406,79 @@ class ReolinkAudioHandler:
         self._preview_stream_buffer: bytearray = bytearray()
 
     async def _amplify_and_forward(self, pcm_data: bytes) -> None:
-        """Apply AGC (Automatic Gain Control) to PCM audio before forwarding.
+        """Apply audio processing pipeline to PCM audio before forwarding.
 
-        Doorbell microphones produce very low-level signals via Baichuan.
-        Instead of fixed gain (which clips), we use simple AGC that targets
-        a specific RMS level while avoiding hard clipping.
+        Pipeline:
+        1. High-pass filter at ~200Hz (removes wind/traffic rumble)
+        2. Noise gate (suppress chunks below noise floor)
+        3. Smoothed AGC with attack/release (amplify voice, limit noise)
         """
         import struct as _struct  # noqa: PLC0415
 
-        TARGET_RMS = 5000.0  # Target RMS for Gemini VAD (~5000 is reliable)
-        MAX_GAIN = 200.0     # Maximum gain to prevent noise amplification
-        MIN_GAIN = 1.0       # Minimum gain (never attenuate)
+        TARGET_RMS = 5000.0    # Target RMS for Gemini VAD
+        MAX_GAIN = 150.0       # Maximum gain (reduced to prevent noise boost)
+        MIN_GAIN = 1.0         # Never attenuate
+        NOISE_GATE_RMS = 40.0  # Below this RMS, consider it silence/noise
+        ATTACK_COEFF = 0.3     # Fast attack (quickly raise gain for speech)
+        RELEASE_COEFF = 0.05   # Slow release (gradually reduce gain after speech)
 
         n_samples = len(pcm_data) // 2
         if n_samples == 0:
             return
 
-        samples = _struct.unpack(f"<{n_samples}h", pcm_data)
+        samples = list(_struct.unpack(f"<{n_samples}h", pcm_data))
 
-        # Compute RMS of input
+        # --- Step 1: High-pass filter at ~200Hz ---
+        # First-order IIR high-pass: y[n] = alpha * (y[n-1] + x[n] - x[n-1])
+        # alpha = RC / (RC + dt), for 200Hz cutoff at 16kHz sample rate: ~0.93
+        alpha = 0.93
+        prev_x = getattr(self, "_hp_prev_x", 0.0)
+        prev_y = getattr(self, "_hp_prev_y", 0.0)
+        for i in range(n_samples):
+            x = float(samples[i])
+            y = alpha * (prev_y + x - prev_x)
+            prev_x = x
+            prev_y = y
+            samples[i] = int(max(-32768, min(32767, y)))
+        self._hp_prev_x = prev_x
+        self._hp_prev_y = prev_y
+
+        # --- Step 2: Compute RMS after filtering ---
         rms = (sum(s * s for s in samples) / n_samples) ** 0.5
         if rms < 1.0:
             rms = 1.0
 
-        # Calculate gain needed to reach target RMS
-        gain = TARGET_RMS / rms
-        gain = max(MIN_GAIN, min(MAX_GAIN, gain))
+        # --- Step 3: Noise gate ---
+        if rms < NOISE_GATE_RMS:
+            # Below noise floor — send near-silence (very low gain)
+            # Don't zero completely to preserve some ambient for natural sound
+            gain = 1.0
+        else:
+            # --- Step 4: Smoothed AGC ---
+            desired_gain = TARGET_RMS / rms
+            desired_gain = max(MIN_GAIN, min(MAX_GAIN, desired_gain))
 
-        # Apply gain with soft clipping (tanh-like) to avoid hard distortion
+            # Smooth gain transitions (attack fast, release slow)
+            prev_gain = getattr(self, "_agc_gain", desired_gain)
+            if desired_gain > prev_gain:
+                # Gain increasing (voice getting quieter) — fast attack
+                gain = prev_gain + ATTACK_COEFF * (desired_gain - prev_gain)
+            else:
+                # Gain decreasing (voice getting louder) — slow release
+                gain = prev_gain + RELEASE_COEFF * (desired_gain - prev_gain)
+            gain = max(MIN_GAIN, min(MAX_GAIN, gain))
+
+        self._agc_gain = gain
+
+        # --- Step 5: Apply gain with soft clipping ---
         amplified = []
         for s in samples:
             v = s * gain
-            # Soft clip: if beyond 80% of range, compress
+            # Soft clip beyond 80% of range
             if v > 26000:
                 v = 26000 + (v - 26000) * 0.3
             elif v < -26000:
                 v = -26000 + (v + 26000) * 0.3
-            # Hard clip at int16 range
             iv = int(v)
             if iv > 32767:
                 iv = 32767

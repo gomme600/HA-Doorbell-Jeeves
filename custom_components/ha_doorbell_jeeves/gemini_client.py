@@ -59,6 +59,8 @@ class GeminiLiveClient(BaseRealtimeClient):
         self._model_generating = False
         # Monitor turn muting: when True, audio output is suppressed (proactive monitor)
         self._monitor_turn_active = False
+        # Keepalive task: sends silent audio during tool calls to prevent server idle timeout
+        self._keepalive_task: asyncio.Task[None] | None = None
 
     @property
     def connected(self) -> bool:
@@ -191,6 +193,7 @@ class GeminiLiveClient(BaseRealtimeClient):
                 await self._receive_task
             except asyncio.CancelledError:
                 pass
+        self._stop_keepalive()
         if self._session_cm:
             try:
                 await self._session_cm.__aexit__(None, None, None)
@@ -237,6 +240,39 @@ class GeminiLiveClient(BaseRealtimeClient):
         except Exception:
             if self._connected:
                 _LOGGER.debug("Failed to send image")
+
+    def _start_keepalive(self) -> None:
+        """Start sending silent audio frames to prevent Gemini idle timeout during tool calls."""
+        if self._keepalive_task and not self._keepalive_task.done():
+            return
+        self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+
+    def _stop_keepalive(self) -> None:
+        """Stop the keepalive task."""
+        if self._keepalive_task and not self._keepalive_task.done():
+            self._keepalive_task.cancel()
+        self._keepalive_task = None
+
+    async def _keepalive_loop(self) -> None:
+        """Send silent audio every 8s while tool_call_pending to keep the WebSocket alive."""
+        # 640 bytes = 20ms of silence at 16kHz/16-bit mono
+        silent_frame = b"\x00" * 640
+        try:
+            while self._tool_call_pending and self._session and self._connected:
+                await asyncio.sleep(8)
+                if not self._tool_call_pending or not self._session:
+                    break
+                try:
+                    await self._session.send_realtime_input(
+                        audio=types.Blob(
+                            data=silent_frame,
+                            mime_type=f"audio/pcm;rate={AUDIO_INPUT_SAMPLE_RATE}",
+                        )
+                    )
+                except Exception:
+                    break
+        except asyncio.CancelledError:
+            pass
 
     async def inject_context(
         self, text: str, image_base64: str | None = None,
@@ -505,6 +541,8 @@ class GeminiLiveClient(BaseRealtimeClient):
 
     async def _handle_tool_call(self, tool_call: Any) -> None:
         self._tool_call_pending = True
+        # Start keepalive to prevent server idle timeout during tool execution
+        self._start_keepalive()
         # Tool call received — model is no longer in monitor mode
         # (unless it's no_action_needed, which is silent anyway)
         has_no_action = any(
@@ -560,6 +598,8 @@ class GeminiLiveClient(BaseRealtimeClient):
                 function_responses.append(types.FunctionResponse(**fr_kwargs))
 
             if self._session and self._connected:
+                # Stop keepalive before sending response (model will generate after this)
+                self._stop_keepalive()
                 # If we have an image that couldn't go in FunctionResponse.parts,
                 # inject it via send_client_content BEFORE the tool_response so
                 # the model sees it in context when generation starts.
@@ -605,6 +645,8 @@ class GeminiLiveClient(BaseRealtimeClient):
                     else:
                         _LOGGER.exception("Failed to send tool response")
         finally:
+            # Stop keepalive in case it's still running
+            self._stop_keepalive()
             # NOTE: We intentionally do NOT clear _tool_call_pending here.
             # It stays True until the model starts generating its response
             # (detected in _process via model_turn). This prevents mic audio
