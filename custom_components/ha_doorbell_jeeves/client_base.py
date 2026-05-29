@@ -42,6 +42,7 @@ class BaseRealtimeClient(ABC):
         text: str,
         image_base64: str | None = None,
         mime_type: str = "image/jpeg",
+        turn_complete: bool = True,
     ) -> None:
         """Inject a text context message into the session (for tool results in dual-model mode)."""
 

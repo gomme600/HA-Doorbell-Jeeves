@@ -125,41 +125,48 @@ class GeminiLiveClient(BaseRealtimeClient):
             self._session = await self._session_cm.__aenter__()
             await self._inject_reference_images()
 
-            # Build context of what was said so the model has conversation history
-            history_parts: list[types.Part] = []
+            # Build proper conversation history with alternating user/model roles
+            # This restores the model's memory of what IT said, preventing greeting repeat
+            history_turns: list[types.Content] = []
             if self._conversation_turns:
-                recent = self._conversation_turns[-10:]
-                transcript_text = "\n".join(
-                    f"{t['role'].upper()}: {t['text']}" for t in recent
-                )
-                history_parts.append(types.Part(text=(
-                    "[SYSTEM] CONNECTION RESUMED — DO NOT SPEAK.\n"
-                    "You are Jeeves, already mid-conversation with a visitor at the door. "
-                    "The connection was briefly interrupted but the visitor is still here.\n\n"
-                    "CONVERSATION SO FAR:\n"
-                    f"{transcript_text}\n\n"
-                    "CRITICAL RULES:\n"
-                    "- Do NOT respond to this message. Stay SILENT.\n"
-                    "- Do NOT say hello again or re-introduce yourself.\n"
-                    "- Do NOT say 'Je préviens le propriétaire' again.\n"
-                    "- Wait for the visitor to speak, then respond naturally.\n"
-                    "- If a tool result arrives, process it silently or respond briefly."
-                )))
-            else:
-                history_parts.append(types.Part(text=(
-                    "[SYSTEM] CONNECTION RESUMED. You already greeted the visitor. "
-                    "Do NOT speak. Wait for visitor input."
-                )))
+                recent = self._conversation_turns[-15:]
+                # Group consecutive same-role entries and build proper Content turns
+                current_role = None
+                current_texts: list[str] = []
+                for turn in recent:
+                    role = "model" if turn["role"] == "assistant" else "user"
+                    if role != current_role:
+                        if current_role and current_texts:
+                            history_turns.append(types.Content(
+                                role=current_role,
+                                parts=[types.Part(text=" ".join(current_texts))]
+                            ))
+                        current_role = role
+                        current_texts = [turn["text"]]
+                    else:
+                        current_texts.append(turn["text"])
+                # Flush last group
+                if current_role and current_texts:
+                    history_turns.append(types.Content(
+                        role=current_role,
+                        parts=[types.Part(text=" ".join(current_texts))]
+                    ))
 
-            # turn_complete=False: gives model context without triggering a response
-            # This prevents the model from repeating the greeting on reconnect
+            # Always end with a user turn to set context
+            history_turns.append(types.Content(role="user", parts=[types.Part(text=(
+                "[SYSTEM] Connection briefly interrupted. You already greeted this visitor. "
+                "Do NOT repeat your greeting or re-introduce yourself. "
+                "Wait silently for the visitor to speak next."
+            ))]))
+
+            # turn_complete=False: the user "hasn't finished" — model should not respond
             await self._session.send_client_content(
-                turns=[types.Content(role="user", parts=history_parts)],
+                turns=history_turns,
                 turn_complete=False,
             )
-            # Model should NOT generate — ensure gate is off so audio can flow
             self._model_generating = False
-            _LOGGER.warning("Gemini reconnected — continuation prompt sent (with %d history turns)", len(self._conversation_turns))
+            _LOGGER.warning("Gemini reconnected — history restored (%d turns, %d conversation entries)",
+                          len(history_turns), len(self._conversation_turns))
             return True
         except Exception:
             _LOGGER.exception("Gemini reconnect failed")
@@ -204,22 +211,28 @@ class GeminiLiveClient(BaseRealtimeClient):
                 _LOGGER.debug("Failed to send audio")
 
     async def send_image(self, image_base64: str, mime_type: str = "image/jpeg") -> None:
-        """Send an image frame to the live session via realtime video input."""
+        """Send an image frame to the live session via the realtime media channel.
+
+        Uses send_realtime_input(media=...) as per the Gemini Live API docs.
+        The image must be a properly-sized JPEG (ideally ~768x768 at 1 FPS).
+        """
         if not self._session or not self._connected:
             return
-        # GATE: Only block during tool processing (model handles realtime input during generation)
         if self._tool_call_pending:
             return
         try:
             image_bytes = base64.b64decode(image_base64)
             await self._session.send_realtime_input(
-                video=types.Blob(data=image_bytes, mime_type=mime_type)
+                media=types.Blob(data=image_bytes, mime_type=mime_type)
             )
         except Exception:
             if self._connected:
                 _LOGGER.debug("Failed to send image")
 
-    async def inject_context(self, text: str, image_base64: str | None = None, mime_type: str = "image/jpeg") -> None:
+    async def inject_context(
+        self, text: str, image_base64: str | None = None,
+        mime_type: str = "image/jpeg", turn_complete: bool = True,
+    ) -> None:
         """Inject a text message (and optional image) into the live session."""
         if not self._session or not self._connected:
             return
@@ -231,7 +244,7 @@ class GeminiLiveClient(BaseRealtimeClient):
 
             await self._session.send_client_content(
                 turns=[types.Content(role="user", parts=parts)],
-                turn_complete=True,
+                turn_complete=turn_complete,
             )
         except Exception:
             _LOGGER.exception("Failed to inject context")
@@ -303,7 +316,7 @@ class GeminiLiveClient(BaseRealtimeClient):
         try:
             await self._session.send_client_content(
                 turns=[types.Content(role="user", parts=parts)],
-                turn_complete=True,
+                turn_complete=False,  # Context only — don't trigger a response
             )
         except Exception:
             _LOGGER.exception("Failed to inject reference images")

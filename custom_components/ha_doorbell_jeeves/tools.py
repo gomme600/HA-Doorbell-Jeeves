@@ -197,13 +197,16 @@ def build_system_context(
         if config:
             from .const import CONF_CAMERA_ENTITY  # noqa: PLC0415
             primary_cam_id = config.get(CONF_CAMERA_ENTITY, "")
-        lines.append("\n--- CAMERAS (you can view any of these on demand) ---")
+        lines.append("\n--- CAMERAS ---")
         for cam in camera_entities:
-            marker = " ⭐ PRIMARY (your live video feed)" if cam.entity_id == primary_cam_id else ""
+            if cam.entity_id == primary_cam_id:
+                marker = " ⭐ PRIMARY — YOU SEE THIS LIVE (do NOT call view_camera for it)"
+            else:
+                marker = ""
             lines.append(f"• {cam.name} [{cam.entity_id}]: {cam.description}{marker}")
         lines.append(
-            "Use 'view_camera' to get a high-res snapshot. Without specifying a camera, "
-            "it uses your PRIMARY camera. Only specify a different camera_entity_id to check other areas."
+            "Your primary camera provides a LIVE video feed — you can already see it. "
+            "Use 'view_camera' ONLY to check OTHER cameras (carport, garden, etc)."
         )
         lines.append("Use 'switch_camera' to change which camera provides the live video/audio feed.")
 
@@ -220,7 +223,7 @@ def build_system_context(
             if cp.has_ptz:
                 caps.append("PTZ")
             if cp.is_doorbell:
-                caps.append("DOORBELL")
+                caps.append("DOORBELL — YOUR PRIMARY CAMERA")
             if cp.has_audio:
                 caps.append("2-WAY AUDIO")
             caps_str = f" [{', '.join(caps)}]" if caps else ""
@@ -337,41 +340,35 @@ def build_gemini_tools(
     # ─── View camera on demand ────────────────────────────────────────────────
     camera_entities = [e for e in readable_entities if e.entity_id.startswith("camera.")]
     if camera_entities:
-        camera_ids = [e.entity_id for e in camera_entities]
-        # Determine the primary camera for the tool description
         primary_cam = ""
         if config:
             from .const import CONF_CAMERA_ENTITY  # noqa: PLC0415
             primary_cam = config.get(CONF_CAMERA_ENTITY, "")
-        primary_note = f" Defaults to your PRIMARY camera ({primary_cam})." if primary_cam else ""
+        # Only list NON-primary cameras in the enum — the primary is already
+        # visible via the live video feed. view_camera is for OTHER cameras.
+        other_camera_ids = [e.entity_id for e in camera_entities if e.entity_id != primary_cam]
         declarations.append(types.FunctionDeclaration(
             name=TOOL_VIEW_CAMERA,
             description=(
-                "COMMAND: Capture a high-resolution snapshot from a camera for visual analysis. "
-                "Use this to see what is currently visible on a camera."
-                f"{primary_note} "
-                "Only specify a different camera_entity_id if you want to check a DIFFERENT area "
-                "(e.g., carport, garden). Your live video feed already shows the primary camera — "
-                "use view_camera to get a high-res still for careful analysis."
+                "Capture a high-resolution snapshot from a DIFFERENT camera (not the doorbell). "
+                "You already have a LIVE video feed from your primary doorbell camera — "
+                "do NOT call this tool to see the doorbell view. "
+                "Use this ONLY to check other areas: carport, garden, terrace, etc."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "camera_entity_id": {
                         "type": "string",
-                        "description": (
-                            f"Camera to snapshot. OMIT to use your primary camera ({primary_cam}). "
-                            "Only specify if checking a DIFFERENT camera."
-                            if primary_cam else "Camera ID to snapshot"
-                        ),
-                        "enum": camera_ids,
+                        "description": "Which other camera to snapshot (NOT the doorbell — you already see that live).",
+                        "enum": other_camera_ids,
                     },
                     "reason": {
                         "type": "string",
-                        "description": "Reason for snapshot",
+                        "description": "Why you need this snapshot",
                     },
                 },
-                "required": [],
+                "required": ["camera_entity_id", "reason"],
             },
         ))
 

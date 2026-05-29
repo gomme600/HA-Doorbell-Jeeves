@@ -526,9 +526,10 @@ class JeevesSessionManager:
                 if self._client:
                     await self._client.inject_context(
                         "[SYSTEM] Live camera feed starting. "
-                        f"All realtime video frames that follow are from {camera_entity}. "
-                        "Treat these frames as current live visual evidence. "
-                        "If vision frames stop or a camera tool fails, say you cannot see it clearly."
+                        f"All image frames that follow are LIVE from your primary camera: {camera_entity}. "
+                        "Use these frames as current visual evidence of who/what is at the door. "
+                        "Do NOT call view_camera for this camera — you already see it live.",
+                        turn_complete=False,
                     )
                 self._vision_task = asyncio.create_task(self._vision_loop(camera_entity, fps))
 

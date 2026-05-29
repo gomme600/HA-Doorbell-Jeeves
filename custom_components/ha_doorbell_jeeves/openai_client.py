@@ -124,6 +124,7 @@ class OpenAIRealtimeClient(BaseRealtimeClient):
         text: str,
         image_base64: str | None = None,
         mime_type: str = "image/jpeg",
+        turn_complete: bool = True,
     ) -> None:
         """Inject a text message into the realtime session (used by tool router for results)."""
         if not self._ws or not self._connected:
