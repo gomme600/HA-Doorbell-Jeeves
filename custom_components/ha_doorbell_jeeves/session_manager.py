@@ -1499,6 +1499,9 @@ class JeevesSessionManager:
             "A camera frame is being sent to you right now — use it to identify the visitor "
             "if you recognize them, but do NOT wait or call view_camera. "
             "You can use tools AFTER you have started speaking. "
+            "IMPORTANT: In this same turn, after starting your greeting speech, also call "
+            "the notify tool to alert the homeowner. You MUST do both (speak AND call notify) "
+            "in the same response turn — do NOT wait for a second turn. "
             "Speak now."
         )
         try:
