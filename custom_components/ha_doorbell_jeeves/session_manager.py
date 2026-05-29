@@ -1946,6 +1946,10 @@ class JeevesSessionManager:
                 result.pop("_image_mime", "image/jpeg"),
                 image_context,
             )
+            # Include the analysis instructions IN the tool response so the model
+            # sees them alongside the image frame. Previously this was extracted
+            # but never sent to the model, causing it to not engage with the image.
+            result["visual_analysis_instructions"] = image_context
             # Pause vision loop so the injected frame isn't immediately overwritten
             # by the next live camera frame. Cleared when model_turn starts.
             self._client._vision_paused = True

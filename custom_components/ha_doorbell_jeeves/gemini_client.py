@@ -529,8 +529,9 @@ class GeminiLiveClient(BaseRealtimeClient):
             if self._session and self._connected and self._pending_tool_image:
                 if len(self._pending_tool_image) == 2:
                     image_b64, mime_type = self._pending_tool_image
+                    image_context = ""
                 else:
-                    image_b64, mime_type, _image_context = self._pending_tool_image
+                    image_b64, mime_type, image_context = self._pending_tool_image
                 self._pending_tool_image = None
                 try:
                     image_bytes = base64.b64decode(image_b64)
@@ -542,7 +543,8 @@ class GeminiLiveClient(BaseRealtimeClient):
                     # sending tool_response. Without this delay, the model starts
                     # generating speech BEFORE it has processed the image, leading
                     # to hallucinated "I see nothing" responses that get corrected later.
-                    await asyncio.sleep(1.0)
+                    # 2.0s gives the server enough time to fully process the frame.
+                    await asyncio.sleep(2.0)
                 except Exception:
                     _LOGGER.warning("Failed to send tool snapshot via realtime_input")
 
