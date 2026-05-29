@@ -377,7 +377,7 @@ class JeevesSessionManager:
         except Exception:  # noqa: BLE001
             _LOGGER.exception("Failed to restart session from trigger")
 
-    async def async_start_session(self) -> None:
+     async def async_start_session(self) -> None:
         """Start the AI concierge session."""
         if self._active or self._starting:
             _LOGGER.warning("Session already active or starting — ignoring")
@@ -386,6 +386,16 @@ class JeevesSessionManager:
         self._starting = True
         try:
             _LOGGER.warning("async_start_session: beginning startup sequence")
+
+            # SAFETY: Force-cleanup any leftover audio handler from a previous session
+            # that didn't clean up properly (prevents connection leaks to Reolink cameras)
+            if self._audio_handler:
+                _LOGGER.warning("Cleaning up orphaned audio handler from previous session")
+                try:
+                    await asyncio.wait_for(self._audio_handler.stop(), timeout=5)
+                except Exception:
+                    pass
+                self._audio_handler = None
 
             # Always reset to primary camera at session start (switch_camera may have changed it)
             if self._primary_camera_entity:
