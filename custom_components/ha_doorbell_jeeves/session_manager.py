@@ -377,7 +377,7 @@ class JeevesSessionManager:
         except Exception:  # noqa: BLE001
             _LOGGER.exception("Failed to restart session from trigger")
 
-     async def async_start_session(self) -> None:
+    async def async_start_session(self) -> None:
         """Start the AI concierge session."""
         if self._active or self._starting:
             _LOGGER.warning("Session already active or starting — ignoring")
