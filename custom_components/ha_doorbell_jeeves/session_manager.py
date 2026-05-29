@@ -203,7 +203,23 @@ class JeevesSessionManager:
         return state.state not in ("unavailable", "unknown")
 
     def _resolve_camera_entity(self, preferred_entity: str) -> str:
-        """Use the preferred camera when available, otherwise fall back to a managed camera."""
+        """Use the preferred camera when available, otherwise fall back to a managed camera.
+
+        IMPORTANT: If the preferred entity is the explicitly configured primary camera,
+        always use it regardless of HA entity state. The vision loop has go2rtc fallback
+        for when the entity is temporarily unavailable (e.g., Reolink max session errors).
+        """
+        # Always use the explicitly configured primary camera — the vision loop
+        # handles snapshot failures via go2rtc fallback internally
+        if preferred_entity and preferred_entity == self._primary_camera_entity:
+            if not self._camera_exists(preferred_entity):
+                _LOGGER.warning(
+                    "Primary camera %s entity is unavailable but will be used anyway "
+                    "(vision loop has go2rtc fallback)",
+                    preferred_entity,
+                )
+            return preferred_entity
+
         candidates: list[str] = []
         for placement in getattr(self.store, "camera_placements", []):
             if placement.is_doorbell:
@@ -997,6 +1013,9 @@ class JeevesSessionManager:
         consecutive_failures = 0
         frames_sent = 0
         go2rtc_stream = self._config.get(CONF_GO2RTC_STREAM_NAME, "")
+        # Also try the Reolink camera's native go2rtc stream (unique_id-based)
+        if not go2rtc_stream and self._audio_handler:
+            go2rtc_stream = getattr(self._audio_handler, "_camera_unique_id", "") or ""
 
         while self._active:
             try:
