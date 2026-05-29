@@ -585,8 +585,10 @@ class JeevesSessionManager:
                         "Do NOT call view_camera for this camera — you already see it live.",
                         turn_complete=False,
                     )
-                    # Brief pause between context injection and greeting trigger
-                    await asyncio.sleep(0.3)
+                    # Generous pause between context injection and greeting trigger.
+                    # 1.0s (up from 0.3s) gives the server time to fully process the
+                    # partial turn before we send turn_complete=True for the greeting.
+                    await asyncio.sleep(1.0)
 
                 await self._send_initial_greeting()
             else:
@@ -600,7 +602,7 @@ class JeevesSessionManager:
                         "Do NOT call view_camera for this camera — you already see it live.",
                         turn_complete=False,
                     )
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(1.0)
                 await self._send_initial_greeting()
                 _LOGGER.warning("Audio mode is '%s' (not reolink)", config.get(CONF_AUDIO_MODE))
 
@@ -1844,17 +1846,14 @@ class JeevesSessionManager:
             return
         # Block tool calls during greeting phase — forces AI to speak first
         self._greeting_phase = True
+        self._notify_after_greeting = True  # Trigger notification after greeting completes
         trigger_msg = (
             "[SYSTEM] A visitor just rang the doorbell. "
             "START SPEAKING YOUR GREETING IMMEDIATELY — do NOT call any tools first. "
             "A camera frame is being sent to you right now — use it to identify the visitor "
             "if you recognize them, but do NOT wait or call view_camera. "
-            "You can use tools AFTER you have started speaking. "
-            "IMPORTANT: In this same turn, after starting your greeting speech, also call "
-            "the notify tool to alert the homeowner. You MUST do both (speak AND call notify) "
-            "in the same response turn — do NOT wait for a second turn. "
-            "Do NOT tell the visitor you are notifying anyone — just greet them warmly and "
-            "ask how you can help. The notification is silent/internal. "
+            "Just greet them warmly and ask how you can help. "
+            "Do NOT tell the visitor you are notifying anyone. "
             "Speak now."
         )
         try:
@@ -1867,6 +1866,34 @@ class JeevesSessionManager:
         except Exception:
             _LOGGER.exception("Failed to send initial greeting trigger")
 
+    async def _post_greeting_notify(self) -> None:
+        """After the greeting finishes, trigger the model to send a notification.
+
+        This is separated from the greeting turn to avoid the model needing to
+        generate audio AND call a tool in the same turn — which causes ~20% of
+        first-connection 1008 errors with native audio models.
+        """
+        # Wait for the greeting audio to finish playing out
+        await asyncio.sleep(6.0)
+        if not self._active or not self._client or not self._client.connected:
+            return
+        # Wait for model to stop generating (greeting might still be in progress)
+        for _ in range(20):  # 20 × 0.5s = 10s max
+            if not self._client.model_generating:
+                break
+            await asyncio.sleep(0.5)
+        if not self._active or not self._client or not self._client.connected:
+            return
+        await self._client.inject_context(
+            "[SYSTEM] Your greeting is complete. Now silently call the notify tool "
+            "to alert the homeowner that someone is at the door. "
+            "Describe the visitor briefly in the notification message based on what you see. "
+            "Do NOT tell the visitor about the notification — do NOT say anything about notifying. "
+            "After the notification, wait silently for the visitor to speak.",
+            turn_complete=True,
+        )
+        _LOGGER.warning("Post-greeting notification trigger injected")
+
     def _handle_audio_output(self, audio_bytes: bytes) -> None:
         """Handle audio output from the AI model."""
         self._touch_audio_activity()
@@ -1878,6 +1905,10 @@ class JeevesSessionManager:
         if getattr(self, "_greeting_phase", False):
             self._greeting_phase = False
             _LOGGER.warning("Greeting phase ended — tools now unblocked")
+            # Schedule post-greeting notification (separate turn to avoid 1008)
+            if getattr(self, "_notify_after_greeting", False):
+                self._notify_after_greeting = False
+                self.hass.async_create_task(self._post_greeting_notify())
         if self._audio_out_count <= 3:
             _LOGGER.warning(
                 "Audio output from AI: %d bytes (chunk #%d)",

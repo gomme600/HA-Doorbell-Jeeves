@@ -114,14 +114,17 @@ class GeminiLiveClient(BaseRealtimeClient):
         self._session = await self._session_cm.__aenter__()
         self._connected = True
 
+        # Start receive loop FIRST — catches any server-sent setup errors immediately.
+        # Previously we started it after reference images, which meant early 1008s were missed.
+        self._receive_task = asyncio.create_task(self._receive_loop())
+
         # Wait for the server to fully initialize the session.
         # Gemini Live has an internal setup phase after WebSocket connect.
         # Sending content too early triggers 1008 "policy violation" intermittently.
-        # 2s delay significantly reduces startup 1008 rate.
-        await asyncio.sleep(2.0)
+        # 3s delay (increased from 2s) gives the server sufficient initialization time.
+        await asyncio.sleep(3.0)
 
         await self._inject_reference_images()
-        self._receive_task = asyncio.create_task(self._receive_loop())
         # Set startup grace period: block audio/video for 5s to let the model initialize
         # and avoid 1008 policy violation from audio racing with session setup.
         # NOTE: We do NOT set _model_generating=True here because that would block
