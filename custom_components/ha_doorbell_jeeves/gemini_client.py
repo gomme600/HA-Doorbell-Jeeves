@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
-import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -55,11 +54,8 @@ class GeminiLiveClient(BaseRealtimeClient):
         self._recap_future: asyncio.Future[str] | None = None
         self._pending_tool_image: tuple[str, str, str] | None = None
         self._tool_call_pending = False
-        # Model turn gate: blocks realtime input while model is actively generating
-        # to prevent 1008 policy violations during thinking/generation
+        # Track model generation state (informational — used by reconnect logic)
         self._model_generating = False
-        self._model_gen_start: float = 0.0  # monotonic time when generation started
-        self._MODEL_GEN_TIMEOUT = 30.0  # safety: auto-clear gate after this many seconds
 
     @property
     def connected(self) -> bool:
@@ -190,22 +186,11 @@ class GeminiLiveClient(BaseRealtimeClient):
         self._conversation_turns.clear()
         _LOGGER.info("Gemini Live disconnected")
 
-    def _is_model_generating(self) -> bool:
-        """Check if model is generating, with safety timeout."""
-        if not self._model_generating:
-            return False
-        # Safety timeout: auto-clear if stuck for too long
-        if self._model_gen_start and (time.monotonic() - self._model_gen_start) > self._MODEL_GEN_TIMEOUT:
-            _LOGGER.warning("Model generating gate timed out after %.0fs — auto-clearing", self._MODEL_GEN_TIMEOUT)
-            self._model_generating = False
-            return False
-        return True
-
     async def send_audio(self, pcm_bytes: bytes) -> None:
         if not self._session or not self._connected:
             return
-        # GATE: Prevent sending audio during tool processing or model generation
-        if self._tool_call_pending or self._is_model_generating():
+        # GATE: Only block during tool processing (model handles realtime input during generation)
+        if self._tool_call_pending:
             return
         try:
             await self._session.send_realtime_input(
@@ -216,14 +201,14 @@ class GeminiLiveClient(BaseRealtimeClient):
             )
         except Exception:
             if self._connected:
-                _LOGGER.debug("Failed to send audio (model may be generating)")
+                _LOGGER.debug("Failed to send audio")
 
     async def send_image(self, image_base64: str, mime_type: str = "image/jpeg") -> None:
         """Send an image frame to the live session via realtime video input."""
         if not self._session or not self._connected:
             return
-        # GATE: Prevent sending images during tool processing or model generation
-        if self._tool_call_pending or self._is_model_generating():
+        # GATE: Only block during tool processing (model handles realtime input during generation)
+        if self._tool_call_pending:
             return
         try:
             image_bytes = base64.b64decode(image_base64)
@@ -232,7 +217,7 @@ class GeminiLiveClient(BaseRealtimeClient):
             )
         except Exception:
             if self._connected:
-                _LOGGER.debug("Failed to send image (model may be generating)")
+                _LOGGER.debug("Failed to send image")
 
     async def inject_context(self, text: str, image_base64: str | None = None, mime_type: str = "image/jpeg") -> None:
         """Inject a text message (and optional image) into the live session."""
@@ -244,15 +229,11 @@ class GeminiLiveClient(BaseRealtimeClient):
                 image_bytes = base64.b64decode(image_base64)
                 parts.append(types.Part(inline_data=types.Blob(data=image_bytes, mime_type=mime_type)))
 
-            # Pre-set model_generating since the model will respond after this
-            self._model_generating = True
-            self._model_gen_start = time.monotonic()
             await self._session.send_client_content(
                 turns=[types.Content(role="user", parts=parts)],
                 turn_complete=True,
             )
         except Exception:
-            self._model_generating = False
             _LOGGER.exception("Failed to inject context")
 
     async def request_recap(self, outcome: str, timeout: float = 8.0) -> dict[str, str] | None:
@@ -412,9 +393,7 @@ class GeminiLiveClient(BaseRealtimeClient):
         tool_call = getattr(response, "tool_call", None)
 
         if server_content and server_content.model_turn:
-            # Model is actively generating — gate realtime input
-            if not self._model_generating:
-                self._model_gen_start = time.monotonic()
+            # Track model generation state (informational)
             self._model_generating = True
             for part in server_content.model_turn.parts:
                 if part.inline_data and part.inline_data.mime_type and "audio" in part.inline_data.mime_type:
