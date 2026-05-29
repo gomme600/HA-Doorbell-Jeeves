@@ -514,7 +514,7 @@ class GeminiLiveClient(BaseRealtimeClient):
             self._monitor_turn_active = False
         try:
             function_responses: list[types.FunctionResponse] = []
-            # Track image data for potential fallback delivery
+            # Track image data for inline delivery
             pending_image_bytes: bytes | None = None
             pending_image_mime: str = "image/jpeg"
             pending_image_ctx: str = ""
@@ -536,6 +536,8 @@ class GeminiLiveClient(BaseRealtimeClient):
                     self._pending_tool_image = None
                     try:
                         pending_image_bytes = base64.b64decode(image_b64)
+                        # Try to include image directly in FunctionResponse.parts
+                        # (requires google-genai >= 2.x)
                         response_parts = [
                             types.FunctionResponsePart(
                                 inline_data=types.FunctionResponseBlob(
@@ -543,47 +545,25 @@ class GeminiLiveClient(BaseRealtimeClient):
                                 )
                             )
                         ]
-                        _LOGGER.warning(
-                            "Tool image attached to FunctionResponse (%d bytes, %s)",
-                            len(pending_image_bytes), pending_image_mime,
-                        )
+                    except (AttributeError, TypeError) as sdk_err:
+                        # Older SDK — FunctionResponsePart not available
+                        _LOGGER.debug("FunctionResponse.parts not supported: %s", sdk_err)
+                        response_parts = None
                     except Exception as img_err:
                         _LOGGER.warning("Failed to build FunctionResponse parts: %s", img_err)
                         response_parts = None
 
-                # Build FunctionResponse — only include parts if successfully created
+                # Build FunctionResponse — only include parts if SDK supports it
                 fr_kwargs: dict[str, Any] = {"id": fc.id, "name": fc.name, "response": result}
                 if response_parts:
                     fr_kwargs["parts"] = response_parts
                 function_responses.append(types.FunctionResponse(**fr_kwargs))
 
-            # Send tool response
             if self._session and self._connected:
-                sent_with_image = False
-                try:
-                    await self._session.send_tool_response(
-                        function_responses=function_responses
-                    )
-                    sent_with_image = response_parts is not None
-                except Exception as send_err:
-                    # If sending with image parts failed, retry without
-                    if response_parts:
-                        _LOGGER.warning("Tool response with image failed (%s), retrying without", send_err)
-                        try:
-                            plain_responses = [
-                                types.FunctionResponse(id=fr.id, name=fr.name, response=fr.response)
-                                for fr in function_responses
-                            ]
-                            await self._session.send_tool_response(function_responses=plain_responses)
-                        except Exception:
-                            _LOGGER.exception("Tool response retry also failed")
-                    else:
-                        _LOGGER.exception("Failed to send tool response")
-
-                # FALLBACK: If image wasn't delivered with the tool response,
-                # send it immediately after via send_client_content so the model
-                # still sees the image when generating its response.
-                if pending_image_bytes and not sent_with_image:
+                # If we have an image that couldn't go in FunctionResponse.parts,
+                # inject it via send_client_content BEFORE the tool_response so
+                # the model sees it in context when generation starts.
+                if pending_image_bytes and not response_parts:
                     try:
                         ctx_text = pending_image_ctx or (
                             "[TOOL IMAGE] The image below was captured by the tool. "
@@ -596,11 +576,34 @@ class GeminiLiveClient(BaseRealtimeClient):
                                     data=pending_image_bytes, mime_type=pending_image_mime
                                 )),
                             ])],
-                            turn_complete=True,
+                            turn_complete=False,  # Don't trigger generation yet
                         )
-                        _LOGGER.warning("Tool image sent via fallback send_client_content (%d bytes)", len(pending_image_bytes))
+                        _LOGGER.warning(
+                            "Tool image injected via send_client_content before tool_response (%d bytes)",
+                            len(pending_image_bytes),
+                        )
                     except Exception:
-                        _LOGGER.warning("Fallback image delivery also failed")
+                        _LOGGER.warning("Failed to inject tool image before tool_response")
+
+                # Send tool_response (this triggers model generation)
+                try:
+                    await self._session.send_tool_response(
+                        function_responses=function_responses
+                    )
+                except Exception as send_err:
+                    # If sending with parts fails, retry without parts
+                    if response_parts:
+                        _LOGGER.warning("Tool response with parts failed (%s), retrying without", send_err)
+                        try:
+                            plain = [
+                                types.FunctionResponse(id=fr.id, name=fr.name, response=fr.response)
+                                for fr in function_responses
+                            ]
+                            await self._session.send_tool_response(function_responses=plain)
+                        except Exception:
+                            _LOGGER.exception("Tool response retry also failed")
+                    else:
+                        _LOGGER.exception("Failed to send tool response")
         finally:
             # NOTE: We intentionally do NOT clear _tool_call_pending here.
             # It stays True until the model starts generating its response
