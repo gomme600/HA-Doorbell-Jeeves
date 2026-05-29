@@ -704,8 +704,15 @@ class JeevesSessionManager:
             _LOGGER.exception("Reolink audio setup failed (background)")
             # Session continues without 2-way audio — AI can still see via camera
 
-    async def _start_reolink_audio(self, config: dict) -> None:
-        """Start the Reolink 2-way audio handler via go2rtc."""
+    async def _start_reolink_audio(self, config: dict, skip_talk_monitor: bool = False) -> None:
+        """Start the Reolink 2-way audio handler via go2rtc.
+
+        Args:
+            config: Audio configuration dict.
+            skip_talk_monitor: If True, don't start the TalkMonitor (saves a session slot).
+                               Used during camera switching where human takeover detection
+                               isn't needed on secondary cameras.
+        """
         from .reolink_audio import (  # noqa: PLC0415
             AudioInterruptDetector,
             ReolinkAudioHandler,
@@ -820,40 +827,43 @@ class JeevesSessionManager:
                 )
 
         # --- Human Takeover Detection (both methods can run simultaneously) ---
+        # Skip on secondary cameras during switch (saves a session slot)
+        if not skip_talk_monitor:
+            # Method 1: Reolink API polling (GetTalkState)
+            use_reolink_api = config.get(CONF_TAKEOVER_REOLINK_API, True)
+            if use_reolink_api:
+                reolink_entry_id = config.get(CONF_REOLINK_ENTRY_ID, "")
+                if reolink_entry_id:
+                    reolink_config = get_reolink_config(self.hass, reolink_entry_id)
+                    if reolink_config and reolink_config.get("host"):
+                        poll_interval = config.get(
+                            CONF_TAKEOVER_POLL_INTERVAL, DEFAULT_TAKEOVER_POLL_INTERVAL
+                        )
+                        self._talk_monitor = ReolinkTalkMonitor(
+                            hass=self.hass,
+                            host=reolink_config["host"],
+                            username=reolink_config["username"],
+                            password=reolink_config["password"],
+                            on_human_takeover=_on_human_takeover,
+                            poll_interval=poll_interval,
+                        )
+                        await self._talk_monitor.start()
+                        _LOGGER.info("Reolink talk monitor active (poll=%.1fs)", poll_interval)
 
-        # Method 1: Reolink API polling (GetTalkState)
-        use_reolink_api = config.get(CONF_TAKEOVER_REOLINK_API, True)
-        if use_reolink_api:
-            reolink_entry_id = config.get(CONF_REOLINK_ENTRY_ID, "")
-            if reolink_entry_id:
-                reolink_config = get_reolink_config(self.hass, reolink_entry_id)
-                if reolink_config and reolink_config.get("host"):
-                    poll_interval = config.get(
-                        CONF_TAKEOVER_POLL_INTERVAL, DEFAULT_TAKEOVER_POLL_INTERVAL
-                    )
-                    self._talk_monitor = ReolinkTalkMonitor(
-                        hass=self.hass,
-                        host=reolink_config["host"],
-                        username=reolink_config["username"],
-                        password=reolink_config["password"],
-                        on_human_takeover=_on_human_takeover,
-                        poll_interval=poll_interval,
-                    )
-                    await self._talk_monitor.start()
-                    _LOGGER.info("Reolink talk monitor active (poll=%.1fs)", poll_interval)
-
-        # Method 2: Audio energy detection
-        use_audio_energy = config.get(CONF_TAKEOVER_AUDIO_ENERGY, False)
-        if use_audio_energy:
-            threshold = config.get(
-                CONF_TAKEOVER_ENERGY_THRESHOLD, DEFAULT_TAKEOVER_ENERGY_THRESHOLD
-            )
-            self._interrupt_detector = AudioInterruptDetector(
-                on_interrupt=_on_human_takeover,
-                energy_threshold=threshold,
-            )
-            self._interrupt_detector.start()
-            _LOGGER.info("Audio energy interrupt detector active (threshold=%d)", threshold)
+            # Method 2: Audio energy detection
+            use_audio_energy = config.get(CONF_TAKEOVER_AUDIO_ENERGY, False)
+            if use_audio_energy:
+                threshold = config.get(
+                    CONF_TAKEOVER_ENERGY_THRESHOLD, DEFAULT_TAKEOVER_ENERGY_THRESHOLD
+                )
+                self._interrupt_detector = AudioInterruptDetector(
+                    on_interrupt=_on_human_takeover,
+                    energy_threshold=threshold,
+                )
+                self._interrupt_detector.start()
+                _LOGGER.info("Audio energy interrupt detector active (threshold=%d)", threshold)
+        else:
+            _LOGGER.info("Skipping talk monitor on switched camera (saves session slot)")
 
     # ─── Dual-Model Tool Router Setup ─────────────────────────────────────────
 
@@ -1245,11 +1255,6 @@ class JeevesSessionManager:
                 await asyncio.sleep(0.2)
             if self._client._model_generating:
                 _LOGGER.warning("AI still speaking after 10s — proceeding with switch anyway")
-        result: dict[str, Any] = {
-            "video_switched": False,
-            "initial_frame_sent": False,
-            "audio_switched": False,
-        }
 
         # Verify camera entity exists
         if not self._camera_exists(camera_entity_id):
@@ -1304,6 +1309,11 @@ class JeevesSessionManager:
                 self._talk_monitor = None
                 self._interrupt_detector = None
 
+                # CRITICAL: Wait for Reolink to reclaim session slots after logout.
+                # Without this delay, the new login arrives before the camera frees
+                # the old session slot, causing "max session" errors.
+                await asyncio.sleep(1.5)
+
                 # Start new audio on target camera
                 audio_config = dict(self._config)
                 audio_config[CONF_CAMERA_ENTITY] = camera_entity_id
@@ -1326,12 +1336,22 @@ class JeevesSessionManager:
                     audio_config[CONF_REOLINK_MIC_METHOD] = ""
                     audio_config[CONF_REOLINK_MIC_URL] = ""
 
-                await self._start_reolink_audio(audio_config)
+                await self._start_reolink_audio(audio_config, skip_talk_monitor=True)
 
-                # Verify audio is actually connected
-                if self._audio_handler and self._audio_handler.is_active:
+                # Verify audio is actually connected AND output pipeline is working
+                if self._audio_handler and self._audio_handler.output_pipeline_ready:
                     audio_started = True
-                    _LOGGER.warning("Audio switch verified: %s is active", camera_entity_id)
+                    _LOGGER.warning("Audio switch verified: %s is active with output pipeline", camera_entity_id)
+                elif self._audio_handler and self._audio_handler.is_active:
+                    # Handler is active but output pipeline isn't ready — wait briefly
+                    for _ in range(10):  # 2 seconds max
+                        await asyncio.sleep(0.2)
+                        if self._audio_handler.output_pipeline_ready:
+                            audio_started = True
+                            _LOGGER.warning("Audio switch verified (after wait): %s output pipeline ready", camera_entity_id)
+                            break
+                    if not audio_started:
+                        _LOGGER.warning("Audio switch FAILED: output pipeline not ready for %s", camera_entity_id)
                 else:
                     _LOGGER.warning("Audio switch FAILED: handler not active for %s", camera_entity_id)
             except Exception:

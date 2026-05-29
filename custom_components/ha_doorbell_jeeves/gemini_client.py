@@ -113,10 +113,15 @@ class GeminiLiveClient(BaseRealtimeClient):
         )
         self._session = await self._session_cm.__aenter__()
         self._connected = True
+        # Start with model_generating=True: the model will generate its greeting
+        # immediately after connect. This prevents mic audio from being sent during
+        # the greeting generation (which causes 1008 policy violations).
+        # Will be cleared when first turn_complete signal arrives.
+        self._model_generating = True
 
         await self._inject_reference_images()
         self._receive_task = asyncio.create_task(self._receive_loop())
-        # Set startup grace period: block audio/video for 3s to let the model initialize
+        # Set startup grace period: block audio/video for 5s to let the model initialize
         # and avoid 1008 policy violation from audio racing with session setup
         self._startup_grace_until = time.time() + 5.0
         _LOGGER.info("Gemini Live connected (model=%s, voice=%s)", self._model, self._voice)
@@ -266,13 +271,28 @@ class GeminiLiveClient(BaseRealtimeClient):
         self._keepalive_task = None
 
     async def _keepalive_loop(self) -> None:
-        """Send silent audio every 8s while tool_call_pending to keep the WebSocket alive."""
+        """Send silent audio every 8s while waiting for model to generate.
+
+        Keeps the WebSocket alive during tool execution AND during the gap
+        between tool_response and model generation start.
+        """
         # 640 bytes = 20ms of silence at 16kHz/16-bit mono
         silent_frame = b"\x00" * 640
         try:
-            while self._tool_call_pending and self._session and self._connected:
+            while self._session and self._connected:
+                # Stop once model starts generating (no longer at risk of idle timeout)
+                if self._model_generating:
+                    break
+                # Also stop if tool is no longer pending AND model isn't generating
+                # (safety: don't keepalive forever if something goes wrong)
+                if not self._tool_call_pending and not self._model_generating:
+                    # Give a brief window for model to start generating after tool_response
+                    await asyncio.sleep(3)
+                    if not self._tool_call_pending and not self._model_generating:
+                        break
+                    continue
                 await asyncio.sleep(8)
-                if not self._tool_call_pending or not self._session:
+                if not self._session or not self._connected or self._model_generating:
                     break
                 try:
                     await self._session.send_realtime_input(
@@ -502,6 +522,8 @@ class GeminiLiveClient(BaseRealtimeClient):
             self._model_generating = True
             # Model is responding — tool call cycle is complete
             self._tool_call_pending = False
+            # Stop keepalive now that model is generating (no idle timeout risk)
+            self._stop_keepalive()
             # Resume vision loop if it was paused for tool image injection
             self._vision_paused = False
             for part in server_content.model_turn.parts:
@@ -604,8 +626,9 @@ class GeminiLiveClient(BaseRealtimeClient):
                 )
 
             if self._session and self._connected:
-                # Stop keepalive before sending response (model will generate after this)
-                self._stop_keepalive()
+                # Don't stop keepalive yet — there's a gap between sending tool_response
+                # and the model starting to generate where no audio flows. The keepalive
+                # will be stopped when model_generating becomes True (in _process).
 
                 # CRITICAL: Inject tool image via send_realtime_input (media channel).
                 # Send multiple frames to ensure the model's visual buffer is dominated

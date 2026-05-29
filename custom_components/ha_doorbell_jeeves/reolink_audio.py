@@ -493,6 +493,16 @@ class ReolinkAudioHandler:
     def is_active(self) -> bool:
         return self._active
 
+    @property
+    def output_pipeline_ready(self) -> bool:
+        """True if audio output pipeline is confirmed working (talk session active)."""
+        return (
+            self._active
+            and self._output_reader_task is not None
+            and not self._output_reader_task.done()
+            and self._talk_baichuan is not None
+        )
+
     async def start(self) -> None:
         """Start 2-way audio: output via Baichuan, input via cached method.
 
@@ -546,15 +556,16 @@ class ReolinkAudioHandler:
             self._cached_mic_url = ""
 
         # Slow fallback: probe all methods (only if no cache or cache failed)
-        # Create a second Baichuan connection for Preview fallback
-        bc = await self._get_baichuan_object(purpose="preview")
-        if bc:
-            self._baichuan = bc
-
+        # First try RTSP (most reliable, no extra session needed)
         rtsp_started = await self._start_rtsp_audio_input()
         if rtsp_started:
             _LOGGER.warning("Audio input: using ffmpeg/RTSP (continuous audio)")
         else:
+            # Only create Preview connection if RTSP failed (saves a session slot)
+            bc = await self._get_baichuan_object(purpose="preview")
+            if bc:
+                self._baichuan = bc
+
             ffmpeg_started = await self._start_ffmpeg_fallback_input()
             if ffmpeg_started:
                 _LOGGER.warning("Audio input: using ffmpeg fallback (FLV/RTMP)")
@@ -1252,7 +1263,7 @@ class ReolinkAudioHandler:
         # Logout dedicated talk connection
         if hasattr(self, "_talk_host") and self._talk_host:
             try:
-                await asyncio.wait_for(self._talk_host.logout(), timeout=5)
+                await asyncio.wait_for(self._talk_host.logout(), timeout=2)
             except Exception as exc:
                 _LOGGER.debug("Talk host logout error: %s", exc)
             self._talk_host = None
@@ -1260,7 +1271,7 @@ class ReolinkAudioHandler:
         # Logout dedicated preview/input connection
         if hasattr(self, "_preview_host") and self._preview_host:
             try:
-                await asyncio.wait_for(self._preview_host.logout(), timeout=5)
+                await asyncio.wait_for(self._preview_host.logout(), timeout=2)
             except Exception as exc:
                 _LOGGER.debug("Preview host logout error: %s", exc)
             self._preview_host = None
@@ -1391,14 +1402,14 @@ class ReolinkAudioHandler:
         # to prevent session leaks (Reolink has a limited session count).
         if purpose == "talk" and hasattr(self, "_talk_host") and self._talk_host:
             try:
-                await asyncio.wait_for(self._talk_host.logout(), timeout=3)
+                await asyncio.wait_for(self._talk_host.logout(), timeout=2)
                 _LOGGER.debug("Cleaned up stale talk host before new connection")
             except Exception:
                 pass
             self._talk_host = None
         elif purpose == "preview" and hasattr(self, "_preview_host") and self._preview_host:
             try:
-                await asyncio.wait_for(self._preview_host.logout(), timeout=3)
+                await asyncio.wait_for(self._preview_host.logout(), timeout=2)
                 _LOGGER.debug("Cleaned up stale preview host before new connection")
             except Exception:
                 pass
