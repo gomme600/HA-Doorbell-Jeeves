@@ -62,6 +62,8 @@ class GeminiLiveClient(BaseRealtimeClient):
         self._monitor_turn_active = False
         # Keepalive task: sends silent audio during tool calls to prevent server idle timeout
         self._keepalive_task: asyncio.Task[None] | None = None
+        # Generation keepalive: sends silent audio during model generation to prevent 1008
+        self._gen_keepalive_task: asyncio.Task[None] | None = None
         # Startup grace period: block audio/video input briefly after greeting to prevent 1008
         self._startup_grace_until: float = 0.0
 
@@ -277,6 +279,50 @@ class GeminiLiveClient(BaseRealtimeClient):
             self._keepalive_task.cancel()
         self._keepalive_task = None
 
+    def _start_generation_keepalive(self) -> None:
+        """Start keepalive during model generation (greeting/first turn).
+
+        The Gemini server has a ~6s inactivity timeout on the client side.
+        During model generation, we block all send_audio/send_image calls
+        via _model_generating=True. But the server expects bidirectional
+        activity. Without keepalive, ~20-60% of first connections get 1008.
+        """
+        if self._gen_keepalive_task and not self._gen_keepalive_task.done():
+            return
+        self._gen_keepalive_task = asyncio.create_task(self._generation_keepalive_loop())
+
+    def _stop_generation_keepalive(self) -> None:
+        """Stop the generation keepalive."""
+        if self._gen_keepalive_task and not self._gen_keepalive_task.done():
+            self._gen_keepalive_task.cancel()
+        self._gen_keepalive_task = None
+
+    async def _generation_keepalive_loop(self) -> None:
+        """Send silent audio every 3s while model is generating.
+
+        This prevents the Gemini server from closing the WebSocket due to
+        client inactivity during the first generation (greeting).
+        """
+        silent_frame = b"\x00" * 640  # 20ms of silence
+        try:
+            while self._session and self._connected and self._model_generating:
+                await asyncio.sleep(3)
+                if not self._session or not self._connected:
+                    break
+                if not self._model_generating:
+                    break
+                try:
+                    await self._session.send_realtime_input(
+                        audio=types.Blob(
+                            data=silent_frame,
+                            mime_type=f"audio/pcm;rate={AUDIO_INPUT_SAMPLE_RATE}",
+                        )
+                    )
+                except Exception:
+                    break
+        except asyncio.CancelledError:
+            pass
+
     async def _keepalive_loop(self) -> None:
         """Send silent audio every 5s while waiting for tool execution to complete.
 
@@ -356,6 +402,8 @@ class GeminiLiveClient(BaseRealtimeClient):
             # processing, triggering a 1008 policy violation.
             if turn_complete:
                 self._model_generating = True
+                # Start generation keepalive to prevent server inactivity timeout
+                self._start_generation_keepalive()
                 if hasattr(self, '_connect_time'):
                     _LOGGER.warning("inject_context(turn_complete=True) at T+%.1f", time.time() - self._connect_time)
 
@@ -466,6 +514,7 @@ class GeminiLiveClient(BaseRealtimeClient):
                     self._model_generating = False
                     self._tool_call_pending = False
                     self._vision_paused = False
+                    self._stop_generation_keepalive()
                     err_str = str(recv_err)
                     t_err = time.time() - self._connect_time if hasattr(self, '_connect_time') else -1
                     _LOGGER.warning("Gemini receive() raised at T+%.1f: %s (turns=%d)", t_err, err_str[:200], turns_completed)
@@ -495,6 +544,7 @@ class GeminiLiveClient(BaseRealtimeClient):
 
                 # Full response stream consumed — safe to ungate vision/audio
                 self._model_generating = False
+                self._stop_generation_keepalive()
                 self._tool_call_pending = False  # Safety: ensure not stuck
                 self._vision_paused = False  # Safety: ensure vision resumes
 
