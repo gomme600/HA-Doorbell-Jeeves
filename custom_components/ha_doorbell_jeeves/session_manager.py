@@ -931,7 +931,8 @@ class JeevesSessionManager:
                                 msg = (
                                     f"[SYSTEM] Motion detected on '{sensor_name}'. "
                                     f"The visitor may have moved to the area covered by {cam}. "
-                                    f"Use 'view_camera' to check that area."
+                                    f"Use 'view_camera' to check that area, or 'switch_camera' "
+                                    f"to follow them (only if that camera has 2-way audio)."
                                 )
                                 if self._client and self._active:
                                     self.hass.async_create_task(self._client.inject_context(msg))
@@ -1139,19 +1140,15 @@ class JeevesSessionManager:
     async def _switch_active_camera(self, camera_entity_id: str) -> dict[str, Any]:
         """Switch the live video and 2-way audio feed to a different camera.
 
-        This stops the current vision loop and restarts it with the new camera.
-        If the new camera is Reolink, the entire audio stack is also redirected.
-
-        Note: This is typically called during a tool call, so _tool_call_pending
-        may be True in the client. The vision loop will start sending frames once
-        the gate opens. We capture the first frame but defer sending it.
+        Strategy: Keep old stream active during transition. Only tear it down
+        once the new stream is confirmed working. If new audio fails, rollback
+        everything to the original camera.
         """
         _LOGGER.warning("Switching active camera to: %s", camera_entity_id)
         result: dict[str, Any] = {
             "video_switched": False,
             "initial_frame_sent": False,
             "audio_switched": False,
-            "audio_message": "Audio was not changed.",
         }
 
         # Verify camera entity exists
@@ -1159,7 +1156,105 @@ class JeevesSessionManager:
             result["error"] = f"Camera entity '{camera_entity_id}' is not available in Home Assistant."
             return result
 
-        # 1. Stop current vision loop
+        old_camera = self._config.get(CONF_CAMERA_ENTITY, "")
+        if camera_entity_id == old_camera:
+            result["video_switched"] = True
+            result["audio_switched"] = True
+            result["message"] = "Already on this camera."
+            return result
+
+        # Check if the target camera has audio capability
+        store = getattr(self, "store", None)
+        placements = getattr(store, "camera_placements", []) if store else []
+        placement = next((cp for cp in placements if cp.entity_id == camera_entity_id), None)
+
+        if self._config.get(CONF_AUDIO_MODE) == AUDIO_MODE_REOLINK:
+            if not (placement and placement.has_audio):
+                result["error"] = (
+                    f"Cannot switch to {camera_entity_id}: this camera does not have 2-way audio. "
+                    "Video and audio must stay together. Use 'view_camera' for snapshots instead."
+                )
+                return result
+
+        # --- TRANSITION: Start new audio while old is still running ---
+        # Save references to old handlers for rollback
+        old_audio_handler = self._audio_handler
+        old_talk_monitor = self._talk_monitor
+        old_interrupt_detector = self._interrupt_detector
+        old_mic_task = getattr(self, "_mic_task", None)
+
+        audio_started = False
+        if self._config.get(CONF_AUDIO_MODE) == AUDIO_MODE_REOLINK and placement and placement.has_audio:
+            try:
+                # Stop old audio first (Reolink only allows one talk session per camera)
+                if old_audio_handler:
+                    await old_audio_handler.stop()
+                if old_talk_monitor:
+                    await old_talk_monitor.stop()
+                if old_interrupt_detector:
+                    old_interrupt_detector.stop()
+                await self._stop_mic_forwarder()
+
+                # Clear handler refs before restarting
+                self._audio_handler = None
+                self._talk_monitor = None
+                self._interrupt_detector = None
+
+                # Start new audio on target camera
+                audio_config = dict(self._config)
+                audio_config[CONF_CAMERA_ENTITY] = camera_entity_id
+                audio_config[CONF_GO2RTC_STREAM_NAME] = camera_entity_id
+                audio_config[CONF_GO2RTC_INPUT_STREAM_NAME] = camera_entity_id
+                audio_config[CONF_GO2RTC_OUTPUT_STREAM_NAME] = camera_entity_id
+                if getattr(placement, "audio_method", ""):
+                    audio_config[CONF_REOLINK_MIC_METHOD] = placement.audio_method
+                    audio_config[CONF_REOLINK_MIC_URL] = getattr(placement, "audio_url", "")
+                else:
+                    audio_config[CONF_REOLINK_MIC_METHOD] = ""
+                    audio_config[CONF_REOLINK_MIC_URL] = ""
+
+                await self._start_reolink_audio(audio_config)
+
+                # Verify audio is actually connected
+                if self._audio_handler and self._audio_handler.is_active:
+                    audio_started = True
+                    _LOGGER.warning("Audio switch verified: %s is active", camera_entity_id)
+                else:
+                    _LOGGER.warning("Audio switch FAILED: handler not active for %s", camera_entity_id)
+            except Exception:
+                _LOGGER.exception("Audio switch failed for %s", camera_entity_id)
+
+            # ROLLBACK if audio failed
+            if not audio_started:
+                _LOGGER.warning("Rolling back to original camera %s (audio failed)", old_camera)
+                # Stop whatever partial new audio was created
+                if self._audio_handler:
+                    try:
+                        await self._audio_handler.stop()
+                    except Exception:
+                        pass
+                    self._audio_handler = None
+                # Restart old audio
+                try:
+                    old_placement = next((cp for cp in placements if cp.entity_id == old_camera), None)
+                    if old_placement:
+                        rollback_config = dict(self._config)
+                        rollback_config[CONF_CAMERA_ENTITY] = old_camera
+                        rollback_config[CONF_GO2RTC_STREAM_NAME] = old_camera
+                        rollback_config[CONF_GO2RTC_INPUT_STREAM_NAME] = old_camera
+                        rollback_config[CONF_GO2RTC_OUTPUT_STREAM_NAME] = old_camera
+                        await self._start_reolink_audio(rollback_config)
+                except Exception:
+                    _LOGGER.exception("Rollback audio restart also failed!")
+
+                result["error"] = (
+                    f"Camera switch to {camera_entity_id} FAILED: could not establish 2-way audio. "
+                    f"Rolled back to {old_camera}. The camera may not be reachable on the network."
+                )
+                return result
+
+        # --- Audio is confirmed working, now switch video ---
+        # Stop old vision loop
         if self._vision_task and not self._vision_task.done():
             self._vision_task.cancel()
             try:
@@ -1167,74 +1262,28 @@ class JeevesSessionManager:
             except asyncio.CancelledError:
                 pass
 
-        # 2. Update session configuration
-        old_camera = self._config.get(CONF_CAMERA_ENTITY, "")
+        # Update session config to new camera
         self._config[CONF_CAMERA_ENTITY] = camera_entity_id
-        # Update go2rtc stream hints
         self._config[CONF_GO2RTC_STREAM_NAME] = camera_entity_id
         self._config[CONF_GO2RTC_INPUT_STREAM_NAME] = camera_entity_id
         self._config[CONF_GO2RTC_OUTPUT_STREAM_NAME] = camera_entity_id
 
-        # 3. Handle Audio Transition
-        store = getattr(self, "store", None)
-        placements = getattr(store, "camera_placements", []) if store else []
-        placement = next((cp for cp in placements if cp.entity_id == camera_entity_id), None)
-
-        if self._config.get(CONF_AUDIO_MODE) == AUDIO_MODE_REOLINK:
-            if placement and placement.has_audio:
-                try:
-                    await self._restart_reolink_audio_for_camera(camera_entity_id, placement)
-                    result["audio_switched"] = bool(self._audio_handler and self._audio_handler.is_active)
-                    result["audio_message"] = (
-                        "Two-way audio successfully switched to the selected camera."
-                        if result["audio_switched"]
-                        else "Video switched, but two-way audio failed to start on the new camera."
-                    )
-                except Exception:
-                    _LOGGER.exception("Failed to restart audio for switched camera %s", camera_entity_id)
-                    result["audio_message"] = f"Error switching audio to {camera_entity_id}. Audio remains on previous camera."
-            else:
-                result["audio_message"] = (
-                    "Video switched. The selected camera does not support two-way audio, "
-                    "so audio remains on the previous device."
-                )
-        elif self._audio_handler:
-            self._audio_handler._camera_entity_id = camera_entity_id
-            if self._audio_handler.is_active:
-                try:
-                    await self._audio_handler.stop()
-                    await self._audio_handler.start()
-                    result["audio_switched"] = True
-                    result["audio_message"] = "Audio handler restarted for new camera."
-                except Exception:
-                    _LOGGER.exception("Manual audio restart failed")
-
-        # 4. Restart Vision Loop — starts sending frames once tool_call_pending clears
+        # Start new vision loop
         if self._client and self._active:
             fps = float(self._config.get(CONF_VISION_FPS, DEFAULT_VISION_FPS))
-            # Inject context notification about the switch
-            # Use a task to avoid blocking if inject_context is gated
-            async def _inject_switch_context() -> None:
-                try:
-                    if self._client and self._active:
-                        await self._client.inject_context(
-                            f"[SYSTEM] CAMERA SWITCHED SUCCESSFULLY from {old_camera} to {camera_entity_id}. "
-                            f"All realtime video frames that follow are now from {camera_entity_id}. "
-                            "The switch is complete — you can now see and hear through the new camera. "
-                            "Acknowledge the switch briefly to the visitor."
-                        )
-                except Exception:
-                    _LOGGER.debug("Failed to inject switch context", exc_info=True)
-
-            # Start the vision loop (it will begin sending once gate opens)
             self._vision_task = asyncio.create_task(self._vision_loop(camera_entity_id, fps))
             result["video_switched"] = True
-            result["initial_frame_sent"] = True  # First frame will come from vision loop
-            _LOGGER.warning("Vision loop restarted with camera: %s (frames will flow after tool gate opens)", camera_entity_id)
+            result["initial_frame_sent"] = True
+            _LOGGER.warning(
+                "Camera switch COMPLETE: %s → %s (video + audio)",
+                old_camera, camera_entity_id,
+            )
 
-            # Schedule context injection after a brief delay (allows gate to open)
-            self.hass.async_create_task(_inject_switch_context())
-
+        result["audio_switched"] = audio_started
+        result["message"] = (
+            f"Successfully switched to {camera_entity_id}. "
+            "Both video feed and 2-way audio are now on the new camera."
+        )
         return result
 
     async def _restart_reolink_audio_for_camera(self, camera_entity_id: str, placement: Any) -> None:

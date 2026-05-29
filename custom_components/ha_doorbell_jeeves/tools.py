@@ -207,7 +207,8 @@ def build_system_context(
         lines.append(
             "Your primary camera provides a LIVE video feed — you can already see it. "
             "Use 'view_camera' ONLY to check OTHER cameras (carport, garden, etc). "
-            "Your live video/audio stream ALWAYS stays on the primary doorbell camera."
+            "Use 'switch_camera' to change which camera provides the live video AND audio feed. "
+            "NOTE: switch_camera only works on cameras with 2-way audio capability."
         )
 
     # Camera placement map (spatial context)
@@ -244,8 +245,8 @@ def build_system_context(
         if audio_cameras:
             names = ", ".join(c.name for c in audio_cameras)
             lines.append(
-                f"\n2-way audio cameras ({names}): Audio is ONLY available on the primary "
-                "doorbell camera. Use view_camera for snapshots from other cameras."
+                f"\n2-way audio cameras ({names}): You can switch_camera to talk/listen "
+                "from these cameras. Cameras WITHOUT 2-way audio can only be viewed via snapshots."
             )
         ptz_cameras = [cp for cp in store.camera_placements if cp.has_ptz]
         if ptz_cameras:
@@ -1242,19 +1243,7 @@ async def execute_tool_call(
         if function_name == TOOL_VIEW_CAMERA:
             return await _execute_view_camera(hass, store, arguments, config)
         if function_name == TOOL_SWITCH_CAMERA:
-            return {
-                "success": False,
-                "error": (
-                    "Camera switching is disabled. Two-way audio is only available on the "
-                    "primary doorbell camera. Use 'view_camera' to take snapshots from other "
-                    "cameras without switching the live stream. Your live video and audio feed "
-                    "always stays on the doorbell."
-                ),
-                "instruction": (
-                    "Tell the visitor you cannot switch cameras but can check other camera "
-                    "views via snapshots. Use view_camera instead."
-                ),
-            }
+            return await _execute_switch_camera(hass, store, arguments)
         if function_name == TOOL_PTZ_MOVE:
             return await _execute_ptz_move(hass, store, arguments)
         if function_name == TOOL_PTZ_RETURN:
