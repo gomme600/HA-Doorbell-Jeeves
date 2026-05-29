@@ -2159,7 +2159,7 @@ async def _execute_notification(
             if hasattr(m, "_notification_manager"):
                 manager = m
                 break
-    _LOGGER.info("Notification: manager found=%s, entry_id=%s", manager is not None, entry_id)
+    _LOGGER.warning("Notification: manager found=%s, entry_id=%s", manager is not None, entry_id)
 
     # Capture a snapshot NOW from the primary camera and save to /config/www/
     # This ensures the image is always available even if the camera becomes unreachable
@@ -2200,14 +2200,14 @@ async def _execute_notification(
                     reolink_entry = (config or {}).get(CONF_REOLINK_ENTRY_ID, "")
                     if reolink_entry:
                         go2rtc_stream = f"jeeves_reolink_{reolink_entry.replace('-', '_')[:12]}"
-                _LOGGER.info(
+                _LOGGER.warning(
                     "Notification go2rtc fallback: stream=%s, has_method=%s",
                     go2rtc_stream, hasattr(manager, "_go2rtc_snapshot"),
                 )
                 if go2rtc_stream and hasattr(manager, "_go2rtc_snapshot"):
                     image_bytes = await manager._go2rtc_snapshot(go2rtc_stream)
                     if image_bytes:
-                        _LOGGER.info("go2rtc snapshot succeeded (%d bytes)", len(image_bytes))
+                        _LOGGER.warning("go2rtc snapshot succeeded (%d bytes)", len(image_bytes))
                     else:
                         _LOGGER.warning("go2rtc snapshot returned None for stream %s", go2rtc_stream)
             except Exception as err2:
@@ -2218,7 +2218,7 @@ async def _execute_notification(
             latest = getattr(manager, "_latest_vision_frame", b"")
             if latest:
                 image_bytes = latest
-                _LOGGER.info("Using cached vision frame for notification (%d bytes)", len(latest))
+                _LOGGER.warning("Using cached vision frame for notification (%d bytes)", len(latest))
 
         if image_bytes:
             def _write_snapshot() -> None:
