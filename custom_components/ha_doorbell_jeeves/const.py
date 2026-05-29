@@ -73,8 +73,14 @@ CONF_TAKEOVER_REOLINK_API = "takeover_reolink_api"
 CONF_TAKEOVER_AUDIO_ENERGY = "takeover_audio_energy"
 CONF_TAKEOVER_ENERGY_THRESHOLD = "takeover_energy_threshold"
 CONF_TAKEOVER_POLL_INTERVAL = "takeover_poll_interval"
+CONF_TAKEOVER_COOPERATIVE_YIELD = "takeover_cooperative_yield"
+CONF_TAKEOVER_YIELD_INTERVAL = "takeover_yield_interval"
+CONF_TAKEOVER_YIELD_DURATION = "takeover_yield_duration"
 DEFAULT_TAKEOVER_ENERGY_THRESHOLD = 2000
 DEFAULT_TAKEOVER_POLL_INTERVAL = 2.0
+DEFAULT_TAKEOVER_COOPERATIVE_YIELD = False
+DEFAULT_TAKEOVER_YIELD_INTERVAL = 3.0  # seconds between yields
+DEFAULT_TAKEOVER_YIELD_DURATION = 200  # milliseconds yield window
 
 # Security
 CONF_DEFAULT_SECURITY_MODE = "default_security_mode"

@@ -1580,8 +1580,10 @@ class ReolinkAudioHandler:
 
         # On-demand talk: track when last audio was sent to detect silence
         TALK_RELEASE_DELAY = 1.5  # Release speaker after 1.5s of silence
-        COOPERATIVE_YIELD_INTERVAL = 2.0  # Yield talk session every 2s during speech
-        COOPERATIVE_YIELD_WINDOW = 0.2  # Release for 200ms to let Reolink app connect
+        # Cooperative yield settings from config (disabled by default)
+        cooperative_yield_enabled = getattr(self, "_cooperative_yield_enabled", False)
+        cooperative_yield_interval = getattr(self, "_cooperative_yield_interval", 3.0)
+        cooperative_yield_duration = getattr(self, "_cooperative_yield_duration_ms", 200) / 1000.0
         last_audio_sent_time = 0.0
         last_yield_time = 0.0
         yield_buffered_payloads: list[tuple[int, bytes]] = []  # (channel, payload) buffered during yield
@@ -1721,21 +1723,21 @@ class ReolinkAudioHandler:
                     if sleep_time > 0.001:
                         await asyncio.sleep(sleep_time)
 
-                # Cooperative yielding: briefly release talk session every N seconds
-                # during continuous speech to let the Reolink app connect.
-                # If re-acquire fails after yield, someone else took over.
+                # Cooperative yielding: briefly release talk session during speech
+                # to let the Reolink app connect (only if enabled in config).
                 # Audio is buffered during the yield and flushed immediately after.
                 if (
-                    self._talk_held
+                    cooperative_yield_enabled
+                    and self._talk_held
                     and last_audio_sent_time > 0
-                    and (time_mod.monotonic() - last_yield_time) > COOPERATIVE_YIELD_INTERVAL
+                    and (time_mod.monotonic() - last_yield_time) > cooperative_yield_interval
                 ):
                     last_yield_time = time_mod.monotonic()
                     await self._release_talk()
                     # Buffer audio during yield window instead of losing it
                     yield_buffered_payloads.clear()
                     yield_start = time_mod.monotonic()
-                    while (time_mod.monotonic() - yield_start) < COOPERATIVE_YIELD_WINDOW:
+                    while (time_mod.monotonic() - yield_start) < cooperative_yield_duration:
                         # Drain any pending PCM and encode during yield
                         async with self._pcm_lock:
                             yc = bytes(self._pcm_buffer)

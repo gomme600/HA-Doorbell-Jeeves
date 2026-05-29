@@ -406,6 +406,9 @@
           "takeover_reolink_api": "Reolink API Takeover Detection (polls camera talk state)",
           "takeover_audio_energy": "Audio Energy Takeover Detection (monitors mic loudness)",
           "takeover_energy_threshold": "Audio Energy Threshold (higher = less sensitive)",
+          "takeover_cooperative_yield": "Cooperative Yield (briefly release speaker to detect app connection)",
+          "takeover_yield_interval": "Yield Frequency (seconds between speaker releases)",
+          "takeover_yield_duration": "Yield Duration (ms the speaker is released for detection)",
           "chime_delay": "Doorbell Chime Delay",
           "silence_timeout": "Silence Auto-Hangup Timeout",
           "takeover_poll_interval": "Reolink Poll Interval"

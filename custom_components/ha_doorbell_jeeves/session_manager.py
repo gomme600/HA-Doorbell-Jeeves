@@ -809,6 +809,24 @@ class JeevesSessionManager:
 
         self._audio_handler._cached_mic_method = cached_method
         self._audio_handler._cached_mic_url = cached_url
+        # Cooperative yield settings
+        from .const import (  # noqa: PLC0415
+            CONF_TAKEOVER_COOPERATIVE_YIELD,
+            CONF_TAKEOVER_YIELD_DURATION,
+            CONF_TAKEOVER_YIELD_INTERVAL,
+            DEFAULT_TAKEOVER_COOPERATIVE_YIELD,
+            DEFAULT_TAKEOVER_YIELD_DURATION,
+            DEFAULT_TAKEOVER_YIELD_INTERVAL,
+        )
+        self._audio_handler._cooperative_yield_enabled = config.get(
+            CONF_TAKEOVER_COOPERATIVE_YIELD, DEFAULT_TAKEOVER_COOPERATIVE_YIELD
+        )
+        self._audio_handler._cooperative_yield_interval = float(config.get(
+            CONF_TAKEOVER_YIELD_INTERVAL, DEFAULT_TAKEOVER_YIELD_INTERVAL
+        ))
+        self._audio_handler._cooperative_yield_duration_ms = int(config.get(
+            CONF_TAKEOVER_YIELD_DURATION, DEFAULT_TAKEOVER_YIELD_DURATION
+        ))
         await self._audio_handler.start()
         _LOGGER.info("Reolink audio handler active (stream=%s)", stream_name)
 

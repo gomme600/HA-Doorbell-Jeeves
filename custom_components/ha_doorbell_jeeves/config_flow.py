@@ -2215,13 +2215,19 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
             CONF_CHIME_DELAY,
             CONF_SILENCE_TIMEOUT,
             CONF_TAKEOVER_AUDIO_ENERGY,
+            CONF_TAKEOVER_COOPERATIVE_YIELD,
             CONF_TAKEOVER_ENERGY_THRESHOLD,
             CONF_TAKEOVER_POLL_INTERVAL,
             CONF_TAKEOVER_REOLINK_API,
+            CONF_TAKEOVER_YIELD_DURATION,
+            CONF_TAKEOVER_YIELD_INTERVAL,
             DEFAULT_CHIME_DELAY,
             DEFAULT_SILENCE_TIMEOUT,
+            DEFAULT_TAKEOVER_COOPERATIVE_YIELD,
             DEFAULT_TAKEOVER_ENERGY_THRESHOLD,
             DEFAULT_TAKEOVER_POLL_INTERVAL,
+            DEFAULT_TAKEOVER_YIELD_DURATION,
+            DEFAULT_TAKEOVER_YIELD_INTERVAL,
         )
 
         if user_input is not None:
@@ -2239,6 +2245,9 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
             self._data[CONF_TAKEOVER_AUDIO_ENERGY] = user_input.get(CONF_TAKEOVER_AUDIO_ENERGY, False)
             self._data[CONF_TAKEOVER_ENERGY_THRESHOLD] = user_input.get(CONF_TAKEOVER_ENERGY_THRESHOLD, DEFAULT_TAKEOVER_ENERGY_THRESHOLD)
             self._data[CONF_TAKEOVER_POLL_INTERVAL] = user_input.get(CONF_TAKEOVER_POLL_INTERVAL, DEFAULT_TAKEOVER_POLL_INTERVAL)
+            self._data[CONF_TAKEOVER_COOPERATIVE_YIELD] = user_input.get(CONF_TAKEOVER_COOPERATIVE_YIELD, DEFAULT_TAKEOVER_COOPERATIVE_YIELD)
+            self._data[CONF_TAKEOVER_YIELD_INTERVAL] = user_input.get(CONF_TAKEOVER_YIELD_INTERVAL, DEFAULT_TAKEOVER_YIELD_INTERVAL)
+            self._data[CONF_TAKEOVER_YIELD_DURATION] = user_input.get(CONF_TAKEOVER_YIELD_DURATION, DEFAULT_TAKEOVER_YIELD_DURATION)
             self._data[CONF_CHIME_DELAY] = user_input.get(CONF_CHIME_DELAY, DEFAULT_CHIME_DELAY)
             self._data[CONF_SILENCE_TIMEOUT] = user_input.get(CONF_SILENCE_TIMEOUT, DEFAULT_SILENCE_TIMEOUT)
             return self._save_options()
@@ -2275,6 +2284,20 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                 default=self._data.get(CONF_TAKEOVER_ENERGY_THRESHOLD, DEFAULT_TAKEOVER_ENERGY_THRESHOLD),
             )
         ] = NumberSelector(NumberSelectorConfig(min=500, max=10000, step=100, mode=NumberSelectorMode.SLIDER))
+        if is_reolink:
+            schema[vol.Optional(CONF_TAKEOVER_COOPERATIVE_YIELD, default=self._data.get(CONF_TAKEOVER_COOPERATIVE_YIELD, DEFAULT_TAKEOVER_COOPERATIVE_YIELD))] = BooleanSelector()
+            schema[
+                vol.Optional(
+                    CONF_TAKEOVER_YIELD_INTERVAL,
+                    default=self._data.get(CONF_TAKEOVER_YIELD_INTERVAL, DEFAULT_TAKEOVER_YIELD_INTERVAL),
+                )
+            ] = NumberSelector(NumberSelectorConfig(min=1.0, max=10.0, step=0.5, mode=NumberSelectorMode.SLIDER))
+            schema[
+                vol.Optional(
+                    CONF_TAKEOVER_YIELD_DURATION,
+                    default=self._data.get(CONF_TAKEOVER_YIELD_DURATION, DEFAULT_TAKEOVER_YIELD_DURATION),
+                )
+            ] = NumberSelector(NumberSelectorConfig(min=50, max=1000, step=50, mode=NumberSelectorMode.SLIDER))
         schema[
             vol.Optional(
                 CONF_CHIME_DELAY,
