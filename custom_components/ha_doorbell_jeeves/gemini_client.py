@@ -62,6 +62,10 @@ class GeminiLiveClient(BaseRealtimeClient):
         return self._connected
 
     @property
+    def model_generating(self) -> bool:
+        return self._model_generating
+
+    @property
     def conversation_summary(self) -> str:
         if not self._conversation_turns:
             return "No conversation yet."
@@ -196,8 +200,8 @@ class GeminiLiveClient(BaseRealtimeClient):
     async def send_audio(self, pcm_bytes: bytes) -> None:
         if not self._session or not self._connected:
             return
-        # GATE: Only block during tool processing (model handles realtime input during generation)
-        if self._tool_call_pending:
+        # GATE: Block during tool processing or active model generation
+        if self._tool_call_pending or self._model_generating:
             return
         try:
             await self._session.send_realtime_input(

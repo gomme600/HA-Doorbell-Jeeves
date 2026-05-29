@@ -11,6 +11,11 @@ class BaseRealtimeClient(ABC):
     """Protocol for real-time audio/vision streaming clients."""
 
     @property
+    def model_generating(self) -> bool:
+        """Return True if the model is currently generating a response."""
+        return False
+
+    @property
     @abstractmethod
     def connected(self) -> bool:
         """Return True if the session is active."""

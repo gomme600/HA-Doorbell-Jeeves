@@ -1878,6 +1878,15 @@ class JeevesSessionManager:
                         _LOGGER.debug("Echo gate: suppressing mic (AI speaking)")
                     continue
 
+                # Model generation gate: suppress mic while model is actively generating
+                # (prevents 1008 policy violations from audio input during generation)
+                if self._client and self._client.model_generating:
+                    echo_suppressed += 1
+                    gate_was_closed = True
+                    if echo_suppressed == 1:
+                        _LOGGER.debug("Echo gate: suppressing mic (model generating)")
+                    continue
+
                 # Gate just opened — log it
                 if gate_was_closed:
                     _LOGGER.warning(
