@@ -2234,7 +2234,7 @@ async def _execute_notification(
 
             await hass.async_add_executor_job(_write_snapshot)
             snapshot_url = f"/local/{snapshot_filename}"
-            _LOGGER.info(
+            _LOGGER.warning(
                 "Notification snapshot captured (%d bytes) → %s",
                 len(image_bytes), snapshot_url,
             )
@@ -2302,7 +2302,7 @@ async def _execute_notification(
         if snapshot_url:
             data["data"]["image"] = snapshot_url
 
-        _LOGGER.info(
+        _LOGGER.warning(
             "Sending notification to %s.%s with image=%s",
             domain, svc, snapshot_url or "(none)",
         )
