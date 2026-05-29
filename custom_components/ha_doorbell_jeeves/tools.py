@@ -2166,18 +2166,42 @@ async def _execute_notification(
     camera_entity = (config or {}).get(CONF_CAMERA_ENTITY, "")
     snapshot_url = ""
     if camera_entity:
-        try:
-            import os
-            import time as _time
-            www_dir = hass.config.path("www")
-            await hass.async_add_executor_job(os.makedirs, www_dir, 0o755, True)
-            snapshot_filename = f"jeeves_snapshot_{int(_time.time())}.jpg"
-            snapshot_path = os.path.join(www_dir, snapshot_filename)
-            image = await ha_camera_get_image(hass, camera_entity, timeout=8)
+        import os
+        import time as _time
+        www_dir = hass.config.path("www")
+        await hass.async_add_executor_job(os.makedirs, www_dir, 0o755, True)
+        snapshot_filename = f"jeeves_snapshot_{int(_time.time())}.jpg"
+        snapshot_path = os.path.join(www_dir, snapshot_filename)
+        image_bytes: bytes | None = None
 
+        # Try 1: HA camera snapshot API
+        try:
+            image = await ha_camera_get_image(hass, camera_entity, timeout=8)
+            if image and image.content:
+                image_bytes = image.content
+        except Exception as err:
+            _LOGGER.debug("HA camera snapshot failed for %s: %s", camera_entity, err)
+
+        # Try 2: go2rtc JPEG endpoint (works even when camera entity is unavailable)
+        if not image_bytes and manager:
+            try:
+                go2rtc_stream = ""
+                if hasattr(manager, "_audio_handler") and manager._audio_handler:
+                    go2rtc_stream = getattr(manager._audio_handler, "_camera_unique_id", "") or ""
+                if not go2rtc_stream:
+                    from .const import CONF_GO2RTC_STREAM_NAME  # noqa: PLC0415
+                    go2rtc_stream = (config or {}).get(CONF_GO2RTC_STREAM_NAME, "")
+                if not go2rtc_stream:
+                    go2rtc_stream = camera_entity  # camera entity name as stream name
+                if go2rtc_stream and hasattr(manager, "_go2rtc_snapshot"):
+                    image_bytes = await manager._go2rtc_snapshot(go2rtc_stream)
+            except Exception as err2:
+                _LOGGER.debug("go2rtc snapshot fallback failed: %s", err2)
+
+        if image_bytes:
             def _write_snapshot() -> None:
                 with open(snapshot_path, "wb") as f:
-                    f.write(image.content)
+                    f.write(image_bytes)
                 # Clean up old snapshots (keep only current)
                 for fname in os.listdir(www_dir):
                     if fname.startswith("jeeves_snapshot_") and fname != snapshot_filename:
@@ -2187,19 +2211,16 @@ async def _execute_notification(
                             pass
 
             await hass.async_add_executor_job(_write_snapshot)
-            # /local/ maps to /config/www/ in HA
             snapshot_url = f"/local/{snapshot_filename}"
             _LOGGER.info(
-                "Notification snapshot captured from %s (%d bytes)",
-                camera_entity, len(image.content),
+                "Notification snapshot captured (%d bytes) → %s",
+                len(image_bytes), snapshot_url,
             )
-        except Exception as err:
+        else:
             _LOGGER.warning(
-                "Failed to capture snapshot from %s for notification: %s — "
-                "falling back to camera proxy URL",
-                camera_entity, err,
+                "All snapshot methods failed for %s — notification will have no image",
+                camera_entity,
             )
-            snapshot_url = f"/api/camera_proxy/{camera_entity}"
 
     if manager and hasattr(manager, "_notification_manager"):
         notification_mgr = manager._notification_manager
