@@ -701,38 +701,45 @@ class GeminiLiveClient(BaseRealtimeClient):
                 )
 
             if self._session and self._connected:
-                # Don't stop keepalive yet — there's a gap between sending tool_response
-                # and the model starting to generate where no audio flows. The keepalive
-                # will be stopped when model_generating becomes True (in _process).
-
-                # CRITICAL: Inject tool image via send_realtime_input (media channel).
-                # Send multiple frames to ensure the model's visual buffer is dominated
-                # by the tool image rather than previous live feed frames.
-                # Do NOT use send_client_content during the tool response flow as it
-                # can cause 1008 policy violations.
+                # CRITICAL: Inject tool image as a proper content Part (inline_data).
+                # Using send_client_content with turn_complete=False injects the image
+                # into the conversation context where the model can deeply analyze it.
+                # Previous approach (send_realtime_input) only put it in the transient
+                # video buffer which the model treated as "live feed" rather than
+                # analyzing it carefully for the tool response.
                 if pending_image_bytes:
-                    num_frames = 5  # More frames to dominate visual buffer over stale live feed
-                    for frame_i in range(num_frames):
-                        try:
-                            await self._session.send_realtime_input(
-                                media=types.Blob(
-                                    data=pending_image_bytes, mime_type=pending_image_mime
+                    try:
+                        image_parts: list[types.Part] = [
+                            types.Part(text=pending_image_ctx),
+                            types.Part(inline_data=types.Blob(
+                                data=pending_image_bytes, mime_type=pending_image_mime
+                            )),
+                        ]
+                        await self._session.send_client_content(
+                            turns=[types.Content(role="user", parts=image_parts)],
+                            turn_complete=False,  # Context injection, no new generation
+                        )
+                        _LOGGER.warning(
+                            "Tool image injected via send_client_content (%d bytes, %s)",
+                            len(pending_image_bytes), pending_image_mime,
+                        )
+                    except Exception:
+                        _LOGGER.warning("Failed to inject tool image via client_content, falling back to realtime_input")
+                        # Fallback: use realtime media channel
+                        for frame_i in range(3):
+                            try:
+                                await self._session.send_realtime_input(
+                                    media=types.Blob(
+                                        data=pending_image_bytes, mime_type=pending_image_mime
+                                    )
                                 )
-                            )
-                        except Exception:
-                            _LOGGER.warning("Failed to inject tool image frame %d", frame_i + 1)
-                            break
-                        if frame_i < num_frames - 1:
-                            await asyncio.sleep(0.15)
-                    _LOGGER.warning(
-                        "Tool image injected via send_realtime_input (%d bytes, %s, %d frames)",
-                        len(pending_image_bytes), pending_image_mime, num_frames,
-                    )
+                            except Exception:
+                                break
+                            if frame_i < 2:
+                                await asyncio.sleep(0.1)
 
                 # Send tool_response (this triggers model generation)
-                # All image context and analysis instructions are included in the
-                # tool response text (result dict). The model sees the image in its
-                # realtime media buffer and the instructions in the tool response.
+                # The model sees the image in conversation context and the tool response text.
                 try:
                     plain = [
                         types.FunctionResponse(id=fr.id, name=fr.name, response=fr.response)
