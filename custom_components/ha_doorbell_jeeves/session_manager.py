@@ -1295,6 +1295,10 @@ class JeevesSessionManager:
         audio_started = False
         if self._config.get(CONF_AUDIO_MODE) == AUDIO_MODE_REOLINK and placement and placement.has_audio:
             try:
+                # Disable takeover callback before stopping old audio to prevent
+                # cooperative yield from triggering a false "human takeover" during switch
+                if old_audio_handler:
+                    old_audio_handler._on_takeover = None
                 # Stop old audio first (Reolink only allows one talk session per camera)
                 if old_audio_handler:
                     await old_audio_handler.stop()

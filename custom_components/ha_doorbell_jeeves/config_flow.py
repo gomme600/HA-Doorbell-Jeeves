@@ -676,7 +676,13 @@ class DoorbellJeevesConfigFlow(ConfigFlow, domain=DOMAIN):
             ]
         self._data.pop("doorbell_trigger_entity", None)
         camera = self._data.get(CONF_CAMERA_ENTITY, "")
-        title = f"Jeeves ({camera})" if camera else "Doorbell Jeeves"
+        if camera:
+            # Use the camera's friendly name for the integration title
+            cam_state = self.hass.states.get(camera)
+            cam_name = cam_state.attributes.get("friendly_name", camera) if cam_state else camera
+            title = f"Jeeves ({cam_name})"
+        else:
+            title = "Doorbell Jeeves"
         return self.async_create_entry(title=title, data=self._data)
 
     async def _validate_api_key(self, provider: str, api_key: str, base_url: str | None = None) -> bool:

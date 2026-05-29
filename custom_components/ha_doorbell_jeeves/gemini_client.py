@@ -114,6 +114,11 @@ class GeminiLiveClient(BaseRealtimeClient):
         self._session = await self._session_cm.__aenter__()
         self._connected = True
 
+        # Brief pause to let the server fully initialize the session before sending content.
+        # Without this, send_client_content (reference images + greeting) can race with the
+        # server's session setup and trigger a 1008 policy violation.
+        await asyncio.sleep(0.5)
+
         await self._inject_reference_images()
         self._receive_task = asyncio.create_task(self._receive_loop())
         # Set startup grace period: block audio/video for 5s to let the model initialize

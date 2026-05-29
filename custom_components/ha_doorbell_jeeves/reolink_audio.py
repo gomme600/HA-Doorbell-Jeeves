@@ -1581,9 +1581,10 @@ class ReolinkAudioHandler:
         # On-demand talk: track when last audio was sent to detect silence
         TALK_RELEASE_DELAY = 1.5  # Release speaker after 1.5s of silence
         COOPERATIVE_YIELD_INTERVAL = 2.0  # Yield talk session every 2s during speech
-        COOPERATIVE_YIELD_WINDOW = 0.5  # Release for 500ms to let Reolink app connect
+        COOPERATIVE_YIELD_WINDOW = 0.2  # Release for 200ms to let Reolink app connect
         last_audio_sent_time = 0.0
         last_yield_time = 0.0
+        yield_buffered_payloads: list[tuple[int, bytes]] = []  # (channel, payload) buffered during yield
         consecutive_send_failures = 0
         TAKEOVER_FAILURE_THRESHOLD = 3  # After 3 consecutive send failures, assume app takeover
 
@@ -1723,6 +1724,7 @@ class ReolinkAudioHandler:
                 # Cooperative yielding: briefly release talk session every N seconds
                 # during continuous speech to let the Reolink app connect.
                 # If re-acquire fails after yield, someone else took over.
+                # Audio is buffered during the yield and flushed immediately after.
                 if (
                     self._talk_held
                     and last_audio_sent_time > 0
@@ -1730,7 +1732,58 @@ class ReolinkAudioHandler:
                 ):
                     last_yield_time = time_mod.monotonic()
                     await self._release_talk()
-                    await asyncio.sleep(COOPERATIVE_YIELD_WINDOW)
+                    # Buffer audio during yield window instead of losing it
+                    yield_buffered_payloads.clear()
+                    yield_start = time_mod.monotonic()
+                    while (time_mod.monotonic() - yield_start) < COOPERATIVE_YIELD_WINDOW:
+                        # Drain any pending PCM and encode during yield
+                        async with self._pcm_lock:
+                            yc = bytes(self._pcm_buffer)
+                            self._pcm_buffer.clear()
+                        if yc:
+                            # Process through resample + encode (reuse existing vars)
+                            raw_input = resample_leftover + yc
+                            resample_leftover = bytearray()
+                            n_bytes = len(raw_input)
+                            if n_bytes % 2:
+                                resample_leftover = bytearray(raw_input[-1:])
+                                raw_input = raw_input[:-1]
+                                n_bytes -= 1
+                            n_samples_in = n_bytes // 2
+                            if n_samples_in >= 2:
+                                in_samples = struct_mod.unpack(f"<{n_samples_in}h", raw_input)
+                                ratio = input_rate / sample_rate
+                                n_samples_out = int((n_samples_in - 1) / ratio)
+                                if n_samples_out >= 1:
+                                    out_samples = []
+                                    for i in range(n_samples_out):
+                                        src_pos = i * ratio
+                                        idx = int(src_pos)
+                                        frac = src_pos - idx
+                                        if idx + 1 < n_samples_in:
+                                            val = in_samples[idx] + frac * (in_samples[idx + 1] - in_samples[idx])
+                                        else:
+                                            val = in_samples[idx]
+                                        out_samples.append(max(-32768, min(32767, int(val))))
+                                    consumed_input_samples = int(n_samples_out * ratio) + 1
+                                    if consumed_input_samples < n_samples_in:
+                                        leftover_start = consumed_input_samples * 2
+                                        resample_leftover = bytearray(raw_input[leftover_start:])
+                                    resampled_bytes = struct_mod.pack(f"<{len(out_samples)}h", *out_samples)
+                                    resampled_pcm_buffer.extend(resampled_bytes)
+                                    while len(resampled_pcm_buffer) >= pcm_bytes_per_block:
+                                        pcm_block = bytes(resampled_pcm_buffer[:pcm_bytes_per_block])
+                                        del resampled_pcm_buffer[:pcm_bytes_per_block]
+                                        adpcm_data, predictor, step_index = self._encode_ima_adpcm(
+                                            pcm_block, block_size, predictor, step_index
+                                        )
+                                        if adpcm_data:
+                                            adpcm_block = adpcm_data[:block_size]
+                                            if len(adpcm_block) >= block_size:
+                                                payload = self._build_bcmedia_payload(adpcm_block, block_size)
+                                                if payload:
+                                                    yield_buffered_payloads.append((channel, payload))
+                        await asyncio.sleep(0.02)
                     # Try to re-acquire
                     if not await self._acquire_talk():
                         _LOGGER.warning(
@@ -1740,6 +1793,20 @@ class ReolinkAudioHandler:
                         if self._on_takeover:
                             self._hass.async_create_task(self._on_takeover())
                         return  # Exit — let human take over
+                    # Flush buffered payloads immediately after re-acquisition
+                    if yield_buffered_payloads:
+                        for _ch, _pl in yield_buffered_payloads:
+                            try:
+                                await self._send_talk_binary(_ch, _pl)
+                                chunks_sent += 1
+                            except Exception:
+                                break
+                        _LOGGER.info(
+                            "Cooperative yield: flushed %d buffered payloads after re-acquire",
+                            len(yield_buffered_payloads),
+                        )
+                        yield_buffered_payloads.clear()
+                        last_audio_sent_time = time_mod.monotonic()
 
         except asyncio.CancelledError:
             pass
