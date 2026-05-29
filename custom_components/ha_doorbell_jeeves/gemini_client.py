@@ -523,9 +523,11 @@ class GeminiLiveClient(BaseRealtimeClient):
                     types.FunctionResponse(id=fc.id, name=fc.name, response=result)
                 )
 
-            # Send tool snapshot image BEFORE tool_response so the model sees
-            # it in context when generating its response. Using send_realtime_input
-            # (same as vision loop) is safe during tool_call pending state.
+            # Send tool snapshot image as structured content (send_client_content)
+            # rather than send_realtime_input. This makes the model treat it as a
+            # discrete image to analyze carefully, not just another video frame in
+            # the continuous stream. Sent with turn_complete=False so it doesn't
+            # trigger generation — the tool_response below will trigger generation.
             if self._session and self._connected and self._pending_tool_image:
                 if len(self._pending_tool_image) == 2:
                     image_b64, mime_type = self._pending_tool_image
@@ -535,18 +537,22 @@ class GeminiLiveClient(BaseRealtimeClient):
                 self._pending_tool_image = None
                 try:
                     image_bytes = base64.b64decode(image_b64)
-                    await self._session.send_realtime_input(
-                        media=types.Blob(data=image_bytes, mime_type=mime_type)
+                    # Build a user content turn with the image + analysis instructions
+                    parts: list[types.Part] = []
+                    if image_context:
+                        parts.append(types.Part(text=image_context))
+                    parts.append(
+                        types.Part(inline_data=types.Blob(data=image_bytes, mime_type=mime_type))
                     )
-                    _LOGGER.debug("Tool snapshot sent via realtime_input (before tool_response)")
-                    # CRITICAL: Wait for the server to ingest the image before
-                    # sending tool_response. Without this delay, the model starts
-                    # generating speech BEFORE it has processed the image, leading
-                    # to hallucinated "I see nothing" responses that get corrected later.
-                    # 2.0s gives the server enough time to fully process the frame.
-                    await asyncio.sleep(2.0)
+                    await self._session.send_client_content(
+                        turns=[types.Content(role="user", parts=parts)],
+                        turn_complete=False,
+                    )
+                    _LOGGER.debug("Tool snapshot sent via send_client_content (structured image)")
+                    # Brief delay to let the server index the content turn
+                    await asyncio.sleep(0.5)
                 except Exception:
-                    _LOGGER.warning("Failed to send tool snapshot via realtime_input")
+                    _LOGGER.warning("Failed to send tool snapshot via send_client_content")
 
             if self._session and self._connected:
                 try:
