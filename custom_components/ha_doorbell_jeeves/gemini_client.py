@@ -514,46 +514,93 @@ class GeminiLiveClient(BaseRealtimeClient):
             self._monitor_turn_active = False
         try:
             function_responses: list[types.FunctionResponse] = []
+            # Track image data for potential fallback delivery
+            pending_image_bytes: bytes | None = None
+            pending_image_mime: str = "image/jpeg"
+            pending_image_ctx: str = ""
+
             for fc in tool_call.function_calls:
                 try:
                     result = await self._on_tool_call(fc.name, fc.args or {})
                 except Exception:
                     result = {"error": f"Tool '{fc.name}' execution failed"}
 
-                # Build FunctionResponse — if there's a pending image, include it
-                # directly in the response's `parts` field so the model receives
-                # text result + image as a single atomic tool response.
+                # Extract pending image if the tool produced one
                 response_parts = None
                 if self._pending_tool_image:
                     if len(self._pending_tool_image) == 2:
-                        image_b64, mime_type = self._pending_tool_image
+                        image_b64, pending_image_mime = self._pending_tool_image
+                        pending_image_ctx = ""
                     else:
-                        image_b64, mime_type, _ctx = self._pending_tool_image
+                        image_b64, pending_image_mime, pending_image_ctx = self._pending_tool_image
                     self._pending_tool_image = None
                     try:
-                        image_bytes = base64.b64decode(image_b64)
+                        pending_image_bytes = base64.b64decode(image_b64)
                         response_parts = [
-                            types.FunctionResponsePart.from_bytes(
-                                data=image_bytes, mime_type=mime_type
+                            types.FunctionResponsePart(
+                                inline_data=types.FunctionResponseBlob(
+                                    data=pending_image_bytes, mime_type=pending_image_mime
+                                )
                             )
                         ]
-                    except Exception:
-                        _LOGGER.warning("Failed to decode tool image for FunctionResponse parts")
+                        _LOGGER.warning(
+                            "Tool image attached to FunctionResponse (%d bytes, %s)",
+                            len(pending_image_bytes), pending_image_mime,
+                        )
+                    except Exception as img_err:
+                        _LOGGER.warning("Failed to build FunctionResponse parts: %s", img_err)
+                        response_parts = None
 
-                # Build FunctionResponse — only include parts if we have image data
+                # Build FunctionResponse — only include parts if successfully created
                 fr_kwargs: dict[str, Any] = {"id": fc.id, "name": fc.name, "response": result}
                 if response_parts:
                     fr_kwargs["parts"] = response_parts
                 function_responses.append(types.FunctionResponse(**fr_kwargs))
 
+            # Send tool response
             if self._session and self._connected:
+                sent_with_image = False
                 try:
                     await self._session.send_tool_response(
                         function_responses=function_responses
                     )
-                    _LOGGER.debug("Tool response sent (with image=%s)", response_parts is not None)
-                except Exception:
-                    _LOGGER.exception("Failed to send tool response")
+                    sent_with_image = response_parts is not None
+                except Exception as send_err:
+                    # If sending with image parts failed, retry without
+                    if response_parts:
+                        _LOGGER.warning("Tool response with image failed (%s), retrying without", send_err)
+                        try:
+                            plain_responses = [
+                                types.FunctionResponse(id=fr.id, name=fr.name, response=fr.response)
+                                for fr in function_responses
+                            ]
+                            await self._session.send_tool_response(function_responses=plain_responses)
+                        except Exception:
+                            _LOGGER.exception("Tool response retry also failed")
+                    else:
+                        _LOGGER.exception("Failed to send tool response")
+
+                # FALLBACK: If image wasn't delivered with the tool response,
+                # send it immediately after via send_client_content so the model
+                # still sees the image when generating its response.
+                if pending_image_bytes and not sent_with_image:
+                    try:
+                        ctx_text = pending_image_ctx or (
+                            "[TOOL IMAGE] The image below was captured by the tool. "
+                            "Analyze it carefully for your response."
+                        )
+                        await self._session.send_client_content(
+                            turns=[types.Content(role="user", parts=[
+                                types.Part(text=ctx_text),
+                                types.Part(inline_data=types.Blob(
+                                    data=pending_image_bytes, mime_type=pending_image_mime
+                                )),
+                            ])],
+                            turn_complete=True,
+                        )
+                        _LOGGER.warning("Tool image sent via fallback send_client_content (%d bytes)", len(pending_image_bytes))
+                    except Exception:
+                        _LOGGER.warning("Fallback image delivery also failed")
         finally:
             # NOTE: We intentionally do NOT clear _tool_call_pending here.
             # It stays True until the model starts generating its response
