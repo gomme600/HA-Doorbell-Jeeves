@@ -505,7 +505,6 @@ class GeminiLiveClient(BaseRealtimeClient):
                     self._model_generating = False
                     self._tool_call_pending = False
                     self._vision_paused = False
-                    self._stop_generation_keepalive()
                     err_str = str(recv_err)
                     t_err = time.time() - self._connect_time if hasattr(self, '_connect_time') else -1
                     _LOGGER.warning("Gemini receive() raised at T+%.1f: %s (turns=%d)", t_err, err_str[:200], turns_completed)
@@ -535,7 +534,6 @@ class GeminiLiveClient(BaseRealtimeClient):
 
                 # Full response stream consumed — safe to ungate vision/audio
                 self._model_generating = False
-                self._stop_generation_keepalive()
                 self._tool_call_pending = False  # Safety: ensure not stuck
                 self._vision_paused = False  # Safety: ensure vision resumes
 
