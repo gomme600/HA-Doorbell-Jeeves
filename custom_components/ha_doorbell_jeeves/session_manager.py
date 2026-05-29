@@ -159,6 +159,12 @@ class JeevesSessionManager:
         self._ai_last_output_time: float = 0.0
         self._echo_gate_hold_sec: float = 1.2  # hold mic mute briefly after AI output without eating replies
 
+        # Turn-end cooldown: extra buffer after model finishes to allow server
+        # to transition from "speaking" to "listening" state.
+        # Without this, sending audio immediately after turn_complete causes 1008.
+        self._turn_end_time: float = 0.0
+        self._turn_end_cooldown_sec: float = 2.5  # seconds after model turn before mic allowed
+
         # PTZ camera tracking: cameras moved during this session (auto-return on end)
         self._ptz_moved_cameras: set[str] = set()
 
@@ -1961,6 +1967,16 @@ class JeevesSessionManager:
                     gate_was_closed = True
                     if echo_suppressed == 1:
                         _LOGGER.debug("Echo gate: suppressing mic (model generating)")
+                    # Track when model was last generating (for turn-end cooldown)
+                    self._turn_end_time = now
+                    continue
+
+                # Turn-end cooldown: after model stops generating, wait before sending audio.
+                # The Gemini server needs time to transition from "speaking" to "listening".
+                # Without this buffer, the first mic chunk after a turn causes 1008.
+                if self._turn_end_time > 0 and (now - self._turn_end_time) < self._turn_end_cooldown_sec:
+                    echo_suppressed += 1
+                    gate_was_closed = True
                     continue
 
                 # Gate just opened — log it
