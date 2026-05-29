@@ -117,17 +117,18 @@ class GeminiLiveClient(BaseRealtimeClient):
         self._connected = True
         self._connect_time = time.time()
 
-        # Wait for the server to fully initialize the session.
-        # 2s delay matches the working v1.5.0 configuration.
-        await asyncio.sleep(2.0)
+        # Brief stabilization pause — reconnect (which never gets 1008) uses 0.5s.
+        # The long 2.0s delay may actually INCREASE 1008 rates by creating an inactivity
+        # window that the server interprets as problematic.
+        await asyncio.sleep(0.5)
 
         await self._inject_reference_images()
 
         # Start receive loop AFTER reference images are sent.
         self._receive_task = asyncio.create_task(self._receive_loop())
 
-        # Set startup grace period: block audio/video for 5s to let the model initialize
-        self._startup_grace_until = time.time() + 5.0
+        # Set startup grace period: block audio/video for 3s to let the model initialize
+        self._startup_grace_until = time.time() + 3.0
         _LOGGER.warning("Gemini Live connected at T+%.1f (model=%s)", time.time() - self._connect_time, self._model)
 
     async def _reconnect_session(self, turns_completed: int = -1) -> bool:
