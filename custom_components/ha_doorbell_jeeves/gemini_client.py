@@ -116,24 +116,21 @@ class GeminiLiveClient(BaseRealtimeClient):
         self._session = await self._session_cm.__aenter__()
         self._connected = True
         self._connect_time = time.time()
-        _LOGGER.warning("WS connected at T+0.0")
 
         # Wait for the server to fully initialize the session.
-        # Gemini Live has an internal setup phase after WebSocket connect.
-        await asyncio.sleep(3.0)
-        _LOGGER.warning("Post-sleep at T+%.1f, injecting reference images...", time.time() - self._connect_time)
+        # 2s delay matches the working v1.5.0 configuration.
+        await asyncio.sleep(2.0)
 
         await self._inject_reference_images()
-        _LOGGER.warning("Reference images done at T+%.1f, starting receive loop...", time.time() - self._connect_time)
 
         # Start receive loop AFTER reference images are sent.
         self._receive_task = asyncio.create_task(self._receive_loop())
 
         # Set startup grace period: block audio/video for 5s to let the model initialize
         self._startup_grace_until = time.time() + 5.0
-        _LOGGER.warning("Gemini Live connected at T+%.1f (model=%s, voice=%s)", time.time() - self._connect_time, self._model, self._voice)
+        _LOGGER.warning("Gemini Live connected at T+%.1f (model=%s)", time.time() - self._connect_time, self._model)
 
-    async def _reconnect_session(self) -> bool:
+    async def _reconnect_session(self, turns_completed: int = -1) -> bool:
         """Tear down current session and open a new one (same config). Returns True on success."""
         try:
             if self._session_cm:
@@ -150,52 +147,63 @@ class GeminiLiveClient(BaseRealtimeClient):
                 model=self._model, config=self._live_config,
             )
             self._session = await self._session_cm.__aenter__()
+            self._connect_time = time.time()
             await self._inject_reference_images()
 
-            # Build proper conversation history with alternating user/model roles
-            # This restores the model's memory of what IT said, preventing greeting repeat
-            history_turns: list[types.Content] = []
-            if self._conversation_turns:
-                recent = self._conversation_turns[-15:]
-                # Group consecutive same-role entries and build proper Content turns
-                current_role = None
-                current_texts: list[str] = []
-                for turn in recent:
-                    role = "model" if turn["role"] == "assistant" else "user"
-                    if role != current_role:
-                        if current_role and current_texts:
-                            history_turns.append(types.Content(
-                                role=current_role,
-                                parts=[types.Part(text=" ".join(current_texts))]
-                            ))
-                        current_role = role
-                        current_texts = [turn["text"]]
-                    else:
-                        current_texts.append(turn["text"])
-                # Flush last group
-                if current_role and current_texts:
-                    history_turns.append(types.Content(
-                        role=current_role,
-                        parts=[types.Part(text=" ".join(current_texts))]
-                    ))
+            if turns_completed == 0:
+                # First turn (greeting) was interrupted by 1008.
+                # Trigger a fresh greeting instead of "wait silently".
+                # This makes the 1008 recovery seamless for the user.
+                await self._session.send_client_content(
+                    turns=[types.Content(role="user", parts=[types.Part(text=(
+                        "[SYSTEM] A visitor is at the door. "
+                        "Greet them briefly and warmly. Ask how you can help. "
+                        "Do NOT call any tools. Speak now."
+                    ))])],
+                    turn_complete=True,
+                )
+                self._model_generating = True
+                self._startup_grace_until = time.time() + 5.0
+                _LOGGER.warning("Gemini reconnected at turns=0 — re-triggering greeting")
+            else:
+                # Build proper conversation history with alternating user/model roles
+                history_turns: list[types.Content] = []
+                if self._conversation_turns:
+                    recent = self._conversation_turns[-15:]
+                    current_role = None
+                    current_texts: list[str] = []
+                    for turn in recent:
+                        role = "model" if turn["role"] == "assistant" else "user"
+                        if role != current_role:
+                            if current_role and current_texts:
+                                history_turns.append(types.Content(
+                                    role=current_role,
+                                    parts=[types.Part(text=" ".join(current_texts))]
+                                ))
+                            current_role = role
+                            current_texts = [turn["text"]]
+                        else:
+                            current_texts.append(turn["text"])
+                    if current_role and current_texts:
+                        history_turns.append(types.Content(
+                            role=current_role,
+                            parts=[types.Part(text=" ".join(current_texts))]
+                        ))
 
-            # Always end with a user turn to set context
-            history_turns.append(types.Content(role="user", parts=[types.Part(text=(
-                "[SYSTEM] Connection briefly interrupted. You already greeted this visitor. "
-                "Do NOT repeat your greeting or re-introduce yourself. "
-                "Wait silently for the visitor to speak next."
-            ))]))
+                history_turns.append(types.Content(role="user", parts=[types.Part(text=(
+                    "[SYSTEM] Connection briefly interrupted. You already greeted this visitor. "
+                    "Do NOT repeat your greeting or re-introduce yourself. "
+                    "Wait silently for the visitor to speak next."
+                ))]))
 
-            # turn_complete=False: the user "hasn't finished" — model should not respond
-            await self._session.send_client_content(
-                turns=history_turns,
-                turn_complete=False,
-            )
-            self._model_generating = False
-            # Set grace period to prevent vision/audio from racing with history restoration
-            self._startup_grace_until = time.time() + 2.0
-            _LOGGER.warning("Gemini reconnected — history restored (%d turns, %d conversation entries)",
-                          len(history_turns), len(self._conversation_turns))
+                await self._session.send_client_content(
+                    turns=history_turns,
+                    turn_complete=False,
+                )
+                self._model_generating = False
+                self._startup_grace_until = time.time() + 2.0
+                _LOGGER.warning("Gemini reconnected — history restored (%d turns, %d conversation entries)",
+                              len(history_turns), len(self._conversation_turns))
             return True
         except Exception:
             _LOGGER.exception("Gemini reconnect failed")
@@ -402,8 +410,6 @@ class GeminiLiveClient(BaseRealtimeClient):
             # processing, triggering a 1008 policy violation.
             if turn_complete:
                 self._model_generating = True
-                # Start generation keepalive to prevent server inactivity timeout
-                self._start_generation_keepalive()
                 if hasattr(self, '_connect_time'):
                     _LOGGER.warning("inject_context(turn_complete=True) at T+%.1f", time.time() - self._connect_time)
 
@@ -488,10 +494,8 @@ class GeminiLiveClient(BaseRealtimeClient):
                 turns=[types.Content(role="user", parts=parts)],
                 turn_complete=False,  # Context only — don't trigger a response
             )
-            # Generous delay after injecting reference images to let server process.
-            # The greeting (with turn_complete=True) will follow after audio setup,
-            # which adds another 2-5s of natural delay.
-            await asyncio.sleep(1.0)
+            # Small delay after injecting reference images to let server process
+            await asyncio.sleep(0.3)
         except Exception:
             _LOGGER.exception("Failed to inject reference images")
 
@@ -531,7 +535,7 @@ class GeminiLiveClient(BaseRealtimeClient):
                                 reconnect_attempts, max_reconnects, delay,
                             )
                             await asyncio.sleep(delay)
-                            if await self._reconnect_session():
+                            if await self._reconnect_session(turns_completed=turns_completed):
                                 consecutive_empty_iters = 0
                                 continue
                         _LOGGER.warning("Gemini server closed connection permanently")
@@ -566,7 +570,7 @@ class GeminiLiveClient(BaseRealtimeClient):
                             "Empty-stream Gemini disconnect (attempt %d/%d) — reconnecting...",
                             reconnect_attempts, max_reconnects,
                         )
-                        if await self._reconnect_session():
+                        if await self._reconnect_session(turns_completed=turns_completed):
                             consecutive_empty_iters = 0
                             continue
                     _LOGGER.warning("Gemini receive stream ended repeatedly with no events (turns=%d)", turns_completed)
