@@ -54,6 +54,9 @@ class GeminiLiveClient(BaseRealtimeClient):
         self._recap_future: asyncio.Future[str] | None = None
         self._pending_tool_image: tuple[str, str, str] | None = None
         self._tool_call_pending = False
+        # Model turn gate: blocks realtime input while model is actively generating
+        # to prevent 1008 policy violations during thinking/generation
+        self._model_generating = False
 
     @property
     def connected(self) -> bool:
@@ -162,6 +165,7 @@ class GeminiLiveClient(BaseRealtimeClient):
     async def disconnect(self) -> None:
         self._connected = False
         self._tool_call_pending = False
+        self._model_generating = False
         if self._receive_task and not self._receive_task.done():
             self._receive_task.cancel()
             try:
@@ -182,8 +186,8 @@ class GeminiLiveClient(BaseRealtimeClient):
     async def send_audio(self, pcm_bytes: bytes) -> None:
         if not self._session or not self._connected:
             return
-        # GATE: Prevent sending audio during tool processing to avoid 1008 policy violation
-        if self._tool_call_pending:
+        # GATE: Prevent sending audio during tool processing or model generation
+        if self._tool_call_pending or self._model_generating:
             return
         try:
             await self._session.send_realtime_input(
@@ -193,14 +197,15 @@ class GeminiLiveClient(BaseRealtimeClient):
                 )
             )
         except Exception:
-            _LOGGER.exception("Failed to send audio")
+            if self._connected:
+                _LOGGER.debug("Failed to send audio (model may be generating)")
 
     async def send_image(self, image_base64: str, mime_type: str = "image/jpeg") -> None:
         """Send an image frame to the live session via realtime video input."""
         if not self._session or not self._connected:
             return
-        # GATE: Prevent sending images during tool processing to avoid 1008 policy violation
-        if self._tool_call_pending:
+        # GATE: Prevent sending images during tool processing or model generation
+        if self._tool_call_pending or self._model_generating:
             return
         try:
             image_bytes = base64.b64decode(image_base64)
@@ -208,7 +213,8 @@ class GeminiLiveClient(BaseRealtimeClient):
                 video=types.Blob(data=image_bytes, mime_type=mime_type)
             )
         except Exception:
-            _LOGGER.exception("Failed to send image")
+            if self._connected:
+                _LOGGER.debug("Failed to send image (model may be generating)")
 
     async def inject_context(self, text: str, image_base64: str | None = None, mime_type: str = "image/jpeg") -> None:
         """Inject a text message (and optional image) into the live session."""
@@ -220,11 +226,14 @@ class GeminiLiveClient(BaseRealtimeClient):
                 image_bytes = base64.b64decode(image_base64)
                 parts.append(types.Part(inline_data=types.Blob(data=image_bytes, mime_type=mime_type)))
 
+            # Pre-set model_generating since the model will respond after this
+            self._model_generating = True
             await self._session.send_client_content(
                 turns=[types.Content(role="user", parts=parts)],
                 turn_complete=True,
             )
         except Exception:
+            self._model_generating = False
             _LOGGER.exception("Failed to inject context")
 
     async def request_recap(self, outcome: str, timeout: float = 8.0) -> dict[str, str] | None:
@@ -372,46 +381,62 @@ class GeminiLiveClient(BaseRealtimeClient):
                 self._connected = False
                 self._on_session_end()
 
+    @staticmethod
+    def _is_thinking_text(text: str) -> bool:
+        """Detect model internal thinking output (not actual speech)."""
+        stripped = text.strip()
+        # Gemini thinking outputs are typically wrapped in ** markers
+        return stripped.startswith("**") and stripped.endswith("**")
+
     async def _process(self, response: Any) -> None:
         server_content = getattr(response, "server_content", None)
         tool_call = getattr(response, "tool_call", None)
 
         if server_content and server_content.model_turn:
+            # Model is actively generating — gate realtime input
+            self._model_generating = True
             for part in server_content.model_turn.parts:
                 if part.inline_data and part.inline_data.mime_type and "audio" in part.inline_data.mime_type:
                     self._on_audio_output(part.inline_data.data)
                 elif part.text:
-                    self._conversation_turns.append({"role": "assistant", "text": part.text})
-                    self._on_transcript("assistant", part.text)
-                    # Resolve recap future if waiting
+                    # Filter out thinking/planning text (not actual speech)
+                    if not self._is_thinking_text(part.text):
+                        self._conversation_turns.append({"role": "assistant", "text": part.text})
+                        self._on_transcript("assistant", part.text)
+                    else:
+                        _LOGGER.debug("Filtered thinking text: %s", part.text[:80])
+                    # Resolve recap future if waiting (thinking or not)
                     if hasattr(self, "_recap_future") and self._recap_future and not self._recap_future.done():
                         self._recap_future.set_result(part.text)
 
         if server_content and hasattr(server_content, "input_transcription"):
             t = getattr(server_content, "input_transcription", None)
             if t and hasattr(t, "text") and t.text:
-                _LOGGER.warning("Input transcription from Gemini: %s", t.text[:200])
+                _LOGGER.info("Input transcription: %s", t.text[:200])
                 self._conversation_turns.append({"role": "user", "text": t.text})
                 self._on_transcript("user", t.text)
 
         if server_content and hasattr(server_content, "output_transcription"):
             t = getattr(server_content, "output_transcription", None)
             if t and hasattr(t, "text") and t.text:
-                self._conversation_turns.append({"role": "assistant", "text": t.text})
-                self._on_transcript("assistant", t.text)
-                # Also resolve recap future from transcription (native audio model
-                # may produce text only via transcription, not model_turn.parts)
+                # Filter out thinking/planning text from output transcription
+                if not self._is_thinking_text(t.text):
+                    self._conversation_turns.append({"role": "assistant", "text": t.text})
+                    self._on_transcript("assistant", t.text)
+                # Resolve recap future from transcription (thinking or not)
                 if hasattr(self, "_recap_future") and self._recap_future and not self._recap_future.done():
                     self._recap_future.set_result(t.text)
 
-        # Log interrupted/turn_complete signals
+        # Track model generation state via turn signals
         if server_content:
             interrupted = getattr(server_content, "interrupted", None)
             turn_complete = getattr(server_content, "turn_complete", None)
             if interrupted:
-                _LOGGER.warning("Gemini: model output was INTERRUPTED (user started speaking)")
+                _LOGGER.debug("Gemini: model output was INTERRUPTED (user started speaking)")
+                self._model_generating = False
             if turn_complete:
                 _LOGGER.debug("Gemini: turn_complete signal received")
+                self._model_generating = False
 
         if tool_call:
             await self._handle_tool_call(tool_call)
