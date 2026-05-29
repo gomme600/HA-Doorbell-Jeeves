@@ -6,7 +6,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable
+from typing import Awaitable, Callable
 
 from homeassistant.core import Event, HomeAssistant, callback
 
@@ -38,6 +38,7 @@ class NotificationSession:
     sent_at: float
     responses: list[OwnerResponse] = field(default_factory=list)
     _on_coming: Callable[[], Awaitable[None]] | None = None
+    _on_not_available: Callable[[], Awaitable[None]] | None = None
 
     @property
     def someone_coming(self) -> bool:
@@ -98,14 +99,19 @@ class NotificationManager:
         session_id: str,
         snapshot_b64: str = "",
         on_coming: Callable[[], Awaitable[None]] | None = None,
+        on_not_available: Callable[[], Awaitable[None]] | None = None,
     ) -> NotificationSession:
-        """Send actionable notification to all configured targets.
+        """Set up tracking session for doorbell notification responses.
+
+        Creates a NotificationSession to track 'Coming'/'Not Available' button presses.
+        The actual notification is sent separately by the tool execution layer.
 
         Args:
             targets: List of {"service": "notify.xxx", "name": "Owner Name"}
             session_id: Current session ID for tracking
-            snapshot_b64: Optional camera snapshot to include
+            snapshot_b64: Unused (kept for API compat)
             on_coming: Callback when someone presses "Coming"
+            on_not_available: Callback when all owners press "Not Available"
         """
         self._active_session = NotificationSession(
             session_id=session_id,
@@ -115,42 +121,12 @@ class NotificationManager:
                 for t in targets
             ],
             _on_coming=on_coming,
+            _on_not_available=on_not_available,
         )
-
-        for target in targets:
-            service_parts = target["service"].split(".", 1)
-            if len(service_parts) != 2:
-                continue
-            domain, service_name = service_parts
-
-            data: dict[str, Any] = {
-                "message": "Someone is at the door! Jeeves is handling it.",
-                "title": "🔔 Doorbell",
-                "data": {
-                    "actions": [
-                        {"action": ACTION_COMING, "title": "🚶 Coming"},
-                        {"action": ACTION_NOT_AVAILABLE, "title": "❌ Not Available"},
-                    ],
-                    "push": {"interruption-level": "time-sensitive"},
-                    "tag": f"jeeves_doorbell_{session_id}",
-                },
-            }
-
-            if snapshot_b64:
-                data["data"]["image"] = f"/api/camera_proxy/{DOMAIN}"
-
-            try:
-                await self._hass.services.async_call(
-                    domain, service_name, data, blocking=False
-                )
-                _LOGGER.info(
-                    "Sent doorbell notification to %s (%s)",
-                    target["name"],
-                    target["service"],
-                )
-            except Exception:
-                _LOGGER.exception("Failed to send notification to %s", target["service"])
-
+        _LOGGER.info(
+            "Notification tracking session created for %d target(s)",
+            len(targets),
+        )
         return self._active_session
 
     async def _process_response(self, action: str) -> None:
@@ -174,6 +150,13 @@ class NotificationManager:
                 await self._active_session._on_coming()
             except Exception:
                 _LOGGER.exception("Failed to notify agent of 'coming' response")
+
+        if response_type == "not_available" and self._active_session.all_unavailable:
+            if self._active_session._on_not_available:
+                try:
+                    await self._active_session._on_not_available()
+                except Exception:
+                    _LOGGER.exception("Failed to notify agent of 'not available' response")
 
     def get_availability_status(self) -> str:
         """Get current availability status for the agent tool."""

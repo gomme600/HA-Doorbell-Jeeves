@@ -558,17 +558,25 @@ def build_gemini_tools(
         tool_name = f"notify_{_slugify(target.name)}"
         declarations.append(types.FunctionDeclaration(
             name=tool_name,
-            description=target.description or f"Send a notification via {target.name}",
+            description=(
+                (target.description or f"Send a doorbell notification to {target.name}") +
+                " The notification includes a live camera snapshot and action buttons "
+                "(Coming / Not Available). Keep the message SHORT and factual — "
+                "state ONLY what you can CLEARLY see (e.g., 'Someone at the door', "
+                "'A delivery driver with a package'). Do NOT guess identity unless you "
+                "are certain from reference photos. The camera image is attached automatically."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
-                    "message": {"type": "string", "description": "The notification message"},
-                    "title": {"type": "string", "description": "Notification title (optional)"},
-                    "urgency": {
+                    "message": {
                         "type": "string",
-                        "description": "Urgency level",
-                        "enum": ["low", "normal", "high", "critical"],
+                        "description": (
+                            "Short factual description of the visitor. ONLY describe what you can "
+                            "clearly see in the live camera feed. If unsure, say 'Someone at the door'."
+                        ),
                     },
+                    "title": {"type": "string", "description": "Notification title (optional)"},
                 },
                 "required": ["message"],
             },
@@ -1163,17 +1171,22 @@ def build_openai_tools(
         tools.append({
             "type": "function",
             "name": tool_name,
-            "description": target.description or f"Send notification via {target.name}",
+            "description": (
+                (target.description or f"Send a doorbell notification to {target.name}") +
+                " Includes camera snapshot and Coming/Not Available buttons. "
+                "Keep message SHORT and factual — only describe what you clearly see."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "message": {"type": "string", "description": "The notification message"},
-                    "title": {"type": "string", "description": "Notification title (optional)"},
-                    "urgency": {
+                    "message": {
                         "type": "string",
-                        "description": "Urgency level",
-                        "enum": ["low", "normal", "high", "critical"],
+                        "description": (
+                            "Short factual description of what you see. "
+                            "If unsure, say 'Someone at the door'."
+                        ),
                     },
+                    "title": {"type": "string", "description": "Notification title (optional)"},
                 },
                 "required": ["message"],
             },
@@ -1255,7 +1268,7 @@ async def execute_tool_call(
 
         # Notification
         if function_name.startswith("notify_"):
-            return await _execute_notification(hass, store, function_name, arguments)
+            return await _execute_notification(hass, store, function_name, arguments, config)
 
         # Custom action
         return await _execute_action(hass, store, function_name, arguments)
@@ -2098,9 +2111,12 @@ async def _execute_read_state(
 
 
 async def _execute_notification(
-    hass: HomeAssistant, store: DataStore, function_name: str, arguments: dict[str, Any]
+    hass: HomeAssistant, store: DataStore, function_name: str, arguments: dict[str, Any],
+    config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Send a notification to a configured target."""
+    """Send a rich actionable notification with Coming/Not Available buttons."""
+    from .const import CONF_CAMERA_ENTITY, DOMAIN  # noqa: PLC0415
+
     target = None
     for t in store.notification_targets:
         if f"notify_{_slugify(t.name)}" == function_name:
@@ -2110,21 +2126,118 @@ async def _execute_notification(
     if not target:
         return {"error": f"Unknown notification target: {function_name}"}
 
-    message = arguments.get("message", "")
+    message = arguments.get("message", "Someone is at the door")
     title = arguments.get("title", "🔔 Doorbell Jeeves")
-    urgency = arguments.get("urgency", "normal")
 
+    # Get the NotificationManager from the session manager
+    entry_id = (config or {}).get("_entry_id", "")
+    manager = None
+    if entry_id and DOMAIN in hass.data:
+        manager = hass.data[DOMAIN].get(entry_id)
+    if not manager and DOMAIN in hass.data:
+        for m in hass.data[DOMAIN].values():
+            if hasattr(m, "_notification_manager"):
+                manager = m
+                break
+
+    # Get camera snapshot for the notification image
+    camera_entity = (config or {}).get(CONF_CAMERA_ENTITY, "")
+    snapshot_url = ""
+    if camera_entity:
+        snapshot_url = f"/api/camera_proxy/{camera_entity}"
+
+    if manager and hasattr(manager, "_notification_manager"):
+        notification_mgr = manager._notification_manager
+
+        # Build on_coming callback to inform the AI
+        async def _on_coming() -> None:
+            if hasattr(manager, "_client") and manager._client and manager._client.connected:
+                await manager._client.inject_context(
+                    "[SYSTEM] The homeowner pressed 'Coming' — they are on their way to the door. "
+                    "Inform the visitor that someone is coming to meet them shortly.",
+                    turn_complete=True,
+                )
+
+        # Build on_not_available callback to inform the AI
+        async def _on_not_available() -> None:
+            if hasattr(manager, "_client") and manager._client and manager._client.connected:
+                await manager._client.inject_context(
+                    "[SYSTEM] The homeowner pressed 'Not Available' — nobody is coming to the door. "
+                    "Handle the visitor yourself: take a message, offer to save event details, "
+                    "or politely inform them nobody is available right now.",
+                    turn_complete=True,
+                )
+
+        # Generate a session_id for tracking
+        session_id = entry_id or "default"
+
+        targets_list = [{"service": target.service, "name": target.name}]
+        await notification_mgr.send_doorbell_notification(
+            targets=targets_list,
+            session_id=session_id,
+            snapshot_b64="",
+            on_coming=_on_coming,
+            on_not_available=_on_not_available,
+        )
+
+        # Override the notification message with the AI's description
+        # Re-send with correct message and image URL
+        if "." in target.service:
+            domain, svc = target.service.split(".", 1)
+        else:
+            domain, svc = "notify", target.service
+
+        from .notifications import ACTION_COMING, ACTION_NOT_AVAILABLE  # noqa: PLC0415
+
+        data: dict[str, Any] = {
+            "message": message,
+            "title": title,
+            "data": {
+                "actions": [
+                    {"action": ACTION_COMING, "title": "🚶 I'm coming"},
+                    {"action": ACTION_NOT_AVAILABLE, "title": "❌ Not available"},
+                ],
+                "push": {"interruption-level": "time-sensitive"},
+                "tag": f"jeeves_doorbell_{session_id}",
+            },
+        }
+        if snapshot_url:
+            data["data"]["image"] = snapshot_url
+
+        await hass.services.async_call(domain, svc, data, blocking=True)
+
+        return {
+            "success": True,
+            "message": (
+                f"Rich notification sent to {target.name} with 'Coming' and 'Not Available' buttons. "
+                f"Use check_owner_availability later to see if they responded."
+            ),
+        }
+
+    # Fallback: no notification manager — send plain notification with buttons
     if "." in target.service:
         domain, svc = target.service.split(".", 1)
     else:
         domain, svc = "notify", target.service
 
-    await hass.services.async_call(
-        domain, svc,
-        {"message": f"[{urgency.upper()}] {message}", "title": title},
-        blocking=True,
-    )
-    return {"success": True, "message": f"Notification sent via {target.name}"}
+    from .notifications import ACTION_COMING, ACTION_NOT_AVAILABLE  # noqa: PLC0415
+
+    data = {
+        "message": message,
+        "title": title,
+        "data": {
+            "actions": [
+                {"action": ACTION_COMING, "title": "🚶 I'm coming"},
+                {"action": ACTION_NOT_AVAILABLE, "title": "❌ Not available"},
+            ],
+            "push": {"interruption-level": "time-sensitive"},
+        },
+    }
+    if snapshot_url:
+        data["data"]["image"] = snapshot_url
+
+    await hass.services.async_call(domain, svc, data, blocking=True)
+    return {"success": True, "message": f"Notification sent to {target.name} with action buttons."}
 
 
 async def _execute_action(
