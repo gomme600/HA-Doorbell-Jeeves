@@ -519,46 +519,39 @@ class GeminiLiveClient(BaseRealtimeClient):
                     result = await self._on_tool_call(fc.name, fc.args or {})
                 except Exception:
                     result = {"error": f"Tool '{fc.name}' execution failed"}
-                function_responses.append(
-                    types.FunctionResponse(id=fc.id, name=fc.name, response=result)
-                )
 
-            # Send tool snapshot image as structured content (send_client_content)
-            # rather than send_realtime_input. This makes the model treat it as a
-            # discrete image to analyze carefully, not just another video frame in
-            # the continuous stream. Sent with turn_complete=False so it doesn't
-            # trigger generation — the tool_response below will trigger generation.
-            if self._session and self._connected and self._pending_tool_image:
-                if len(self._pending_tool_image) == 2:
-                    image_b64, mime_type = self._pending_tool_image
-                    image_context = ""
-                else:
-                    image_b64, mime_type, image_context = self._pending_tool_image
-                self._pending_tool_image = None
-                try:
-                    image_bytes = base64.b64decode(image_b64)
-                    # Build a user content turn with the image + analysis instructions
-                    parts: list[types.Part] = []
-                    if image_context:
-                        parts.append(types.Part(text=image_context))
-                    parts.append(
-                        types.Part(inline_data=types.Blob(data=image_bytes, mime_type=mime_type))
+                # Build FunctionResponse — if there's a pending image, include it
+                # directly in the response's `parts` field so the model receives
+                # text result + image as a single atomic tool response.
+                response_parts = None
+                if self._pending_tool_image:
+                    if len(self._pending_tool_image) == 2:
+                        image_b64, mime_type = self._pending_tool_image
+                    else:
+                        image_b64, mime_type, _ctx = self._pending_tool_image
+                    self._pending_tool_image = None
+                    try:
+                        image_bytes = base64.b64decode(image_b64)
+                        response_parts = [
+                            types.FunctionResponsePart.from_bytes(
+                                data=image_bytes, mime_type=mime_type
+                            )
+                        ]
+                    except Exception:
+                        _LOGGER.warning("Failed to decode tool image for FunctionResponse parts")
+
+                function_responses.append(
+                    types.FunctionResponse(
+                        id=fc.id, name=fc.name, response=result, parts=response_parts
                     )
-                    await self._session.send_client_content(
-                        turns=[types.Content(role="user", parts=parts)],
-                        turn_complete=False,
-                    )
-                    _LOGGER.debug("Tool snapshot sent via send_client_content (structured image)")
-                    # Brief delay to let the server index the content turn
-                    await asyncio.sleep(0.5)
-                except Exception:
-                    _LOGGER.warning("Failed to send tool snapshot via send_client_content")
+                )
 
             if self._session and self._connected:
                 try:
                     await self._session.send_tool_response(
                         function_responses=function_responses
                     )
+                    _LOGGER.debug("Tool response sent (with image=%s)", response_parts is not None)
                 except Exception:
                     _LOGGER.exception("Failed to send tool response")
         finally:
