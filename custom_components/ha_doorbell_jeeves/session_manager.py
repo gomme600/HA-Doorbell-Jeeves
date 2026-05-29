@@ -1034,9 +1034,14 @@ class JeevesSessionManager:
                     if image and image.content:
                         image_bytes = image.content
                 except Exception as cam_err:
-                    # Fallback: try go2rtc JPEG snapshot if stream is configured
+                    # Fallback 1: try go2rtc JPEG snapshot if stream is configured
                     if go2rtc_stream:
                         image_bytes = await self._go2rtc_snapshot(go2rtc_stream)
+                    # Fallback 2: try RTSP snapshot via ffmpeg (same URL as audio input)
+                    if not image_bytes and self._audio_handler:
+                        rtsp_url = getattr(self._audio_handler, "_reolink_rtsp_url", "")
+                        if rtsp_url:
+                            image_bytes = await self._rtsp_snapshot(rtsp_url)
                     if not image_bytes:
                         consecutive_failures += 1
                         if consecutive_failures % 5 == 1:
@@ -1099,6 +1104,24 @@ class JeevesSessionManager:
         finally:
             if own_session:
                 await own_session.close()
+        return None
+
+    async def _rtsp_snapshot(self, rtsp_url: str) -> bytes | None:
+        """Capture a single JPEG frame from an RTSP stream via ffmpeg."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-y", "-rtsp_transport", "tcp",
+                "-i", rtsp_url,
+                "-frames:v", "1", "-f", "image2", "-c:v", "mjpeg", "-q:v", "5",
+                "pipe:1",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=8)
+            if proc.returncode == 0 and stdout:
+                return stdout
+        except (asyncio.TimeoutError, Exception):
+            pass
         return None
 
     def _schedule_session_timeout(self, timeout_seconds: int) -> None:
