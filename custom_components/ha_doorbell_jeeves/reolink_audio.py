@@ -1349,6 +1349,23 @@ class ReolinkAudioHandler:
             purpose: "talk" for speaker output, "preview" for mic input.
                      Controls which host reference is stored for proper cleanup.
         """
+        # CLEANUP: Logout any existing connection for this purpose first
+        # to prevent session leaks (Reolink has a limited session count).
+        if purpose == "talk" and hasattr(self, "_talk_host") and self._talk_host:
+            try:
+                await asyncio.wait_for(self._talk_host.logout(), timeout=3)
+                _LOGGER.debug("Cleaned up stale talk host before new connection")
+            except Exception:
+                pass
+            self._talk_host = None
+        elif purpose == "preview" and hasattr(self, "_preview_host") and self._preview_host:
+            try:
+                await asyncio.wait_for(self._preview_host.logout(), timeout=3)
+                _LOGGER.debug("Cleaned up stale preview host before new connection")
+            except Exception:
+                pass
+            self._preview_host = None
+
         camera_entity = self._camera_entity_id or ""
         reolink_entry_id = self._reolink_entry_id
         if not reolink_entry_id:

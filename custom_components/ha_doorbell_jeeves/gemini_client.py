@@ -57,6 +57,8 @@ class GeminiLiveClient(BaseRealtimeClient):
         self._vision_paused = False  # Pause vision loop during tool image injection
         # Track model generation state (informational — used by reconnect logic)
         self._model_generating = False
+        # Monitor turn muting: when True, audio output is suppressed (proactive monitor)
+        self._monitor_turn_active = False
 
     @property
     def connected(self) -> bool:
@@ -182,6 +184,7 @@ class GeminiLiveClient(BaseRealtimeClient):
         self._tool_call_pending = False
         self._model_generating = False
         self._vision_paused = False
+        self._monitor_turn_active = False
         if self._receive_task and not self._receive_task.done():
             self._receive_task.cancel()
             try:
@@ -238,10 +241,25 @@ class GeminiLiveClient(BaseRealtimeClient):
     async def inject_context(
         self, text: str, image_base64: str | None = None,
         mime_type: str = "image/jpeg", turn_complete: bool = True,
+        monitor: bool = False,
     ) -> None:
-        """Inject a text message (and optional image) into the live session."""
+        """Inject a text message (and optional image) into the live session.
+
+        Args:
+            monitor: If True, this is a proactive monitor injection. Audio output
+                     will be suppressed for this turn (model should call no_action_needed silently).
+        """
         if not self._session or not self._connected:
             return
+        # SAFETY GATE: Never inject during model generation or tool processing.
+        # This is the primary cause of 1008 "policy violation" errors.
+        if self._model_generating or self._tool_call_pending:
+            _LOGGER.debug("inject_context blocked: model_generating=%s, tool_pending=%s",
+                         self._model_generating, self._tool_call_pending)
+            return
+        # Set monitor mute BEFORE sending so the response audio gets suppressed
+        if monitor:
+            self._monitor_turn_active = True
         try:
             parts = [types.Part(text=text)]
             if image_base64:
@@ -254,6 +272,8 @@ class GeminiLiveClient(BaseRealtimeClient):
             )
         except Exception:
             _LOGGER.exception("Failed to inject context")
+            if monitor:
+                self._monitor_turn_active = False
 
     async def request_recap(self, outcome: str, timeout: float = 8.0) -> dict[str, str] | None:
         """Ask the live model to generate a session recap.
@@ -427,12 +447,16 @@ class GeminiLiveClient(BaseRealtimeClient):
             self._vision_paused = False
             for part in server_content.model_turn.parts:
                 if part.inline_data and part.inline_data.mime_type and "audio" in part.inline_data.mime_type:
-                    self._on_audio_output(part.inline_data.data)
+                    # MUTE audio during monitor turns (proactive checks should be silent)
+                    if not self._monitor_turn_active:
+                        self._on_audio_output(part.inline_data.data)
                 elif part.text:
                     # Filter out thinking/planning text (not actual speech)
                     if not self._is_thinking_text(part.text):
                         self._conversation_turns.append({"role": "assistant", "text": part.text})
-                        self._on_transcript("assistant", part.text)
+                        # Only emit transcript if not a muted monitor turn
+                        if not self._monitor_turn_active:
+                            self._on_transcript("assistant", part.text)
                     else:
                         _LOGGER.debug("Filtered thinking text: %s", part.text[:80])
                     # Resolve recap future if waiting (thinking or not)
@@ -463,9 +487,11 @@ class GeminiLiveClient(BaseRealtimeClient):
             turn_complete = getattr(server_content, "turn_complete", None)
             if interrupted:
                 _LOGGER.debug("Gemini: model output was INTERRUPTED (user started speaking)")
-                # Don't clear _model_generating here — wait for receive() to end
+                self._monitor_turn_active = False
             if turn_complete:
                 _LOGGER.debug("Gemini: turn_complete signal received")
+                # Clear monitor mute at end of turn
+                self._monitor_turn_active = False
                 # Don't clear _model_generating here — there may be a tool_call
                 # still pending in the same receive() stream. We clear it in
                 # _receive_loop after the async for completes.
@@ -475,6 +501,13 @@ class GeminiLiveClient(BaseRealtimeClient):
 
     async def _handle_tool_call(self, tool_call: Any) -> None:
         self._tool_call_pending = True
+        # Tool call received — model is no longer in monitor mode
+        # (unless it's no_action_needed, which is silent anyway)
+        has_no_action = any(
+            fc.name == "no_action_needed" for fc in tool_call.function_calls
+        )
+        if not has_no_action:
+            self._monitor_turn_active = False
         try:
             function_responses: list[types.FunctionResponse] = []
             for fc in tool_call.function_calls:
@@ -501,6 +534,11 @@ class GeminiLiveClient(BaseRealtimeClient):
                         media=types.Blob(data=image_bytes, mime_type=mime_type)
                     )
                     _LOGGER.debug("Tool snapshot sent via realtime_input (before tool_response)")
+                    # CRITICAL: Wait for the server to ingest the image before
+                    # sending tool_response. Without this delay, the model starts
+                    # generating speech BEFORE it has processed the image, leading
+                    # to hallucinated "I see nothing" responses that get corrected later.
+                    await asyncio.sleep(1.0)
                 except Exception:
                     _LOGGER.warning("Failed to send tool snapshot via realtime_input")
 

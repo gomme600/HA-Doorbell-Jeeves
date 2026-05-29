@@ -477,6 +477,13 @@ class JeevesSessionManager:
                     "6. CRITICAL: You must NEVER repeat your initial greeting. Once you have "
                     "greeted the visitor, do not say hello or introduce yourself again, even "
                     "if there is a brief pause or tool execution in between.\n"
+                    "7. CRITICAL: When using view_camera or any tool that returns visual data, "
+                    "NEVER describe what you see BEFORE receiving the tool result. Say ONLY a brief "
+                    "acknowledgment like 'Un instant' or 'Je vérifie' then WAIT for the result. "
+                    "NEVER say 'I see nothing' or 'It's empty' before the tool has completed.\n"
+                    "8. After responding to the visitor, WAIT SILENTLY for them to speak next. "
+                    "Do NOT add follow-up questions like 'Est-ce que je peux faire autre chose?' "
+                    "or 'Puis-je vous aider avec autre chose?'. Let the visitor initiate.\n"
                 )
 
             if provider == PROVIDER_GEMINI:
@@ -1231,6 +1238,10 @@ class JeevesSessionManager:
         old_interrupt_detector = self._interrupt_detector
         old_mic_task = getattr(self, "_mic_task", None)
 
+        # Find the Reolink entry for the target camera (needed for both audio and video)
+        from .reolink_audio import find_reolink_entry_for_camera  # noqa: PLC0415
+        target_entry_id = find_reolink_entry_for_camera(self.hass, camera_entity_id)
+
         audio_started = False
         if self._config.get(CONF_AUDIO_MODE) == AUDIO_MODE_REOLINK and placement and placement.has_audio:
             try:
@@ -1254,6 +1265,15 @@ class JeevesSessionManager:
                 audio_config[CONF_GO2RTC_STREAM_NAME] = camera_entity_id
                 audio_config[CONF_GO2RTC_INPUT_STREAM_NAME] = camera_entity_id
                 audio_config[CONF_GO2RTC_OUTPUT_STREAM_NAME] = camera_entity_id
+
+                # CRITICAL: Find the Reolink entry for the TARGET camera.
+                # Without this, audio connects to the original doorbell's Baichuan.
+                if target_entry_id:
+                    audio_config[CONF_REOLINK_ENTRY_ID] = target_entry_id
+                    _LOGGER.warning("Camera switch: target Reolink entry=%s for %s", target_entry_id[:8], camera_entity_id)
+                else:
+                    _LOGGER.warning("Camera switch: no Reolink entry found for %s — using default", camera_entity_id)
+
                 if getattr(placement, "audio_method", ""):
                     audio_config[CONF_REOLINK_MIC_METHOD] = placement.audio_method
                     audio_config[CONF_REOLINK_MIC_URL] = getattr(placement, "audio_url", "")
@@ -1291,6 +1311,10 @@ class JeevesSessionManager:
                         rollback_config[CONF_GO2RTC_STREAM_NAME] = old_camera
                         rollback_config[CONF_GO2RTC_INPUT_STREAM_NAME] = old_camera
                         rollback_config[CONF_GO2RTC_OUTPUT_STREAM_NAME] = old_camera
+                        # Restore original Reolink entry for the old camera
+                        old_entry_id = find_reolink_entry_for_camera(self.hass, old_camera)
+                        if old_entry_id:
+                            rollback_config[CONF_REOLINK_ENTRY_ID] = old_entry_id
                         await self._start_reolink_audio(rollback_config)
                 except Exception:
                     _LOGGER.exception("Rollback audio restart also failed!")
@@ -1315,6 +1339,9 @@ class JeevesSessionManager:
         self._config[CONF_GO2RTC_STREAM_NAME] = camera_entity_id
         self._config[CONF_GO2RTC_INPUT_STREAM_NAME] = camera_entity_id
         self._config[CONF_GO2RTC_OUTPUT_STREAM_NAME] = camera_entity_id
+        # Update Reolink entry to point to the new camera's device
+        if target_entry_id:
+            self._config[CONF_REOLINK_ENTRY_ID] = target_entry_id
 
         # Start new vision loop
         if self._client and self._active:
@@ -1353,6 +1380,11 @@ class JeevesSessionManager:
         audio_config[CONF_GO2RTC_STREAM_NAME] = camera_entity_id
         audio_config[CONF_GO2RTC_INPUT_STREAM_NAME] = camera_entity_id
         audio_config[CONF_GO2RTC_OUTPUT_STREAM_NAME] = camera_entity_id
+        # Find the correct Reolink entry for this camera
+        from .reolink_audio import find_reolink_entry_for_camera  # noqa: PLC0415
+        entry_id = find_reolink_entry_for_camera(self.hass, camera_entity_id)
+        if entry_id:
+            audio_config[CONF_REOLINK_ENTRY_ID] = entry_id
         if getattr(placement, "audio_method", ""):
             audio_config[CONF_REOLINK_MIC_METHOD] = placement.audio_method
             audio_config[CONF_REOLINK_MIC_URL] = getattr(placement, "audio_url", "")
@@ -1438,13 +1470,18 @@ class JeevesSessionManager:
                 if self._client.model_generating:
                     continue
 
-                # Skip if model was recently active (speech/tool within interval)
-                now = time.time()
-                if self._last_model_activity and (now - self._last_model_activity) < self._monitor_interval * 0.8:
+                # Skip if a tool call is pending
+                if self._client._tool_call_pending:
                     continue
 
-                _LOGGER.warning("Monitor tick — injecting proactive check")
-                # Inject monitoring prompt — model can speak, call tools, or stay silent
+                # Skip if model was recently active (speech/tool within interval)
+                # Use FULL interval to avoid triggering follow-up responses
+                now = time.time()
+                if self._last_model_activity and (now - self._last_model_activity) < self._monitor_interval:
+                    continue
+
+                _LOGGER.debug("Monitor tick — injecting proactive check")
+                # Inject monitoring prompt with monitor=True to mute any audio output
                 try:
                     await self._client.inject_context(
                         "[MONITOR] Periodic security check. Assess the live camera feed NOW.\n"
@@ -1456,6 +1493,7 @@ class JeevesSessionManager:
                         "CRITICAL: For option 1, call the no_action_needed tool. Do NOT generate any speech audio. "
                         "Do NOT say 'let me check' or anything similar. Just call the tool silently.",
                         turn_complete=True,
+                        monitor=True,
                     )
                 except Exception:
                     _LOGGER.warning("Monitor inject failed (session may have ended)")
