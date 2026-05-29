@@ -440,8 +440,10 @@ class GeminiLiveClient(BaseRealtimeClient):
                 turns=[types.Content(role="user", parts=parts)],
                 turn_complete=False,  # Context only — don't trigger a response
             )
-            # Small delay after injecting reference images to let server process
-            await asyncio.sleep(0.3)
+            # Generous delay after injecting reference images to let server process.
+            # The greeting (with turn_complete=True) will follow after audio setup,
+            # which adds another 2-5s of natural delay.
+            await asyncio.sleep(1.0)
         except Exception:
             _LOGGER.exception("Failed to inject reference images")
 

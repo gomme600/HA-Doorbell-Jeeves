@@ -575,35 +575,12 @@ class JeevesSessionManager:
                     except asyncio.TimeoutError:
                         _LOGGER.error("Audio setup timed out after 35s")
 
-                # Inject vision context BEFORE greeting (to avoid 1008 during model generation)
+                # Resolve camera and send greeting (vision context merged into greeting)
                 camera_entity = self._resolve_camera_entity(config.get(CONF_CAMERA_ENTITY, ""))
-                if camera_entity and self._client:
-                    await self._client.inject_context(
-                        "[SYSTEM] Live camera feed starting. "
-                        f"All image frames that follow are LIVE from your primary camera: {camera_entity}. "
-                        "Use these frames as current visual evidence of who/what is at the door. "
-                        "Do NOT call view_camera for this camera — you already see it live.",
-                        turn_complete=False,
-                    )
-                    # Generous pause between context injection and greeting trigger.
-                    # 1.0s (up from 0.3s) gives the server time to fully process the
-                    # partial turn before we send turn_complete=True for the greeting.
-                    await asyncio.sleep(1.0)
-
-                await self._send_initial_greeting()
+                await self._send_initial_greeting(camera_entity)
             else:
-                # Inject vision context BEFORE greeting
                 camera_entity = self._resolve_camera_entity(config.get(CONF_CAMERA_ENTITY, ""))
-                if camera_entity and self._client:
-                    await self._client.inject_context(
-                        "[SYSTEM] Live camera feed starting. "
-                        f"All image frames that follow are LIVE from your primary camera: {camera_entity}. "
-                        "Use these frames as current visual evidence of who/what is at the door. "
-                        "Do NOT call view_camera for this camera — you already see it live.",
-                        turn_complete=False,
-                    )
-                    await asyncio.sleep(1.0)
-                await self._send_initial_greeting()
+                await self._send_initial_greeting(camera_entity)
                 _LOGGER.warning("Audio mode is '%s' (not reolink)", config.get(CONF_AUDIO_MODE))
 
             # Start vision loop — send frames to AI for visual context
@@ -1840,15 +1817,32 @@ class JeevesSessionManager:
 
     # ─── Callbacks ────────────────────────────────────────────────────────────
 
-    async def _send_initial_greeting(self) -> None:
-        """Send an initial trigger message so the AI starts speaking immediately."""
+    async def _send_initial_greeting(self, camera_entity: str = "") -> None:
+        """Send an initial trigger message so the AI starts speaking immediately.
+
+        Vision context is merged directly into the greeting message to avoid sending
+        multiple partial turns before the greeting. Multiple partial turns
+        (reference images + vision context) before turn_complete=True were found
+        to cause ~20% first-connection 1008 errors.
+        """
         if not self._client:
             return
         # Block tool calls during greeting phase — forces AI to speak first
         self._greeting_phase = True
         self._notify_after_greeting = True  # Trigger notification after greeting completes
+
+        # Build combined vision + greeting message (single turn_complete=True call)
+        vision_prefix = ""
+        if camera_entity:
+            vision_prefix = (
+                f"Live camera feed is active from your primary camera: {camera_entity}. "
+                "Image frames that follow are LIVE from this camera — use them as current visual evidence. "
+                "Do NOT call view_camera for this camera — you already see it live. "
+            )
+
         trigger_msg = (
-            "[SYSTEM] A visitor just rang the doorbell. "
+            f"[SYSTEM] {vision_prefix}"
+            "A visitor just rang the doorbell. "
             "START SPEAKING YOUR GREETING IMMEDIATELY — do NOT call any tools first. "
             "A camera frame is being sent to you right now — use it to identify the visitor "
             "if you recognize them, but do NOT wait or call view_camera. "
