@@ -308,11 +308,18 @@ def _register_services(hass: HomeAssistant) -> None:
         if manager and hasattr(manager, "_client") and manager._client and manager._client.connected:
             text = call.data.get("text", "")
             turn_complete = call.data.get("turn_complete", True)
-            await manager._client.inject_context(
-                f"[USER SPEECH] The visitor just said: \"{text}\"",
-                turn_complete=turn_complete,
-            )
-            _LOGGER.info("Injected text into session: %s", text[:100])
+            role = call.data.get("role", "visitor")
+            if role == "system":
+                # Direct system injection — no visitor wrapper
+                msg = f"[SYSTEM] {text}"
+            elif role == "owner":
+                # Owner speaking via intercom — model should obey
+                msg = f"[OWNER COMMAND] The homeowner (Sebastian) says: \"{text}\""
+            else:
+                # Default: visitor at the door
+                msg = f"[USER SPEECH] The visitor just said: \"{text}\""
+            await manager._client.inject_context(msg, turn_complete=turn_complete)
+            _LOGGER.info("Injected text (role=%s) into session: %s", role, text[:100])
         else:
             _LOGGER.warning("Cannot inject text — no active session")
 
@@ -322,6 +329,7 @@ def _register_services(hass: HomeAssistant) -> None:
             vol.Optional("entry_id"): cv.string,
             vol.Required("text"): cv.string,
             vol.Optional("turn_complete"): bool,
+            vol.Optional("role"): vol.In(["visitor", "owner", "system"]),
         }),
     )
 
