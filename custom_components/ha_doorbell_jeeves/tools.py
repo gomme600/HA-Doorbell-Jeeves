@@ -2160,15 +2160,33 @@ async def _execute_notification(
                 manager = m
                 break
 
-    # Get camera snapshot for the notification image
+    # Capture a snapshot NOW from the primary camera and save to /config/www/
+    # This ensures the image is always available even if the camera becomes unreachable
+    # when the phone tries to fetch it later.
     camera_entity = (config or {}).get(CONF_CAMERA_ENTITY, "")
     snapshot_url = ""
     if camera_entity:
-        snapshot_url = f"/api/camera_proxy/{camera_entity}"
-    _LOGGER.warning(
-        "Notification image: camera_entity=%s, snapshot_url=%s",
-        camera_entity, snapshot_url,
-    )
+        try:
+            import os
+            www_dir = hass.config.path("www")
+            os.makedirs(www_dir, exist_ok=True)
+            snapshot_path = os.path.join(www_dir, "jeeves_doorbell_snapshot.jpg")
+            image = await ha_camera_get_image(hass, camera_entity, timeout=8)
+            with open(snapshot_path, "wb") as f:
+                f.write(image.content)
+            # /local/ maps to /config/www/ in HA
+            snapshot_url = "/local/jeeves_doorbell_snapshot.jpg"
+            _LOGGER.info(
+                "Notification snapshot captured from %s (%d bytes)",
+                camera_entity, len(image.content),
+            )
+        except Exception as err:
+            _LOGGER.warning(
+                "Failed to capture snapshot from %s for notification: %s — "
+                "falling back to camera proxy URL",
+                camera_entity, err,
+            )
+            snapshot_url = f"/api/camera_proxy/{camera_entity}"
 
     if manager and hasattr(manager, "_notification_manager"):
         notification_mgr = manager._notification_manager
