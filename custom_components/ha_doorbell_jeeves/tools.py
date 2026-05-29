@@ -331,22 +331,22 @@ def build_gemini_tools(
         declarations.append(types.FunctionDeclaration(
             name=TOOL_VIEW_CAMERA,
             description=(
-                "Capture a single live snapshot from a camera. Use this for quick checks "
-                "of other areas (e.g., counting cars in the carport, checking the gate) "
-                "WITHOUT changing your primary live video/audio feed. The image will be "
-                "injected into your conversation history for reliable visual analysis."
+                "COMMAND: Capture a single live snapshot from a camera. Use this for "
+                "quick checks of other areas (e.g., carport, gate) WITHOUT changing "
+                "your primary live video/audio feed. The image is added to your "
+                "history for analysis."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "camera_entity_id": {
                         "type": "string",
-                        "description": "Which camera to view",
+                        "description": "Camera ID to snapshot",
                         "enum": camera_ids,
                     },
                     "reason": {
                         "type": "string",
-                        "description": "Brief note on why you're checking this camera (for audit)",
+                        "description": "Reason for snapshot",
                     },
                 },
                 "required": ["camera_entity_id"],
