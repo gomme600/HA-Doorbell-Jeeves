@@ -162,8 +162,6 @@ class GeminiLiveClient(BaseRealtimeClient):
     async def send_audio(self, pcm_bytes: bytes) -> None:
         if not self._session or not self._connected:
             return
-        if self._tool_call_pending:
-            return
         try:
             await self._session.send_realtime_input(
                 audio=types.Blob(
@@ -177,8 +175,6 @@ class GeminiLiveClient(BaseRealtimeClient):
     async def send_image(self, image_base64: str, mime_type: str = "image/jpeg") -> None:
         """Send an image frame to the live session via realtime video input."""
         if not self._session or not self._connected:
-            return
-        if self._tool_call_pending:
             return
         try:
             image_bytes = base64.b64decode(image_base64)
