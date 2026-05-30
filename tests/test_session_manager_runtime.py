@@ -5,6 +5,8 @@ from types import SimpleNamespace
 from typing import Any
 
 import custom_components.ha_doorbell_jeeves.gemini_client as gc_module
+import custom_components.ha_doorbell_jeeves.session_manager as sm_module
+import custom_components.ha_doorbell_jeeves.tools as tools_module
 from custom_components.ha_doorbell_jeeves.const import (
     CONF_API_KEY,
     CONF_CAMERA_ENTITY,
@@ -195,6 +197,88 @@ def test_handle_model_turn_complete_starts_media_once() -> None:
         await scheduled[0]
 
         assert calls == [("camera.entree", {"audio_mode": "reolink"})]
+
+    asyncio.run(_run())
+
+
+def test_async_start_session_uses_configured_fps_for_startup_log(monkeypatch: Any) -> None:
+    async def _run() -> None:
+        manager = JeevesSessionManager.__new__(JeevesSessionManager)
+        manager._active = False
+        manager._starting = False
+        manager._audio_handler = None
+        manager._primary_camera_entity = ""
+        manager._primary_go2rtc_stream = ""
+        manager._primary_go2rtc_input = ""
+        manager._primary_go2rtc_output = ""
+        manager._primary_reolink_entry = ""
+        manager.reolink_needs_setup = False
+        manager._tool_router = None
+        manager._vision_task = None
+        manager._silence_task = None
+        manager._notification_manager = SimpleNamespace(clear_session=lambda: None)
+        manager._security = SimpleNamespace(start_session=lambda: None)
+        manager._stop_unsubs = []
+        manager._session_start_snapshot = None
+        manager._transcript_history = []
+        manager.entry = SimpleNamespace(entry_id="entry-1")
+        manager.store = SimpleNamespace(camera_placements=[], managed_entities=[])
+
+        async def _async_add_executor_job(func: Any, *args: Any) -> Any:
+            return func(*args)
+
+        manager.hass = SimpleNamespace(
+            async_add_executor_job=_async_add_executor_job,
+            bus=SimpleNamespace(async_fire=lambda *_args, **_kwargs: None),
+        )
+        manager._config = {
+            CONF_API_KEY: "k",
+            CONF_PROVIDER: PROVIDER_GEMINI,
+            CONF_MODEL: "gemini-test-model",
+            CONF_CAMERA_ENTITY: "camera.entree",
+            CONF_VISION_FPS: 2.5,
+        }
+
+        async def _noop_async(*_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        connect_calls: list[str] = []
+
+        async def _fake_create_client(
+            _api_key: str,
+            _model: str,
+            _voice_prompt: str,
+            _voice: str,
+            _tools: list[Any],
+            _reference_images: list[Any],
+        ) -> Any:
+            async def _connect(*, greeting_text: str) -> None:
+                connect_calls.append(greeting_text)
+
+            return SimpleNamespace(connect=_connect)
+
+        monkeypatch.setattr(sm_module, "build_system_context", lambda *_args: "")
+        monkeypatch.setattr(sm_module, "build_gemini_tools", lambda *_args: [])
+        monkeypatch.setattr(sm_module, "build_openai_tools", lambda *_args: [])
+        monkeypatch.setattr(tools_module, "render_camera_map_image", lambda *_args: None)
+
+        manager._capture_memory_snapshot = _noop_async
+        manager._get_reference_images = lambda: []
+        manager._create_gemini_client = _fake_create_client
+        manager._touch_audio_activity = lambda: None
+        manager._schedule_session_timeout = lambda _timeout: None
+        manager._register_stop_triggers = lambda: None
+        manager._cleanup_after_end = _noop_async
+        manager._resolve_camera_entity = lambda camera_entity: camera_entity
+        manager._build_identity_context = lambda: ""
+
+        await manager.async_start_session()
+
+        assert manager._active is True
+        assert manager._startup_media_pending is True
+        assert manager._startup_media_camera_entity == "camera.entree"
+        assert manager._starting is False
+        assert len(connect_calls) == 1
 
     asyncio.run(_run())
 

@@ -432,6 +432,7 @@ class JeevesSessionManager:
             api_key: str = config[CONF_API_KEY]
             model: str = config.get(CONF_MODEL, DEFAULT_MODEL_GEMINI)
             dual_model = config.get(CONF_DUAL_MODEL_ENABLED, False)
+            fps = float(config.get(CONF_VISION_FPS, DEFAULT_VISION_FPS))
 
             _LOGGER.warning(
                 "Session config: provider=%s, model=%s, audio_mode=%s, camera=%s",
