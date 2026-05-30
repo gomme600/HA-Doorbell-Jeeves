@@ -1937,10 +1937,13 @@ class JeevesSessionManager:
             pass
 
     async def _handle_tool_call(self, function_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        # During greeting phase, block tool calls to force the AI to speak first
+        # During greeting phase, block ONLY notification tools to force the AI to speak first.
+        # Other tools (view_camera, end_conversation, etc.) should still work — especially
+        # when triggered by owner commands via inject_text.
         if getattr(self, "_greeting_phase", False):
-            _LOGGER.warning("Tool call %s blocked during greeting phase — forcing speech first", function_name)
-            return {"error": "You must speak your greeting FIRST before using any tools. Speak now."}
+            if function_name.startswith("notify_") or function_name == "no_action_needed":
+                _LOGGER.warning("Tool call %s blocked during greeting phase — forcing speech first", function_name)
+                return {"error": "You must speak your greeting FIRST before using any tools. Speak now."}
 
         # Track model activity for proactive monitoring + silence watchdog
         self._last_model_activity = time.time()

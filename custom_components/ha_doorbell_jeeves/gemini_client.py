@@ -400,10 +400,23 @@ class GeminiLiveClient(BaseRealtimeClient):
                 if hasattr(self, '_connect_time'):
                     _LOGGER.warning("inject_context(turn_complete=True) at T+%.1f", time.time() - self._connect_time)
 
-            await self._session.send_client_content(
-                turns=[types.Content(role="user", parts=parts)],
-                turn_complete=turn_complete,
-            )
+            # Retry once if WebSocket send fails (race with 1008 reconnection)
+            for attempt in range(2):
+                try:
+                    await self._session.send_client_content(
+                        turns=[types.Content(role="user", parts=parts)],
+                        turn_complete=turn_complete,
+                    )
+                    break  # Success
+                except Exception as send_err:
+                    if attempt == 0 and self._connected:
+                        _LOGGER.warning("inject_context send failed, retrying after reconnect window: %s", str(send_err)[:100])
+                        # Wait for reconnection to complete
+                        await asyncio.sleep(2.0)
+                        if not self._session or not self._connected:
+                            raise
+                    else:
+                        raise
         except Exception:
             _LOGGER.exception("Failed to inject context")
             if monitor:
