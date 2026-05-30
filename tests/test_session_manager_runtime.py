@@ -178,6 +178,7 @@ def test_handle_model_turn_complete_starts_media_once() -> None:
         manager._startup_media_camera_entity = "camera.entree"
         manager._startup_media_config = {"audio_mode": "reolink"}
         manager._notify_after_greeting = True
+        manager._greeting_phase = True
 
         scheduled: list[asyncio.Future[Any] | asyncio.Task[Any] | Any] = []
         calls: list[str] = []
@@ -207,6 +208,7 @@ def test_handle_model_turn_complete_starts_media_once() -> None:
         assert manager._startup_media_camera_entity == ""
         assert manager._startup_media_config is None
         assert manager._notify_after_greeting is False
+        assert manager._greeting_phase is False
         assert len(scheduled) == 1
 
         await scheduled[0]

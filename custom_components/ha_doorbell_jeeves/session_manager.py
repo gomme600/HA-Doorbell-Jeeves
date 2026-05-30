@@ -1882,6 +1882,9 @@ class JeevesSessionManager:
         """Start live audio/vision only after the initial greeting turn finishes."""
         if turn_count != 1 or not self._startup_media_pending:
             return
+        if getattr(self, "_greeting_phase", False):
+            self._greeting_phase = False
+            _LOGGER.warning("Greeting phase ended — tools now unblocked")
         self._startup_media_pending = False
         camera_entity = self._startup_media_camera_entity
         config = dict(self._startup_media_config or self._config)
@@ -2001,9 +2004,6 @@ class JeevesSessionManager:
             self._audio_out_count = 0
         self._audio_out_count += 1
         # End greeting phase once AI actually produces audio
-        if getattr(self, "_greeting_phase", False):
-            self._greeting_phase = False
-            _LOGGER.warning("Greeting phase ended — tools now unblocked")
         if self._audio_out_count <= 3:
             _LOGGER.warning(
                 "Audio output from AI: %d bytes (chunk #%d)",
