@@ -398,6 +398,7 @@ def test_start_session_media_enables_reolink_input_after_greeting() -> None:
                 CONF_VISION_FPS: 2.5,
             },
         )
+        await asyncio.sleep(0)
 
         assert calls == [(False, True)]
         assert manager._vision_task is not None

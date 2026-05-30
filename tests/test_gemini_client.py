@@ -136,6 +136,15 @@ def test_gemini_connect_uses_prewarmed_shared_client(monkeypatch: Any) -> None:
     asyncio.run(_run())
 
 
+def test_live_config_disables_thinking_budget() -> None:
+    client = _build_client()
+    config = client._build_live_config()
+
+    assert config.thinking_config is not None
+    assert config.thinking_config.thinking_budget == 0
+    assert config.thinking_config.include_thoughts is False
+
+
 def test_tool_response_omits_parts_kwarg_when_no_image(monkeypatch: Any) -> None:
     async def _run() -> None:
         captured_kwargs: list[dict[str, Any]] = []
@@ -194,6 +203,48 @@ def test_view_camera_fails_safely_when_parts_unsupported(monkeypatch: Any) -> No
         assert "parts" not in captured_kwargs[0]
         assert "too old to support inline tool image parts" in captured_kwargs[0]["response"]["error"]
         assert session.tool_response_calls == [[captured_kwargs[0]]]
+
+    asyncio.run(_run())
+
+
+def test_process_filters_gemini_thought_parts() -> None:
+    async def _run() -> None:
+        transcripts: list[tuple[str, str]] = []
+        client = GeminiLiveClient(
+            api_key="k",
+            model="gemini-test-model",
+            system_prompt="prompt",
+            tools=[],
+            voice="Puck",
+            reference_images=[],
+            on_audio_output=lambda _audio: None,
+            on_tool_call=lambda _name, _args: asyncio.sleep(0, result={"success": True}),
+            on_session_end=lambda: None,
+            on_transcript=lambda role, text: transcripts.append((role, text)),
+        )
+
+        response = SimpleNamespace(
+            server_content=SimpleNamespace(
+                model_turn=SimpleNamespace(
+                    parts=[
+                        SimpleNamespace(text="Internal plan", inline_data=None, thought=True),
+                        SimpleNamespace(text="Bonjour, puis-je vous aider ?", inline_data=None, thought=False),
+                    ]
+                ),
+                input_transcription=None,
+                output_transcription=None,
+                interrupted=False,
+                turn_complete=False,
+            ),
+            tool_call=None,
+        )
+
+        await client._process(response)
+
+        assert client._conversation_turns == [
+            {"role": "assistant", "text": "Bonjour, puis-je vous aider ?"}
+        ]
+        assert transcripts == [("assistant", "Bonjour, puis-je vous aider ?")]
 
     asyncio.run(_run())
 

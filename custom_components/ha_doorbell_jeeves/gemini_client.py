@@ -205,6 +205,10 @@ class GeminiLiveClient(BaseRealtimeClient):
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=self._voice)
                 )
             ),
+            thinking_config=types.ThinkingConfig(
+                thinking_budget=0,
+                include_thoughts=False,
+            ),
             system_instruction=types.Content(parts=[types.Part(text=self._system_prompt)]),
             tools=self._tools if self._tools else None,
             output_audio_transcription=types.AudioTranscriptionConfig(),
@@ -333,8 +337,9 @@ class GeminiLiveClient(BaseRealtimeClient):
                 await self._session.send_client_content(
                     turns=[types.Content(role="user", parts=[types.Part(text=(
                         "[SYSTEM] A visitor is at the door. "
-                        "Greet them briefly and warmly. Ask how you can help. "
-                        "Do NOT call any tools. Speak now."
+                        "Speak exactly one short sentence in French ending with a question. "
+                        "End your turn immediately after that sentence. "
+                        "Do NOT call any tools. Do NOT think aloud. Speak now."
                     ))])],
                     turn_complete=True,
                 )
@@ -796,6 +801,9 @@ class GeminiLiveClient(BaseRealtimeClient):
                     if not self._monitor_turn_active:
                         self._on_audio_output(part.inline_data.data)
                 elif part.text:
+                    if bool(getattr(part, "thought", False)):
+                        _LOGGER.debug("Filtered Gemini thought part: %s", part.text[:80])
+                        continue
                     # Filter out thinking/planning text (not actual speech)
                     if not self._is_thinking_text(part.text):
                         self._conversation_turns.append({"role": "assistant", "text": part.text})

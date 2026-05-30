@@ -551,8 +551,10 @@ class JeevesSessionManager:
                 "[SYSTEM] A visitor just rang the doorbell. "
                 "START SPEAKING YOUR GREETING IMMEDIATELY — do NOT call any tools first. "
                 "Do NOT wait for vision or call view_camera before greeting. "
-                "Just greet them warmly and ask how you can help. "
+                "Speak exactly one short sentence in French ending with a question. "
+                "End your turn immediately after that sentence. "
                 "Do NOT tell the visitor you are notifying anyone. "
+                "Do NOT think aloud. "
                 "Speak now."
             )
 
@@ -1929,13 +1931,9 @@ class JeevesSessionManager:
         reolink_mode = config.get(CONF_AUDIO_MODE) == AUDIO_MODE_REOLINK
         if reolink_mode:
             _LOGGER.warning("Starting Reolink microphone/takeover monitoring after greeting turn completed")
-            audio_task = asyncio.create_task(
+            asyncio.create_task(
                 self._start_reolink_audio_background(config, input_only=True)
             )
-            try:
-                await asyncio.wait_for(asyncio.shield(audio_task), timeout=35.0)
-            except asyncio.TimeoutError:
-                _LOGGER.error("Audio setup timed out after 35s")
         else:
             _LOGGER.warning("Audio mode is '%s' (not reolink)", config.get(CONF_AUDIO_MODE))
 
