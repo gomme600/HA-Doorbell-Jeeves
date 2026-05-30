@@ -24,6 +24,9 @@ class _FakeSession:
     async def send_tool_response(self, *, function_responses: Any) -> None:
         self.tool_response_calls.append(function_responses)
 
+    async def receive(self) -> Any:
+        yield SimpleNamespace(server_content=SimpleNamespace(model_turn=object()))
+
 
 class _FakeSessionCM:
     def __init__(self, session: _FakeSession) -> None:
@@ -93,6 +96,9 @@ def test_gemini_prewarm_reuses_shared_client(monkeypatch: Any) -> None:
         assert first is second
         assert len(_FakeGenAIClient.instances) == 1
         assert len(first.aio.live.connect_calls) == 1
+        warmup_session = first.aio.live.connect_calls[0][3]
+        assert warmup_session.client_content_calls
+        assert warmup_session.client_content_calls[0][1] is True
 
     asyncio.run(_run())
 

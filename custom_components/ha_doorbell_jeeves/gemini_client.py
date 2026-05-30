@@ -135,22 +135,62 @@ class GeminiLiveClient(BaseRealtimeClient):
         async with lock:
             if warm_key in _WARMED_LIVE_MODELS:
                 return client
-            try:
-                warmup_cm = client.aio.live.connect(
-                    model=model,
-                    config=types.LiveConnectConfig(response_modalities=["AUDIO"]),
-                )
-                await warmup_cm.__aenter__()
-                await warmup_cm.__aexit__(None, None, None)
-                await asyncio.sleep(0.3)
-                _WARMED_LIVE_MODELS.add(warm_key)
-                _LOGGER.warning("Gemini shared client prewarmed (model=%s)", model)
-            except Exception:
-                _LOGGER.warning(
-                    "Gemini shared client prewarm failed (model=%s)",
-                    model,
-                    exc_info=True,
-                )
+
+            async def _wait_for_first_response(session: Any) -> bool:
+                try:
+                    async with asyncio.timeout(8.0):
+                        async for _response in session.receive():
+                            return True
+                except TimeoutError:
+                    return False
+                return False
+
+            for attempt in range(1, 4):
+                warmup_cm = None
+                warmup_session = None
+                try:
+                    warmup_cm = client.aio.live.connect(
+                        model=model,
+                        config=types.LiveConnectConfig(response_modalities=["AUDIO"]),
+                    )
+                    warmup_session = await warmup_cm.__aenter__()
+                    await warmup_session.send_client_content(
+                        turns=types.Content(
+                            role="user",
+                            parts=[types.Part(text="Warmup: say hello briefly.")],
+                        ),
+                        turn_complete=True,
+                    )
+                    if not await _wait_for_first_response(warmup_session):
+                        raise RuntimeError("warmup session produced no response")
+                    await asyncio.sleep(0.2)
+                    _WARMED_LIVE_MODELS.add(warm_key)
+                    _LOGGER.warning(
+                        "Gemini shared client prewarmed with first generation (model=%s, attempt=%d)",
+                        model,
+                        attempt,
+                    )
+                    break
+                except Exception:
+                    if attempt >= 3:
+                        _LOGGER.warning(
+                            "Gemini shared client prewarm failed (model=%s)",
+                            model,
+                            exc_info=True,
+                        )
+                    else:
+                        _LOGGER.warning(
+                            "Gemini shared client warmup attempt %d failed; retrying",
+                            attempt,
+                            exc_info=True,
+                        )
+                        await asyncio.sleep(0.4 * attempt)
+                finally:
+                    if warmup_cm is not None:
+                        try:
+                            await warmup_cm.__aexit__(None, None, None)
+                        except Exception:
+                            _LOGGER.debug("Gemini warmup session close failed", exc_info=True)
         return client
 
     def _build_live_config(self) -> types.LiveConnectConfig:
