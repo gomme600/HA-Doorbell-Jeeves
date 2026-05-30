@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -21,6 +22,20 @@ _SHARED_CLIENTS: dict[str, genai.Client] = {}
 _SHARED_CLIENT_LOCKS: dict[str, asyncio.Lock] = {}
 _WARMED_LIVE_MODELS: set[tuple[str, str]] = set()
 _WARM_LOCKS: dict[tuple[str, str], asyncio.Lock] = {}
+
+
+def _function_response_supports_parts() -> bool:
+    """Detect whether the installed SDK supports FunctionResponse.parts."""
+    model_fields = getattr(types.FunctionResponse, "model_fields", None)
+    if isinstance(model_fields, dict):
+        return "parts" in model_fields
+    try:
+        return "parts" in inspect.signature(types.FunctionResponse).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+_FUNCTION_RESPONSE_SUPPORTS_PARTS = _function_response_supports_parts()
 
 
 class GeminiLiveClient(BaseRealtimeClient):
@@ -756,14 +771,27 @@ class GeminiLiveClient(BaseRealtimeClient):
                 elif fc.name == "view_camera":
                     _LOGGER.warning("view_camera completed but no _pending_tool_image was set!")
 
-                function_responses.append(
-                    types.FunctionResponse(
-                        id=fc.id,
-                        name=fc.name,
-                        response=result,
-                        parts=response_parts,
-                    )
-                )
+                function_response_kwargs: dict[str, Any] = {
+                    "id": fc.id,
+                    "name": fc.name,
+                    "response": result,
+                }
+                if response_parts is not None:
+                    if _FUNCTION_RESPONSE_SUPPORTS_PARTS:
+                        function_response_kwargs["parts"] = response_parts
+                    else:
+                        _LOGGER.warning(
+                            "Installed google-genai SDK does not support FunctionResponse.parts"
+                        )
+                        if fc.name == "view_camera":
+                            function_response_kwargs["response"] = {
+                                "error": (
+                                    "Unable to attach the live camera image because the installed "
+                                    "google-genai SDK is too old to support inline tool image parts."
+                                )
+                            }
+
+                function_responses.append(types.FunctionResponse(**function_response_kwargs))
 
             if self._session and self._connected:
                 # Send tool_response (this triggers model generation)

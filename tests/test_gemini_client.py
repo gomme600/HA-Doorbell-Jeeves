@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+from types import SimpleNamespace
 from typing import Any
 
 import custom_components.ha_doorbell_jeeves.gemini_client as gc_module
@@ -11,12 +13,16 @@ class _FakeSession:
     def __init__(self) -> None:
         self.client_content_calls: list[tuple[Any, bool]] = []
         self.realtime_input_calls: list[dict[str, Any]] = []
+        self.tool_response_calls: list[Any] = []
 
     async def send_client_content(self, *, turns: Any, turn_complete: bool = True) -> None:
         self.client_content_calls.append((turns, turn_complete))
 
     async def send_realtime_input(self, **kwargs: Any) -> None:
         self.realtime_input_calls.append(kwargs)
+
+    async def send_tool_response(self, *, function_responses: Any) -> None:
+        self.tool_response_calls.append(function_responses)
 
 
 class _FakeSessionCM:
@@ -119,5 +125,67 @@ def test_gemini_connect_uses_prewarmed_shared_client(monkeypatch: Any) -> None:
         assert actual_session.client_content_calls[0][1] is True
 
         await client.disconnect()
+
+    asyncio.run(_run())
+
+
+def test_tool_response_omits_parts_kwarg_when_no_image(monkeypatch: Any) -> None:
+    async def _run() -> None:
+        captured_kwargs: list[dict[str, Any]] = []
+
+        def _fake_function_response(**kwargs: Any) -> dict[str, Any]:
+            captured_kwargs.append(kwargs)
+            return kwargs
+
+        client = _build_client()
+        session = _FakeSession()
+        client._session = session
+        client._connected = True
+
+        monkeypatch.setattr(gc_module.types, "FunctionResponse", _fake_function_response)
+
+        tool_call = SimpleNamespace(
+            function_calls=[SimpleNamespace(id="tool-1", name="notify_sebastians_phone", args={})]
+        )
+
+        await client._handle_tool_call(tool_call)
+
+        assert len(captured_kwargs) == 1
+        assert "parts" not in captured_kwargs[0]
+        assert session.tool_response_calls == [[captured_kwargs[0]]]
+
+    asyncio.run(_run())
+
+
+def test_view_camera_fails_safely_when_parts_unsupported(monkeypatch: Any) -> None:
+    async def _run() -> None:
+        captured_kwargs: list[dict[str, Any]] = []
+
+        def _fake_function_response(**kwargs: Any) -> dict[str, Any]:
+            captured_kwargs.append(kwargs)
+            return kwargs
+
+        client = _build_client()
+        session = _FakeSession()
+        client._session = session
+        client._connected = True
+        client._pending_tool_image = (
+            base64.b64encode(b"jpeg-bytes").decode(),
+            "image/jpeg",
+        )
+
+        monkeypatch.setattr(gc_module.types, "FunctionResponse", _fake_function_response)
+        monkeypatch.setattr(gc_module, "_FUNCTION_RESPONSE_SUPPORTS_PARTS", False)
+
+        tool_call = SimpleNamespace(
+            function_calls=[SimpleNamespace(id="tool-2", name="view_camera", args={})]
+        )
+
+        await client._handle_tool_call(tool_call)
+
+        assert len(captured_kwargs) == 1
+        assert "parts" not in captured_kwargs[0]
+        assert "too old to support inline tool image parts" in captured_kwargs[0]["response"]["error"]
+        assert session.tool_response_calls == [[captured_kwargs[0]]]
 
     asyncio.run(_run())
