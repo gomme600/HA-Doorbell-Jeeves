@@ -8,7 +8,9 @@ import custom_components.ha_doorbell_jeeves.gemini_client as gc_module
 import custom_components.ha_doorbell_jeeves.session_manager as sm_module
 import custom_components.ha_doorbell_jeeves.tools as tools_module
 from custom_components.ha_doorbell_jeeves.const import (
+    AUDIO_MODE_REOLINK,
     CONF_API_KEY,
+    CONF_AUDIO_MODE,
     CONF_CAMERA_ENTITY,
     CONF_MEMORY_RETENTION_DAYS,
     CONF_MODEL,
@@ -235,6 +237,7 @@ def test_async_start_session_uses_configured_fps_for_startup_log(monkeypatch: An
             CONF_API_KEY: "k",
             CONF_PROVIDER: PROVIDER_GEMINI,
             CONF_MODEL: "gemini-test-model",
+            CONF_AUDIO_MODE: AUDIO_MODE_REOLINK,
             CONF_CAMERA_ENTITY: "camera.entree",
             CONF_VISION_FPS: 2.5,
         }
@@ -242,7 +245,7 @@ def test_async_start_session_uses_configured_fps_for_startup_log(monkeypatch: An
         async def _noop_async(*_args: Any, **_kwargs: Any) -> None:
             return None
 
-        connect_calls: list[str] = []
+        call_order: list[str] = []
 
         async def _fake_create_client(
             _api_key: str,
@@ -253,9 +256,21 @@ def test_async_start_session_uses_configured_fps_for_startup_log(monkeypatch: An
             _reference_images: list[Any],
         ) -> Any:
             async def _connect(*, greeting_text: str) -> None:
-                connect_calls.append(greeting_text)
+                call_order.append(f"connect:{greeting_text}")
 
             return SimpleNamespace(connect=_connect)
+
+        async def _fake_start_reolink_audio(
+            _config: dict[str, Any],
+            skip_talk_monitor: bool = False,
+            *,
+            output_only: bool = False,
+            input_only: bool = False,
+        ) -> None:
+            call_order.append(
+                "audio:"
+                f"output_only={output_only},input_only={input_only},skip_talk_monitor={skip_talk_monitor}"
+            )
 
         monkeypatch.setattr(sm_module, "build_system_context", lambda *_args: "")
         monkeypatch.setattr(sm_module, "build_gemini_tools", lambda *_args: [])
@@ -271,6 +286,7 @@ def test_async_start_session_uses_configured_fps_for_startup_log(monkeypatch: An
         manager._cleanup_after_end = _noop_async
         manager._resolve_camera_entity = lambda camera_entity: camera_entity
         manager._build_identity_context = lambda: ""
+        manager._start_reolink_audio = _fake_start_reolink_audio
 
         await manager.async_start_session()
 
@@ -278,7 +294,57 @@ def test_async_start_session_uses_configured_fps_for_startup_log(monkeypatch: An
         assert manager._startup_media_pending is True
         assert manager._startup_media_camera_entity == "camera.entree"
         assert manager._starting is False
-        assert len(connect_calls) == 1
+        assert call_order[0] == "audio:output_only=True,input_only=False,skip_talk_monitor=True"
+        assert call_order[1].startswith("connect:[SYSTEM] A visitor just rang the doorbell.")
+
+    asyncio.run(_run())
+
+
+def test_start_session_media_enables_reolink_input_after_greeting() -> None:
+    async def _run() -> None:
+        manager = JeevesSessionManager.__new__(JeevesSessionManager)
+        manager._active = True
+        manager._client = SimpleNamespace(connected=True)
+        manager._vision_task = None
+        manager._monitor_task = None
+
+        calls: list[tuple[bool, bool]] = []
+
+        async def _fake_start_reolink_audio_background(
+            _config: dict[str, Any],
+            *,
+            output_only: bool = False,
+            input_only: bool = False,
+        ) -> None:
+            calls.append((output_only, input_only))
+
+        async def _fake_vision_loop(_camera_entity: str, _fps: float) -> None:
+            return None
+
+        async def _fake_monitor_loop() -> None:
+            return None
+
+        manager._start_reolink_audio_background = _fake_start_reolink_audio_background
+        manager._vision_loop = _fake_vision_loop
+        manager._proactive_monitor_loop = _fake_monitor_loop
+
+        await manager._start_session_media(
+            "camera.entree",
+            {
+                CONF_AUDIO_MODE: AUDIO_MODE_REOLINK,
+                CONF_CAMERA_ENTITY: "camera.entree",
+                CONF_VISION_FPS: 2.5,
+            },
+        )
+
+        assert calls == [(False, True)]
+        assert manager._vision_task is not None
+        assert manager._monitor_task is not None
+
+        if manager._vision_task and not manager._vision_task.done():
+            await manager._vision_task
+        if manager._monitor_task and not manager._monitor_task.done():
+            await manager._monitor_task
 
     asyncio.run(_run())
 

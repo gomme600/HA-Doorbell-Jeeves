@@ -142,6 +142,8 @@ class JeevesSessionManager:
         # Mic forwarder queue/task (decouples ffmpeg reads from API send latency)
         self._mic_queue: asyncio.Queue[bytes] | None = None
         self._mic_forward_task: asyncio.Task[None] | None = None
+        self._mic_rx_count = 0
+        self._mic_dropped_count = 0
 
         # Tool router (dual-model mode)
         self._tool_router: Any = None  # ToolRouter or None
@@ -554,6 +556,18 @@ class JeevesSessionManager:
                 "Speak now."
             )
 
+            reolink_mode = config.get(CONF_AUDIO_MODE) == AUDIO_MODE_REOLINK
+            if reolink_mode:
+                _LOGGER.warning("Starting Reolink speaker output before greeting")
+                try:
+                    await self._start_reolink_audio(
+                        config,
+                        skip_talk_monitor=True,
+                        output_only=True,
+                    )
+                except Exception:
+                    _LOGGER.exception("Reolink speaker output setup failed before greeting")
+
             # Connect with greeting in atomic burst (matches reconnect pattern that never gets 1008)
             await self._client.connect(greeting_text=greeting_text)
             self._active = True
@@ -689,26 +703,122 @@ class JeevesSessionManager:
 
     # ─── Reolink Audio Integration ────────────────────────────────────────────
 
-    async def _start_reolink_audio_background(self, config: dict) -> None:
-        """Background wrapper for Reolink audio setup (non-blocking startup)."""
+    async def _handle_human_takeover(self) -> None:
+        """Human started talking — stop AI session."""
+        _LOGGER.info("Human takeover detected — stopping AI session")
+        await self.async_stop_session("human takeover")
+
+    def _ensure_mic_forwarder(self) -> None:
+        """Ensure the mic queue/forwarder task exists before input starts."""
+        if self._mic_queue is None:
+            self._mic_queue = asyncio.Queue(maxsize=256)
+        if not self._mic_forward_task or self._mic_forward_task.done():
+            self._mic_forward_task = self.hass.async_create_task(self._mic_forward_loop())
+        self._mic_rx_count = 0
+        self._mic_dropped_count = 0
+
+    async def _handle_doorbell_audio(self, audio_bytes: bytes) -> None:
+        """Forward audio from doorbell mic to AI client."""
+        self._mic_rx_count += 1
+        self._touch_audio_activity()
+        if self._interrupt_detector:
+            self._interrupt_detector.process_audio_frame(audio_bytes)
+        if self._mic_rx_count == 1:
+            _LOGGER.warning("✓ First microphone chunk received from doorbell (%d bytes)", len(audio_bytes))
+            import struct as _s
+
+            samples = _s.unpack(f"<{len(audio_bytes)//2}h", audio_bytes)
+            rms = (sum(s * s for s in samples) / len(samples)) ** 0.5
+            peak = max(abs(s) for s in samples)
+            _LOGGER.warning(
+                "Audio diagnostic: RMS=%.1f, peak=%d, samples=%d (expect non-zero for valid audio)",
+                rms,
+                peak,
+                len(samples),
+            )
+        elif self._mic_rx_count % 500 == 0:
+            _LOGGER.info("Microphone input received: %d chunks", self._mic_rx_count)
+
+        if self._mic_queue is None:
+            return
+
         try:
-            await self._start_reolink_audio(config)
-        except Exception:
-            _LOGGER.exception("Reolink audio setup failed (background)")
-            # Session continues without 2-way audio — AI can still see via camera
+            self._mic_queue.put_nowait(audio_bytes)
+        except asyncio.QueueFull:
+            try:
+                _ = self._mic_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            self._mic_queue.put_nowait(audio_bytes)
+            self._mic_dropped_count += 1
+            if self._mic_dropped_count <= 3 or self._mic_dropped_count % 100 == 0:
+                _LOGGER.warning("Mic queue overflow: dropped %d chunk(s)", self._mic_dropped_count)
 
-    async def _start_reolink_audio(self, config: dict, skip_talk_monitor: bool = False) -> None:
-        """Start the Reolink 2-way audio handler via go2rtc.
+    def _configure_reolink_audio_handler(self, config: dict, stream_name: str) -> None:
+        """Create or update the Reolink audio handler for the target camera."""
+        from .reolink_audio import ReolinkAudioHandler  # noqa: PLC0415
 
-        Args:
-            config: Audio configuration dict.
-            skip_talk_monitor: If True, don't start the TalkMonitor (saves a session slot).
-                               Used during camera switching where human takeover detection
-                               isn't needed on secondary cameras.
-        """
+        if self._audio_handler is None:
+            self._audio_handler = ReolinkAudioHandler(
+                self.hass,
+                stream_name,
+                on_audio_received=self._handle_doorbell_audio,
+                on_takeover=self._handle_human_takeover,
+            )
+
+        camera_entity = config.get(CONF_CAMERA_ENTITY, "")
+        self._audio_handler._stream_name = stream_name
+        self._audio_handler._camera_entity_id = camera_entity
+        self._audio_handler._reolink_entry_id = config.get(CONF_REOLINK_ENTRY_ID, "")
+        self._audio_handler._chime_delay = float(
+            config.get(CONF_CHIME_DELAY, DEFAULT_CHIME_DELAY)
+        )
+
+        cached_method = config.get(CONF_REOLINK_MIC_METHOD, "")
+        cached_url = config.get(CONF_REOLINK_MIC_URL, "")
+        self._audio_handler._cached_mic_method = cached_method
+        self._audio_handler._cached_mic_url = cached_url
+
+        from .const import (  # noqa: PLC0415
+            CONF_TAKEOVER_COOPERATIVE_YIELD,
+            CONF_TAKEOVER_YIELD_DURATION,
+            CONF_TAKEOVER_YIELD_INTERVAL,
+            DEFAULT_TAKEOVER_COOPERATIVE_YIELD,
+            DEFAULT_TAKEOVER_YIELD_DURATION,
+            DEFAULT_TAKEOVER_YIELD_INTERVAL,
+        )
+
+        self._audio_handler._cooperative_yield_enabled = config.get(
+            CONF_TAKEOVER_COOPERATIVE_YIELD, DEFAULT_TAKEOVER_COOPERATIVE_YIELD
+        )
+        self._audio_handler._cooperative_yield_interval = float(
+            config.get(CONF_TAKEOVER_YIELD_INTERVAL, DEFAULT_TAKEOVER_YIELD_INTERVAL)
+        )
+        self._audio_handler._cooperative_yield_duration_ms = int(
+            config.get(CONF_TAKEOVER_YIELD_DURATION, DEFAULT_TAKEOVER_YIELD_DURATION)
+        )
+
+    def _persist_discovered_mic_method(self, cached_method: str) -> None:
+        """Persist a newly discovered working mic input method for future sessions."""
+        if not self._audio_handler or not self._audio_handler._listen_active:
+            return
+
+        discovered_url = getattr(self._audio_handler, "_discovered_mic_url", "")
+        discovered_method = getattr(self._audio_handler, "_discovered_mic_method", "")
+        if discovered_method and discovered_method != cached_method:
+            new_options = dict(self.entry.options)
+            new_options[CONF_REOLINK_MIC_METHOD] = discovered_method
+            new_options[CONF_REOLINK_MIC_URL] = discovered_url
+            self.hass.config_entries.async_update_entry(self.entry, options=new_options)
+            _LOGGER.warning(
+                "Audio: cached discovered method='%s' for future sessions",
+                discovered_method,
+            )
+
+    async def _start_reolink_takeover_monitors(self, config: dict) -> None:
+        """Start takeover detection once microphone input is live."""
         from .reolink_audio import (  # noqa: PLC0415
             AudioInterruptDetector,
-            ReolinkAudioHandler,
             ReolinkTalkMonitor,
             get_reolink_config,
         )
@@ -716,6 +826,86 @@ class JeevesSessionManager:
             DEFAULT_TAKEOVER_ENERGY_THRESHOLD,
             DEFAULT_TAKEOVER_POLL_INTERVAL,
         )
+
+        # Method 1: Reolink API polling (GetTalkState)
+        use_reolink_api = config.get(CONF_TAKEOVER_REOLINK_API, True)
+        if use_reolink_api:
+            reolink_entry_id = config.get(CONF_REOLINK_ENTRY_ID, "")
+            if reolink_entry_id:
+                reolink_config = get_reolink_config(self.hass, reolink_entry_id)
+                if reolink_config and reolink_config.get("host"):
+                    poll_interval = config.get(
+                        CONF_TAKEOVER_POLL_INTERVAL,
+                        DEFAULT_TAKEOVER_POLL_INTERVAL,
+                    )
+                    self._talk_monitor = ReolinkTalkMonitor(
+                        hass=self.hass,
+                        host=reolink_config["host"],
+                        username=reolink_config["username"],
+                        password=reolink_config["password"],
+                        on_human_takeover=self._handle_human_takeover,
+                        poll_interval=poll_interval,
+                    )
+                    await self._talk_monitor.start()
+                    _LOGGER.info("Reolink talk monitor active (poll=%.1fs)", poll_interval)
+
+        # Method 2: Audio energy detection
+        use_audio_energy = config.get(CONF_TAKEOVER_AUDIO_ENERGY, False)
+        if use_audio_energy:
+            from .const import (  # noqa: PLC0415
+                CONF_TAKEOVER_ENERGY_THRESHOLD,
+            )
+
+            threshold = config.get(
+                CONF_TAKEOVER_ENERGY_THRESHOLD,
+                DEFAULT_TAKEOVER_ENERGY_THRESHOLD,
+            )
+            self._interrupt_detector = AudioInterruptDetector(
+                on_interrupt=self._handle_human_takeover,
+                energy_threshold=threshold,
+            )
+            self._interrupt_detector.start()
+            _LOGGER.info("Audio energy interrupt detector active (threshold=%d)", threshold)
+
+    async def _start_reolink_audio_background(
+        self,
+        config: dict,
+        *,
+        output_only: bool = False,
+        input_only: bool = False,
+    ) -> None:
+        """Background wrapper for Reolink audio setup (non-blocking startup)."""
+        try:
+            await self._start_reolink_audio(
+                config,
+                output_only=output_only,
+                input_only=input_only,
+            )
+        except Exception:
+            _LOGGER.exception("Reolink audio setup failed (background)")
+            # Session continues without 2-way audio — AI can still see via camera
+
+    async def _start_reolink_audio(
+        self,
+        config: dict,
+        skip_talk_monitor: bool = False,
+        *,
+        output_only: bool = False,
+        input_only: bool = False,
+    ) -> None:
+        """Start the Reolink 2-way audio handler via go2rtc.
+
+        Args:
+            config: Audio configuration dict.
+            skip_talk_monitor: If True, don't start the TalkMonitor (saves a session slot).
+                               Used during camera switching where human takeover detection
+                               isn't needed on secondary cameras.
+            output_only: If True, initialize only the speaker output path.
+            input_only: If True, enable only the microphone/takeover path on an
+                        already prepared speaker handler.
+        """
+        if output_only and input_only:
+            raise ValueError("output_only and input_only are mutually exclusive")
 
         stream_name = config.get(CONF_GO2RTC_STREAM_NAME, "")
         if not stream_name:
@@ -736,143 +926,29 @@ class JeevesSessionManager:
                 _LOGGER.warning("No go2rtc stream configured — Reolink audio disabled")
                 return
 
-        # Shared takeover callback
-        async def _on_human_takeover() -> None:
-            """Human started talking — stop AI session."""
-            _LOGGER.info("Human takeover detected — stopping AI session")
-            await self.async_stop_session("human takeover")
-
-        # Audio handler (always needed for Reolink mode)
-        self._mic_queue = asyncio.Queue(maxsize=256)
-        self._mic_forward_task = self.hass.async_create_task(self._mic_forward_loop())
-        mic_rx_count = 0
-        dropped_count = 0
-
-        async def _on_doorbell_audio(audio_bytes: bytes) -> None:
-            """Forward audio from doorbell mic to AI client."""
-            nonlocal mic_rx_count, dropped_count
-            mic_rx_count += 1
-            self._touch_audio_activity()
-            if self._interrupt_detector:
-                self._interrupt_detector.process_audio_frame(audio_bytes)
-            if mic_rx_count == 1:
-                _LOGGER.warning("✓ First microphone chunk received from doorbell (%d bytes)", len(audio_bytes))
-                # Diagnostic: compute RMS of first chunk to verify audio signal
-                import struct as _s
-                samples = _s.unpack(f"<{len(audio_bytes)//2}h", audio_bytes)
-                rms = (sum(s*s for s in samples) / len(samples)) ** 0.5
-                peak = max(abs(s) for s in samples)
-                _LOGGER.warning(
-                    "Audio diagnostic: RMS=%.1f, peak=%d, samples=%d (expect non-zero for valid audio)",
-                    rms, peak, len(samples),
-                )
-            elif mic_rx_count % 500 == 0:
-                _LOGGER.info("Microphone input received: %d chunks", mic_rx_count)
-
-            if self._mic_queue is None:
-                return
-
-            try:
-                self._mic_queue.put_nowait(audio_bytes)
-            except asyncio.QueueFull:
-                # Keep stream real-time by dropping oldest queued audio.
-                try:
-                    _ = self._mic_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
-                self._mic_queue.put_nowait(audio_bytes)
-                dropped_count += 1
-                if dropped_count <= 3 or dropped_count % 100 == 0:
-                    _LOGGER.warning("Mic queue overflow: dropped %d chunk(s)", dropped_count)
-
-        camera_entity = config.get(CONF_CAMERA_ENTITY, "")
-        self._audio_handler = ReolinkAudioHandler(
-            self.hass, stream_name,
-            on_audio_received=_on_doorbell_audio,
-            on_takeover=_on_human_takeover,
-        )
-        self._audio_handler._camera_entity_id = camera_entity
-        self._audio_handler._reolink_entry_id = config.get(CONF_REOLINK_ENTRY_ID, "")
-        self._audio_handler._chime_delay = float(
-            config.get(CONF_CHIME_DELAY, DEFAULT_CHIME_DELAY)
-        )
-        # Pass cached audio input method (probed during setup)
         cached_method = config.get(CONF_REOLINK_MIC_METHOD, "")
-        cached_url = config.get(CONF_REOLINK_MIC_URL, "")
+        if input_only and self._audio_handler is None:
+            _LOGGER.warning("No existing Reolink speaker handler — falling back to full audio startup")
+            input_only = False
 
-        self._audio_handler._cached_mic_method = cached_method
-        self._audio_handler._cached_mic_url = cached_url
-        # Cooperative yield settings
-        from .const import (  # noqa: PLC0415
-            CONF_TAKEOVER_COOPERATIVE_YIELD,
-            CONF_TAKEOVER_YIELD_DURATION,
-            CONF_TAKEOVER_YIELD_INTERVAL,
-            DEFAULT_TAKEOVER_COOPERATIVE_YIELD,
-            DEFAULT_TAKEOVER_YIELD_DURATION,
-            DEFAULT_TAKEOVER_YIELD_INTERVAL,
-        )
-        self._audio_handler._cooperative_yield_enabled = config.get(
-            CONF_TAKEOVER_COOPERATIVE_YIELD, DEFAULT_TAKEOVER_COOPERATIVE_YIELD
-        )
-        self._audio_handler._cooperative_yield_interval = float(config.get(
-            CONF_TAKEOVER_YIELD_INTERVAL, DEFAULT_TAKEOVER_YIELD_INTERVAL
-        ))
-        self._audio_handler._cooperative_yield_duration_ms = int(config.get(
-            CONF_TAKEOVER_YIELD_DURATION, DEFAULT_TAKEOVER_YIELD_DURATION
-        ))
-        await self._audio_handler.start()
+        self._configure_reolink_audio_handler(config, stream_name)
+
+        if output_only:
+            await self._audio_handler.start_output_only()
+            _LOGGER.info("Reolink speaker output active (stream=%s)", stream_name)
+            return
+
+        self._ensure_mic_forwarder()
+        if input_only:
+            await self._audio_handler.start_input_only()
+        else:
+            await self._audio_handler.start()
         _LOGGER.info("Reolink audio handler active (stream=%s)", stream_name)
 
-        # Save the discovered method for future sessions if it differs from cache
-        if self._audio_handler._listen_active:
-            discovered_url = getattr(self._audio_handler, "_discovered_mic_url", "")
-            discovered_method = getattr(self._audio_handler, "_discovered_mic_method", "")
-            if discovered_method and discovered_method != cached_method:
-                new_options = dict(self.entry.options)
-                new_options[CONF_REOLINK_MIC_METHOD] = discovered_method
-                new_options[CONF_REOLINK_MIC_URL] = discovered_url
-                self.hass.config_entries.async_update_entry(self.entry, options=new_options)
-                _LOGGER.warning(
-                    "Audio: cached discovered method='%s' for future sessions",
-                    discovered_method,
-                )
+        self._persist_discovered_mic_method(cached_method)
 
-        # --- Human Takeover Detection (both methods can run simultaneously) ---
-        # Skip on secondary cameras during switch (saves a session slot)
         if not skip_talk_monitor:
-            # Method 1: Reolink API polling (GetTalkState)
-            use_reolink_api = config.get(CONF_TAKEOVER_REOLINK_API, True)
-            if use_reolink_api:
-                reolink_entry_id = config.get(CONF_REOLINK_ENTRY_ID, "")
-                if reolink_entry_id:
-                    reolink_config = get_reolink_config(self.hass, reolink_entry_id)
-                    if reolink_config and reolink_config.get("host"):
-                        poll_interval = config.get(
-                            CONF_TAKEOVER_POLL_INTERVAL, DEFAULT_TAKEOVER_POLL_INTERVAL
-                        )
-                        self._talk_monitor = ReolinkTalkMonitor(
-                            hass=self.hass,
-                            host=reolink_config["host"],
-                            username=reolink_config["username"],
-                            password=reolink_config["password"],
-                            on_human_takeover=_on_human_takeover,
-                            poll_interval=poll_interval,
-                        )
-                        await self._talk_monitor.start()
-                        _LOGGER.info("Reolink talk monitor active (poll=%.1fs)", poll_interval)
-
-            # Method 2: Audio energy detection
-            use_audio_energy = config.get(CONF_TAKEOVER_AUDIO_ENERGY, False)
-            if use_audio_energy:
-                threshold = config.get(
-                    CONF_TAKEOVER_ENERGY_THRESHOLD, DEFAULT_TAKEOVER_ENERGY_THRESHOLD
-                )
-                self._interrupt_detector = AudioInterruptDetector(
-                    on_interrupt=_on_human_takeover,
-                    energy_threshold=threshold,
-                )
-                self._interrupt_detector.start()
-                _LOGGER.info("Audio energy interrupt detector active (threshold=%d)", threshold)
+            await self._start_reolink_takeover_monitors(config)
         else:
             _LOGGER.info("Skipping talk monitor on switched camera (saves session slot)")
 
@@ -1820,8 +1896,10 @@ class JeevesSessionManager:
 
         reolink_mode = config.get(CONF_AUDIO_MODE) == AUDIO_MODE_REOLINK
         if reolink_mode:
-            _LOGGER.warning("Starting Reolink audio after greeting turn completed")
-            audio_task = asyncio.create_task(self._start_reolink_audio_background(config))
+            _LOGGER.warning("Starting Reolink microphone/takeover monitoring after greeting turn completed")
+            audio_task = asyncio.create_task(
+                self._start_reolink_audio_background(config, input_only=True)
+            )
             try:
                 await asyncio.wait_for(asyncio.shield(audio_task), timeout=35.0)
             except asyncio.TimeoutError:

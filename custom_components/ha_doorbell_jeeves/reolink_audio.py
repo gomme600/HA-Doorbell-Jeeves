@@ -517,16 +517,55 @@ class ReolinkAudioHandler:
 
         Audio output always uses Baichuan talk (CMD 201/202).
         """
-        if self._active:
+        if self._active and self._listen_active and self.output_pipeline_ready:
             return
 
-        # Get Reolink connection details for direct camera access
-        await self._discover_reolink_details()
+        if not self._active:
+            # Get Reolink connection details for direct camera access
+            await self._discover_reolink_details()
+            self._active = True
 
-        self._active = True
+        if not self.output_pipeline_ready:
+            # --- SPEAKER OUTPUT FIRST (fast path, ~1s) ---
+            await self._start_output_pipeline(enable_input=True)
 
-        # --- SPEAKER OUTPUT FIRST (fast path, ~1s) ---
-        await self._start_output_pipeline()
+        await self._start_input_pipeline()
+        _LOGGER.warning(
+            "Reolink audio handler started (host=%s, baichuan=%s, mic_input=%s)",
+            self._reolink_host,
+            "connected" if self._baichuan else "failed",
+            "active" if self._listen_active else "disabled",
+        )
+
+    async def start_output_only(self) -> None:
+        """Start only the speaker output pipeline; keep microphone input deferred."""
+        if not self._active:
+            await self._discover_reolink_details()
+            self._active = True
+        if self.output_pipeline_ready:
+            return
+        await self._start_output_pipeline(enable_input=False)
+        _LOGGER.warning(
+            "Reolink audio output ready (host=%s, mic_input=deferred)",
+            self._reolink_host,
+        )
+
+    async def start_input_only(self) -> None:
+        """Start only the microphone input pipeline on an existing handler."""
+        if not self._active:
+            await self._discover_reolink_details()
+            self._active = True
+        await self._start_input_pipeline()
+        _LOGGER.warning(
+            "Reolink audio input ready (host=%s, mic_input=%s)",
+            self._reolink_host,
+            "active" if self._listen_active else "disabled",
+        )
+
+    async def _start_input_pipeline(self) -> None:
+        """Start microphone input using the cached method or fallback probes."""
+        if self._listen_active:
+            return
 
         # --- Audio INPUT: use cached method or probe ---
         cached_method = getattr(self, "_cached_mic_method", "") or ""
@@ -609,13 +648,6 @@ class ReolinkAudioHandler:
                             )
                         else:
                             _LOGGER.warning("Audio input: ALL methods failed — mic disabled")
-
-        _LOGGER.warning(
-            "Reolink audio handler started (host=%s, baichuan=%s, mic_input=%s)",
-            self._reolink_host,
-            "connected" if self._baichuan else "failed",
-            "active" if self._listen_active else "disabled",
-        )
 
     async def _discover_reolink_details(self) -> None:
         """Get Reolink camera connection details from HA's Reolink integration.
@@ -1328,7 +1360,7 @@ class ReolinkAudioHandler:
         if self._send_count == 1:
             _LOGGER.warning("First audio data received from AI (%d bytes)", len(pcm_bytes))
 
-    async def _start_output_pipeline(self) -> None:
+    async def _start_output_pipeline(self, enable_input: bool = True) -> None:
         """Start the Baichuan talk session and audio output loop.
 
         Uses a DEDICATED Baichuan connection (separate from Preview stream)
@@ -1352,14 +1384,17 @@ class ReolinkAudioHandler:
         # reolink_aio may clear _connection after commands complete, so we must
         # grab it NOW before any further operations.
         fdx_hooked = False
-        try:
-            fdx_hooked = self._install_talk_data_received_hook()
-            if fdx_hooked:
-                _LOGGER.warning("✓ FDX data_received hook installed (pre-talk)")
-            else:
-                _LOGGER.warning("FDX pre-talk hook failed — will retry after talk start")
-        except Exception as exc:
-            _LOGGER.warning("FDX pre-talk hook exception: %s", exc)
+        if enable_input:
+            try:
+                fdx_hooked = self._install_talk_data_received_hook()
+                if fdx_hooked:
+                    _LOGGER.warning("✓ FDX data_received hook installed (pre-talk)")
+                else:
+                    _LOGGER.warning("FDX pre-talk hook failed — will retry after talk start")
+            except Exception as exc:
+                _LOGGER.warning("FDX pre-talk hook exception: %s", exc)
+        else:
+            _LOGGER.warning("Output-only start: skipping FDX microphone hook until greeting completes")
 
         # Query TalkAbility to get audio parameters
         ability = await self._query_talk_ability()
@@ -1374,7 +1409,7 @@ class ReolinkAudioHandler:
         )
 
         # Mark FDX as active if hook succeeded and duplex is FDX
-        if fdx_hooked and ability.get("duplex") == "FDX":
+        if enable_input and fdx_hooked and ability.get("duplex") == "FDX":
             if not self._aac_queue:
                 self._aac_queue = asyncio.Queue(maxsize=200)
             if not self._aac_decoder_task or self._aac_decoder_task.done():
@@ -1383,7 +1418,7 @@ class ReolinkAudioHandler:
             _LOGGER.warning("✓ FDX audio pipeline active — continuous mic audio enabled")
 
         # If FDX hook failed, start raw TCP mic stream as ultimate fallback
-        if not self._baichuan_audio_input_active and ability.get("duplex") == "FDX":
+        if enable_input and not self._baichuan_audio_input_active and ability.get("duplex") == "FDX":
             _LOGGER.warning("Starting raw TCP mic stream (FDX hook unavailable)")
             self._raw_mic_task = asyncio.create_task(
                 self._raw_tcp_mic_stream(ability)
