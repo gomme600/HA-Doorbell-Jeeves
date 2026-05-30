@@ -167,6 +167,38 @@ def test_async_initialize_prewarms_shared_gemini_client(monkeypatch: Any) -> Non
     asyncio.run(_run())
 
 
+def test_handle_model_turn_complete_starts_media_once() -> None:
+    async def _run() -> None:
+        manager = JeevesSessionManager.__new__(JeevesSessionManager)
+        manager._startup_media_pending = True
+        manager._startup_media_camera_entity = "camera.entree"
+        manager._startup_media_config = {"audio_mode": "reolink"}
+
+        scheduled: list[asyncio.Future[Any] | asyncio.Task[Any] | Any] = []
+        calls: list[tuple[str, dict[str, Any]]] = []
+
+        async def _fake_start(camera_entity: str, config: dict[str, Any]) -> None:
+            calls.append((camera_entity, config))
+
+        manager._start_session_media = _fake_start
+        manager.hass = SimpleNamespace(
+            async_create_task=lambda coro: scheduled.append(coro) or coro
+        )
+
+        manager._handle_model_turn_complete(1)
+
+        assert manager._startup_media_pending is False
+        assert manager._startup_media_camera_entity == ""
+        assert manager._startup_media_config is None
+        assert len(scheduled) == 1
+
+        await scheduled[0]
+
+        assert calls == [("camera.entree", {"audio_mode": "reolink"})]
+
+    asyncio.run(_run())
+
+
 def test_resolve_camera_entity_falls_back_to_managed_camera() -> None:
     manager = JeevesSessionManager.__new__(JeevesSessionManager)
     manager._config = {}

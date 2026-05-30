@@ -115,7 +115,8 @@ def test_gemini_connect_uses_prewarmed_shared_client(monkeypatch: Any) -> None:
         assert len(_FakeGenAIClient.instances) == 1
         assert len(shared.aio.live.connect_calls) == 2
         actual_session = shared.aio.live.connect_calls[1][3]
-        assert actual_session.realtime_input_calls == [{"text": "hello"}]
+        assert actual_session.client_content_calls
+        assert actual_session.client_content_calls[0][1] is True
 
         await client.disconnect()
 

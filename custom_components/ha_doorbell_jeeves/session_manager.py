@@ -180,6 +180,9 @@ class JeevesSessionManager:
         self._monitor_task: asyncio.Task[None] | None = None
         self._last_model_activity: float = 0.0  # time of last model turn completion
         self._monitor_interval: float = 12.0  # seconds between proactive checks
+        self._startup_media_pending: bool = False
+        self._startup_media_camera_entity: str = ""
+        self._startup_media_config: dict[str, Any] | None = None
 
     def _normalize_manual_audio_config(self) -> None:
         """Backfill split go2rtc stream keys from the legacy single stream key."""
@@ -544,8 +547,7 @@ class JeevesSessionManager:
             greeting_text = (
                 "[SYSTEM] A visitor just rang the doorbell. "
                 "START SPEAKING YOUR GREETING IMMEDIATELY — do NOT call any tools first. "
-                "A camera frame is being sent to you right now — use it to identify the visitor "
-                "if you recognize them, but do NOT wait or call view_camera. "
+                "Do NOT wait for vision or call view_camera before greeting. "
                 "Just greet them warmly and ask how you can help. "
                 "Do NOT tell the visitor you are notifying anyone. "
                 "Speak now."
@@ -566,26 +568,12 @@ class JeevesSessionManager:
             self._greeting_phase = True
             self._notify_after_greeting = True
             self._ai_last_output_time = time.time() + 8.0  # Pre-close echo gate
-
-            # Start audio setup in background (model is already generating greeting)
-            reolink_mode = config.get(CONF_AUDIO_MODE) == AUDIO_MODE_REOLINK
-
-            if reolink_mode:
-                _LOGGER.warning("Starting Reolink audio (model already generating greeting)")
-                audio_task = asyncio.create_task(self._start_reolink_audio_background(config))
-                try:
-                    await asyncio.wait_for(asyncio.shield(audio_task), timeout=35.0)
-                except asyncio.TimeoutError:
-                    _LOGGER.error("Audio setup timed out after 35s")
-            else:
-                _LOGGER.warning("Audio mode is '%s' (not reolink)", config.get(CONF_AUDIO_MODE))
-
-            # Start vision loop — send frames to AI for visual context
-            fps = config.get(CONF_VISION_FPS, DEFAULT_VISION_FPS)
-            if not camera_entity:
-                camera_entity = self._resolve_camera_entity(config.get(CONF_CAMERA_ENTITY, ""))
-            if camera_entity:
-                self._vision_task = asyncio.create_task(self._vision_loop(camera_entity, fps))
+            self._startup_media_pending = True
+            self._startup_media_camera_entity = camera_entity
+            self._startup_media_config = dict(config)
+            _LOGGER.warning(
+                "Deferring live audio/vision startup until greeting turn completes"
+            )
 
             if self._tool_router:
                 self._tool_router.start()
@@ -600,9 +588,6 @@ class JeevesSessionManager:
             silence_timeout = float(config.get(CONF_SILENCE_TIMEOUT, DEFAULT_SILENCE_TIMEOUT))
             if silence_timeout > 0:
                 self._silence_task = asyncio.create_task(self._silence_watchdog(silence_timeout))
-
-            # Start proactive monitoring loop (gives model agency to act without visitor speech)
-            self._monitor_task = asyncio.create_task(self._proactive_monitor_loop())
 
             self._register_stop_triggers()
 
@@ -630,6 +615,9 @@ class JeevesSessionManager:
         self._active = False
         self._starting = False
         self._session_end_reason = reason
+        self._startup_media_pending = False
+        self._startup_media_camera_entity = ""
+        self._startup_media_config = None
 
         for unsub in self._stop_unsubs:
             unsub()
@@ -1796,6 +1784,7 @@ class JeevesSessionManager:
             on_tool_call=self._handle_tool_call,
             on_session_end=self._handle_session_end,
             on_transcript=self._handle_transcript,
+            on_turn_complete=self._handle_model_turn_complete,
         )
 
     async def _create_openai_client(self, api_key: str, model: str, prompt: str,
@@ -1811,6 +1800,42 @@ class JeevesSessionManager:
             on_session_end=self._handle_session_end,
             on_transcript=self._handle_transcript,
         )
+
+    def _handle_model_turn_complete(self, turn_count: int) -> None:
+        """Start live audio/vision only after the initial greeting turn finishes."""
+        if turn_count != 1 or not self._startup_media_pending:
+            return
+        self._startup_media_pending = False
+        camera_entity = self._startup_media_camera_entity
+        config = dict(self._startup_media_config or self._config)
+        self._startup_media_camera_entity = ""
+        self._startup_media_config = None
+        self.hass.async_create_task(self._start_session_media(camera_entity, config))
+
+    async def _start_session_media(self, camera_entity: str, config: dict[str, Any]) -> None:
+        """Start microphone/vision pipelines after the greeting turn completes."""
+        if not self._active or not self._client or not self._client.connected:
+            return
+
+        reolink_mode = config.get(CONF_AUDIO_MODE) == AUDIO_MODE_REOLINK
+        if reolink_mode:
+            _LOGGER.warning("Starting Reolink audio after greeting turn completed")
+            audio_task = asyncio.create_task(self._start_reolink_audio_background(config))
+            try:
+                await asyncio.wait_for(asyncio.shield(audio_task), timeout=35.0)
+            except asyncio.TimeoutError:
+                _LOGGER.error("Audio setup timed out after 35s")
+        else:
+            _LOGGER.warning("Audio mode is '%s' (not reolink)", config.get(CONF_AUDIO_MODE))
+
+        fps = config.get(CONF_VISION_FPS, DEFAULT_VISION_FPS)
+        if not camera_entity:
+            camera_entity = self._resolve_camera_entity(config.get(CONF_CAMERA_ENTITY, ""))
+        if camera_entity and (not self._vision_task or self._vision_task.done()):
+            self._vision_task = asyncio.create_task(self._vision_loop(camera_entity, fps))
+
+        if not self._monitor_task or self._monitor_task.done():
+            self._monitor_task = asyncio.create_task(self._proactive_monitor_loop())
 
     # ─── Callbacks ────────────────────────────────────────────────────────────
 

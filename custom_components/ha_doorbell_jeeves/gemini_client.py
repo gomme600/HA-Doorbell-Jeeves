@@ -39,6 +39,7 @@ class GeminiLiveClient(BaseRealtimeClient):
         on_tool_call: Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]],
         on_session_end: Callable[[], None],
         on_transcript: Callable[[str, str], None],
+        on_turn_complete: Callable[[int], None] | None = None,
     ) -> None:
         self._api_key = api_key
         self._model = model
@@ -50,6 +51,7 @@ class GeminiLiveClient(BaseRealtimeClient):
         self._on_tool_call = on_tool_call
         self._on_session_end = on_session_end
         self._on_transcript = on_transcript
+        self._on_turn_complete = on_turn_complete
 
         self._client: genai.Client | None = None
         self._session: Any = None
@@ -176,14 +178,16 @@ class GeminiLiveClient(BaseRealtimeClient):
         # Prefill static reference images before live turn-taking begins.
         await self._inject_reference_images()
 
-        # Start receiving BEFORE the first live prompt so the initial greeting
-        # follows the same pattern as reconnects: the receive loop is already
-        # actively draining server events when generation starts.
+        # Start receiving BEFORE the first greeting so the initial turn is
+        # drained immediately once generation begins.
         self._receive_task = asyncio.create_task(self._receive_loop())
 
         if greeting_text:
             self._model_generating = True
-            await self._session.send_realtime_input(text=greeting_text)
+            await self._session.send_client_content(
+                turns=[types.Content(role="user", parts=[types.Part(text=greeting_text)])],
+                turn_complete=True,
+            )
             _LOGGER.warning(
                 "Gemini connected + greeting sent at T+%.1f",
                 time.time() - self._connect_time,
@@ -224,11 +228,14 @@ class GeminiLiveClient(BaseRealtimeClient):
                 # Trigger a fresh greeting instead of "wait silently".
                 # This makes the 1008 recovery seamless for the user.
                 self._model_generating = True
-                await self._session.send_realtime_input(text=(
-                    "[SYSTEM] A visitor is at the door. "
-                    "Greet them briefly and warmly. Ask how you can help. "
-                    "Do NOT call any tools. Speak now."
-                ))
+                await self._session.send_client_content(
+                    turns=[types.Content(role="user", parts=[types.Part(text=(
+                        "[SYSTEM] A visitor is at the door. "
+                        "Greet them briefly and warmly. Ask how you can help. "
+                        "Do NOT call any tools. Speak now."
+                    ))])],
+                    turn_complete=True,
+                )
                 self._startup_grace_until = time.time() + 5.0
                 _LOGGER.warning("Gemini reconnected at turns=0 — re-triggering greeting")
             else:
@@ -594,6 +601,11 @@ class GeminiLiveClient(BaseRealtimeClient):
                 if saw_message:
                     turns_completed += 1
                     consecutive_empty_iters = 0
+                    if self._on_turn_complete:
+                        try:
+                            self._on_turn_complete(turns_completed)
+                        except Exception:
+                            _LOGGER.debug("Gemini on_turn_complete callback failed", exc_info=True)
                     _LOGGER.warning("Gemini turn %d completed, re-entering receive() — waiting for speech", turns_completed)
                     continue
 
