@@ -189,6 +189,9 @@ def test_handle_model_turn_complete_starts_media_once() -> None:
         async def _fake_notify() -> None:
             calls.append("notify")
 
+        async def _fake_enable_tools() -> None:
+            calls.append("tools")
+
         async def _fake_inject_refs() -> None:
             calls.append("refs")
 
@@ -196,6 +199,7 @@ def test_handle_model_turn_complete_starts_media_once() -> None:
         manager._post_greeting_notify = _fake_notify
         manager._client = SimpleNamespace(
             connected=True,
+            enable_deferred_tools_after_greeting=_fake_enable_tools,
             inject_pending_reference_images=_fake_inject_refs,
         )
         manager.hass = SimpleNamespace(
@@ -214,6 +218,7 @@ def test_handle_model_turn_complete_starts_media_once() -> None:
         await scheduled[0]
 
         assert calls == [
+            "tools",
             "refs",
             "media:camera.entree:reolink",
             "notify",

@@ -1862,6 +1862,7 @@ class JeevesSessionManager:
             on_session_end=self._handle_session_end,
             on_transcript=self._handle_transcript,
             on_turn_complete=self._handle_model_turn_complete,
+            defer_tools_until_turn_one=True,
         )
 
     async def _create_openai_client(self, api_key: str, model: str, prompt: str,
@@ -1908,6 +1909,7 @@ class JeevesSessionManager:
     ) -> None:
         """Complete all deferred startup work once greeting turn 1 has ended."""
         if self._client and self._client.connected:
+            await self._client.enable_deferred_tools_after_greeting()
             await self._client.inject_pending_reference_images()
         await self._start_session_media(camera_entity, config)
         if notify_after_greeting:

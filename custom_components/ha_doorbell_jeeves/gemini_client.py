@@ -55,11 +55,13 @@ class GeminiLiveClient(BaseRealtimeClient):
         on_session_end: Callable[[], None],
         on_transcript: Callable[[str, str], None],
         on_turn_complete: Callable[[int], None] | None = None,
+        defer_tools_until_turn_one: bool = False,
     ) -> None:
         self._api_key = api_key
         self._model = model
         self._system_prompt = system_prompt
-        self._tools = tools
+        self._deferred_tools = tools if defer_tools_until_turn_one else []
+        self._tools = [] if defer_tools_until_turn_one else tools
         self._voice = voice
         self._reference_images = reference_images
         self._on_audio_output = on_audio_output
@@ -260,6 +262,18 @@ class GeminiLiveClient(BaseRealtimeClient):
         if self._receive_task and not self._receive_task.done():
             return
         self._receive_task = asyncio.create_task(self._receive_loop())
+
+    async def enable_deferred_tools_after_greeting(self) -> None:
+        """Reconnect once with the full tool list after the first greeting turn."""
+        if not self._deferred_tools or self._tools:
+            return
+        self._tools = self._deferred_tools
+        self._deferred_tools = []
+        self._live_config = self._build_live_config()
+        if not self._connected or not self._session:
+            return
+        _LOGGER.warning("Enabling Gemini tools after greeting turn via reconnect")
+        await self._reconnect_session(turns_completed=1)
 
     async def _reconnect_session(self, turns_completed: int = -1) -> bool:
         """Tear down current session and open a new one (same config). Returns True on success."""

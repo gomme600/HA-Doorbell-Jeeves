@@ -62,18 +62,19 @@ class _FakeGenAIClient:
         _FakeGenAIClient.instances.append(self)
 
 
-def _build_client() -> GeminiLiveClient:
+def _build_client(*, tools: list[Any] | None = None, defer_tools_until_turn_one: bool = False) -> GeminiLiveClient:
     return GeminiLiveClient(
         api_key="k",
         model="gemini-test-model",
         system_prompt="prompt",
-        tools=[],
+        tools=tools or [],
         voice="Puck",
         reference_images=[],
         on_audio_output=lambda _audio: None,
         on_tool_call=lambda _name, _args: asyncio.sleep(0, result={"success": True}),
         on_session_end=lambda: None,
         on_transcript=lambda _role, _text: None,
+        defer_tools_until_turn_one=defer_tools_until_turn_one,
     )
 
 
@@ -193,5 +194,39 @@ def test_view_camera_fails_safely_when_parts_unsupported(monkeypatch: Any) -> No
         assert "parts" not in captured_kwargs[0]
         assert "too old to support inline tool image parts" in captured_kwargs[0]["response"]["error"]
         assert session.tool_response_calls == [[captured_kwargs[0]]]
+
+    asyncio.run(_run())
+
+
+def test_enable_deferred_tools_after_greeting_reconnects_once() -> None:
+    async def _run() -> None:
+        reconnect_turns: list[int] = []
+        fake_tool = gc_module.types.Tool(
+            function_declarations=[
+                gc_module.types.FunctionDeclaration(
+                    name="noop_tool",
+                    description="test tool",
+                )
+            ]
+        )
+        client = _build_client(
+            tools=[fake_tool],
+            defer_tools_until_turn_one=True,
+        )
+        client._connected = True
+        client._session = object()
+
+        async def _fake_reconnect(*, turns_completed: int = -1) -> bool:
+            reconnect_turns.append(turns_completed)
+            return True
+
+        client._reconnect_session = _fake_reconnect  # type: ignore[method-assign]
+
+        assert client._tools == []
+
+        await client.enable_deferred_tools_after_greeting()
+
+        assert client._tools == [fake_tool]
+        assert reconnect_turns == [1]
 
     asyncio.run(_run())
