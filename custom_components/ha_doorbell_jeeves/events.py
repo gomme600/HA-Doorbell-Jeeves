@@ -98,7 +98,58 @@ class EventStore:
         payload["entry_id"] = self._entry_id
         self._hass.bus.async_fire(EVENT_IMPORTANT, payload)
         _LOGGER.info("Stored important event: %s (%s)", event.title, event.id)
+
+        # Auto-notify configured devices
+        await self._auto_notify_event(event)
+
         return event.id
+
+    async def _auto_notify_event(self, event: ImportantEvent) -> None:
+        """Send notification to configured event_notify_targets."""
+        from .const import CONF_EVENT_NOTIFY_TARGETS  # noqa: PLC0415
+
+        # Get config from the integration entry
+        entry_data = {}
+        if hasattr(self._hass, "config_entries"):
+            entry = self._hass.config_entries.async_get_entry(self._entry_id)
+            if entry:
+                entry_data = dict(entry.options) if entry.options else dict(entry.data)
+
+        targets = entry_data.get(CONF_EVENT_NOTIFY_TARGETS, [])
+        if not targets:
+            return
+
+        severity_emoji = {"urgent": "🚨", "warning": "⚠️", "info": "📋"}.get(event.severity, "📋")
+        message = f"{severity_emoji} {event.title}\n{event.description[:300]}"
+        title = f"🔔 Jeeves: {event.severity.upper()} Event"
+
+        for target in targets:
+            try:
+                # target can be "notify.mobile_app_xxx" or just "mobile_app_xxx"
+                service_str = target if isinstance(target, str) else str(target)
+                if "." in service_str:
+                    domain, svc = service_str.split(".", 1)
+                else:
+                    domain, svc = "notify", service_str
+                await self._hass.services.async_call(
+                    domain, svc,
+                    {
+                        "message": message,
+                        "title": title,
+                        "data": {
+                            "push": {
+                                "interruption-level": (
+                                    "critical" if event.severity == "urgent"
+                                    else "time-sensitive" if event.severity == "warning"
+                                    else "active"
+                                ),
+                            },
+                        },
+                    },
+                    blocking=False,
+                )
+            except Exception:
+                _LOGGER.debug("Auto-notify failed for target %s", target)
 
     async def async_attach_photo(self, event_id: str, photo_b64: str) -> bool:
         """Attach a photo to an existing event."""

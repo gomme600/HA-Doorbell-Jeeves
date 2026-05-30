@@ -204,8 +204,11 @@ def test_execute_save_event_falls_back_to_available_manager_and_fires_entry_even
 
 def test_execute_view_camera_returns_labeled_image_context(hass: object, monkeypatch: Any) -> None:
     async def _run() -> None:
+        # Use data large enough to pass size check (>1000 bytes)
+        fake_jpeg = b"\xff\xd8\xff\xe0" + b"\x42" * 2000 + b"\xff\xd9"
+
         async def _fake_get_image(_hass: object, _camera_id: str, timeout: int = 8) -> Any:
-            return SimpleNamespace(content=b"not-a-real-jpeg")
+            return SimpleNamespace(content=fake_jpeg)
 
         def _fake_process_frame(
             image_bytes: bytes,
@@ -239,7 +242,7 @@ def test_execute_view_camera_returns_labeled_image_context(hass: object, monkeyp
         assert result["success"] is True
         assert result["camera_entity_id"] == "camera.carport"
         assert "_image_base64" in result
-        assert "Camera entity: camera.carport" in result["_image_context"]
-        assert "do not infer it" in result["_image_context"]
+        assert "camera.carport" in result["_image_context"]
+        assert "Carport" in result["_image_context"]
 
     asyncio.run(_run())

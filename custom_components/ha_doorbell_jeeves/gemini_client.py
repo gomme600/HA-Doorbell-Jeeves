@@ -918,18 +918,34 @@ class GeminiLiveClient(BaseRealtimeClient):
                     self._stop_keepalive()
                     return
 
-                # Inject the tool image AFTER the tool response via realtime media
-                # (FunctionResponsePart.from_bytes causes JSON serialization failures)
+                # Inject the tool image AFTER the tool response via send_client_content.
+                # Using inline_data in a Content part puts the image into conversation
+                # context so the model can actually analyze it. send_realtime_input(media=...)
+                # only goes to the transient video buffer and causes hallucinations.
                 if pending_image_for_injection and self._session and self._connected:
                     img_b64, img_mime = pending_image_for_injection
                     try:
                         img_bytes = base64.b64decode(img_b64)
-                        await self._session.send_realtime_input(
-                            media=types.Blob(data=img_bytes, mime_type=img_mime)
+                        image_part = types.Part(
+                            inline_data=types.Blob(data=img_bytes, mime_type=img_mime)
                         )
-                        _LOGGER.warning("Tool image injected via realtime_input (%d bytes)", len(img_bytes))
+                        await self._session.send_client_content(
+                            turns=[types.Content(
+                                role="user",
+                                parts=[
+                                    types.Part(text=(
+                                        "[SYSTEM] The image below was captured by the requested camera. "
+                                        "Analyze THIS image to answer the user's question. "
+                                        "Describe ONLY what you actually see in this specific image."
+                                    )),
+                                    image_part,
+                                ],
+                            )],
+                            turn_complete=False,
+                        )
+                        _LOGGER.warning("Tool image injected via send_client_content (%d bytes)", len(img_bytes))
                     except Exception:
-                        _LOGGER.exception("Failed to inject tool image via realtime_input")
+                        _LOGGER.exception("Failed to inject tool image via send_client_content")
             else:
                 # Session gone — clear pending state
                 self._tool_call_pending = False

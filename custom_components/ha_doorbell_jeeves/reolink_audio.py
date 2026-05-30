@@ -415,12 +415,12 @@ class ReolinkAudioHandler:
         """
         import struct as _struct  # noqa: PLC0415
 
-        TARGET_RMS = 5000.0    # Target RMS for Gemini VAD
-        MAX_GAIN = 150.0       # Maximum gain (reduced to prevent noise boost)
+        TARGET_RMS = 6000.0    # Target RMS for Gemini VAD (higher = better recognition)
+        MAX_GAIN = 250.0       # Maximum gain (higher to handle distant/quiet speakers)
         MIN_GAIN = 1.0         # Never attenuate
-        NOISE_GATE_RMS = 40.0  # Below this RMS, consider it silence/noise
-        ATTACK_COEFF = 0.3     # Fast attack (quickly raise gain for speech)
-        RELEASE_COEFF = 0.05   # Slow release (gradually reduce gain after speech)
+        NOISE_GATE_RMS = 25.0  # Below this RMS, consider it silence/noise (lower = more sensitive)
+        ATTACK_COEFF = 0.4     # Fast attack (quickly raise gain for speech)
+        RELEASE_COEFF = 0.03   # Slower release (hold gain longer after speech ends)
 
         n_samples = len(pcm_data) // 2
         if n_samples == 0:

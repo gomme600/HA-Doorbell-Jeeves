@@ -173,11 +173,11 @@ def test_tool_response_omits_parts_kwarg_when_no_image(monkeypatch: Any) -> None
     asyncio.run(_run())
 
 
-def test_view_camera_injects_image_via_realtime_input(monkeypatch: Any) -> None:
-    """Test that view_camera tool images are injected via send_realtime_input after tool response."""
+def test_view_camera_injects_image_via_client_content(monkeypatch: Any) -> None:
+    """Test that view_camera tool images are injected via send_client_content after tool response."""
     async def _run() -> None:
         captured_kwargs: list[dict[str, Any]] = []
-        realtime_calls: list[dict[str, Any]] = []
+        client_content_calls: list[dict[str, Any]] = []
 
         def _fake_function_response(**kwargs: Any) -> dict[str, Any]:
             captured_kwargs.append(kwargs)
@@ -185,11 +185,10 @@ def test_view_camera_injects_image_via_realtime_input(monkeypatch: Any) -> None:
 
         client = _build_client()
         session = _FakeSession()
-        # Track send_realtime_input calls
-        original_send = session.send_realtime_input
-        async def _track_realtime(**kwargs: Any) -> None:
-            realtime_calls.append(kwargs)
-        session.send_realtime_input = _track_realtime
+        # Track send_client_content calls
+        async def _track_client_content(**kwargs: Any) -> None:
+            client_content_calls.append(kwargs)
+        session.send_client_content = _track_client_content
 
         client._session = session
         client._connected = True
@@ -209,9 +208,9 @@ def test_view_camera_injects_image_via_realtime_input(monkeypatch: Any) -> None:
         # Tool response should NOT contain parts (no image in response)
         assert len(captured_kwargs) == 1
         assert "parts" not in captured_kwargs[0]
-        # Image should have been injected via realtime_input
-        assert len(realtime_calls) == 1
-        assert "media" in realtime_calls[0]
+        # Image should have been injected via send_client_content
+        assert len(client_content_calls) == 1
+        assert "turns" in client_content_calls[0]
 
     asyncio.run(_run())
 

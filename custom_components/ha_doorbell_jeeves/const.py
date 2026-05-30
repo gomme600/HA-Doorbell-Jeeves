@@ -37,6 +37,7 @@ CONF_FRAME_MAX_HEIGHT = "frame_max_height"
 CONF_FRAME_QUALITY = "frame_quality"
 CONF_SESSION_TIMEOUT = "session_timeout"
 CONF_SILENCE_TIMEOUT = "silence_timeout"
+CONF_HANG_TIMEOUT = "hang_timeout"
 CONF_CHIME_DELAY = "chime_delay"
 CONF_MEMORY_RETENTION_DAYS = "memory_retention_days"
 CONF_LLMVISION_TIMELINE_ENABLED = "llmvision_timeline_enabled"
@@ -53,6 +54,7 @@ CONF_MAX_SESSION_TIMEOUT = "max_session_timeout"
 # Entity & Action management (stored in .storage, not config entry)
 CONF_MANAGED_ENTITIES = "managed_entities"
 CONF_NOTIFICATION_TARGETS = "notification_targets"
+CONF_EVENT_NOTIFY_TARGETS = "event_notify_targets"  # Auto-notify devices when events are added
 GLOBAL_ACTIONS_ENTITY_ID = "_global_actions_"
 GLOBAL_ACTIONS_ENTITY_NAME = "Automation Actions"
 
@@ -128,6 +130,7 @@ DEFAULT_VISION_FPS = 1.0
 DEFAULT_SESSION_TIMEOUT = 120
 DEFAULT_MAX_SESSION_TIMEOUT = 600  # 10 minutes max
 DEFAULT_SILENCE_TIMEOUT = 30.0
+DEFAULT_HANG_TIMEOUT = 10.0
 DEFAULT_CHIME_DELAY = 3.0
 DEFAULT_MEMORY_RETENTION_DAYS = 30
 DEFAULT_AUDIO_MANUAL_MODE = AUDIO_MANUAL_EXTERNAL_GO2RTC

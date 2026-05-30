@@ -45,6 +45,7 @@ from .const import (
     CONF_REOLINK_MIC_URL,
     CONF_SESSION_TIMEOUT,
     CONF_SILENCE_TIMEOUT,
+    CONF_HANG_TIMEOUT,
     CONF_STOP_ENTITIES,
     CONF_STOP_ENTITY_STATES,
     CONF_STOP_EVENTS,
@@ -64,6 +65,7 @@ from .const import (
     DEFAULT_FRAME_MAX_HEIGHT,
     DEFAULT_FRAME_MAX_WIDTH,
     DEFAULT_FRAME_QUALITY,
+    DEFAULT_HANG_TIMEOUT,
     DEFAULT_MAX_SESSION_TIMEOUT,
     DEFAULT_MEMORY_RETENTION_DAYS,
     DEFAULT_MODEL_GEMINI,
@@ -181,6 +183,8 @@ class JeevesSessionManager:
         # Proactive monitoring: periodic turn injection so the model can act autonomously
         self._monitor_task: asyncio.Task[None] | None = None
         self._last_model_activity: float = 0.0  # time of last model turn completion
+        self._last_user_input_time: float = 0.0  # time of last user speech/input
+        self._hang_watchdog_task: asyncio.Task[None] | None = None
         self._monitor_interval: float = 12.0  # seconds between proactive checks
         self._startup_media_pending: bool = False
         self._startup_media_camera_entity: str = ""
@@ -606,6 +610,9 @@ class JeevesSessionManager:
             if silence_timeout > 0:
                 self._silence_task = asyncio.create_task(self._silence_watchdog(silence_timeout))
 
+            # Start hang detection watchdog
+            self._hang_watchdog_task = asyncio.create_task(self._hang_watchdog())
+
             self._register_stop_triggers()
 
             self.hass.bus.async_fire(EVENT_SESSION_STARTED, {"entry_id": self.entry.entry_id})
@@ -662,6 +669,7 @@ class JeevesSessionManager:
             self._timeout_task,
             self._silence_task,
             self._ai_speaking_clear_task,
+            self._hang_watchdog_task,
         ):
             if task and not task.done():
                 task.cancel()
@@ -673,6 +681,7 @@ class JeevesSessionManager:
         self._timeout_task = None
         self._silence_task = None
         self._ai_speaking_clear_task = None
+        self._hang_watchdog_task = None
         self._session_timeout_deadline = 0.0
 
         # Request recap from the live model BEFORE disconnecting (it has full context)
@@ -1618,6 +1627,77 @@ class JeevesSessionManager:
         except asyncio.CancelledError:
             pass
 
+    async def _hang_watchdog(self) -> None:
+        """Restart session if model doesn't respond within hang_timeout after user input.
+
+        This handles the case where the model hangs (WebSocket alive but no generation).
+        It preserves conversation context and asks the user to repeat.
+        """
+        hang_timeout = float(self._config.get(CONF_HANG_TIMEOUT, DEFAULT_HANG_TIMEOUT))
+        if hang_timeout <= 0:
+            return  # Feature disabled
+
+        try:
+            while self._active:
+                await asyncio.sleep(2.0)
+                if not self._active or not self._client:
+                    break
+
+                # Only check if user recently spoke
+                if self._last_user_input_time <= 0:
+                    continue
+
+                now = time.time()
+                elapsed = now - self._last_user_input_time
+
+                # If model is generating or a tool is pending, it's not hanging
+                if self._client and (self._client.model_generating or self._client._tool_call_pending):
+                    continue
+
+                # If model responded after user input, reset
+                if self._last_model_activity >= self._last_user_input_time:
+                    continue
+
+                # Hang detected: user spoke > hang_timeout ago, no model response
+                if elapsed > hang_timeout:
+                    _LOGGER.warning(
+                        "Hang detected: user spoke %.1fs ago, no model response. Restarting session.",
+                        elapsed,
+                    )
+                    # Determine system prompt language for the apology
+                    system_prompt = self._config.get("system_prompt", "")
+                    if "français" in system_prompt.lower() or "french" in system_prompt.lower():
+                        apology = "Désolé, j'ai rencontré un problème technique. Pouvez-vous répéter s'il vous plaît ?"
+                    else:
+                        apology = "Sorry, I encountered a technical issue. Could you please repeat?"
+
+                    # Reset the input time so we don't re-trigger
+                    self._last_user_input_time = 0.0
+
+                    # Save current conversation context for restoration
+                    context_turns = []
+                    if self._client:
+                        context_turns = list(self._client._conversation_turns[-10:])
+
+                    # Reconnect the Gemini session with context preserved
+                    try:
+                        if self._client and self._client.connected:
+                            await self._client._reconnect_session(
+                                post_reconnect_instruction=(
+                                    f"[SYSTEM] The session was automatically restarted due to a hang. "
+                                    f"Previous conversation context is preserved. "
+                                    f"Say EXACTLY: \"{apology}\" — nothing else. Do NOT repeat the greeting."
+                                )
+                            )
+                            _LOGGER.warning("Hang recovery: session reconnected with apology instruction")
+                        else:
+                            _LOGGER.warning("Hang recovery: client disconnected, cannot reconnect")
+                    except Exception:
+                        _LOGGER.exception("Hang recovery failed")
+                    break  # Exit watchdog — a new one will be started on reconnect
+        except asyncio.CancelledError:
+            pass
+
     async def _proactive_monitor_loop(self) -> None:
         """Periodically give the model a turn to act autonomously.
 
@@ -2483,6 +2563,8 @@ class JeevesSessionManager:
 
     def _handle_transcript(self, role: str, text: str) -> None:
         self._security.log_event("transcript", f"{role}_speech", {"text": text[:500]})
+        if role == "user" and text.strip():
+            self._last_user_input_time = time.time()
         if text and (
             not self._transcript_history
             or self._transcript_history[-1]["role"] != role

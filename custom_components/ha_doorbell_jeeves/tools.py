@@ -1385,9 +1385,48 @@ async def _execute_view_camera(
         _LOGGER.info("view_camera: captured %d frames from %s (sizes: %s)",
                      len(frames), camera_id, [len(f) for f in frames])
 
-        # Process the best frame (largest = most detail) at high quality
+        # Validate frames: reject mostly black/white images (corrupted or offline camera)
         from .frame_processor import process_frame  # noqa: PLC0415
-        best_frame = max(frames, key=len)
+
+        def _validate_frame(raw: bytes) -> bool:
+            """Check frame is not mostly black or white (corrupt/offline indicator)."""
+            try:
+                from PIL import Image  # noqa: PLC0415
+                import io  # noqa: PLC0415
+                img = Image.open(io.BytesIO(raw))
+                # Sample 1000 pixels spread across the image for speed
+                width, height = img.size
+                if width < 10 or height < 10:
+                    return False
+                pixels = list(img.resize((32, 32)).convert("L").getdata())
+                avg = sum(pixels) / len(pixels)
+                # Reject if >90% of pixels are near-black (<15) or near-white (>240)
+                dark_count = sum(1 for p in pixels if p < 15)
+                light_count = sum(1 for p in pixels if p > 240)
+                total = len(pixels)
+                if dark_count / total > 0.9:
+                    _LOGGER.warning("view_camera: frame rejected — mostly black (avg=%d)", avg)
+                    return False
+                if light_count / total > 0.9:
+                    _LOGGER.warning("view_camera: frame rejected — mostly white (avg=%d)", avg)
+                    return False
+                return True
+            except Exception:
+                return True  # If validation fails, allow the frame through
+
+        valid_frames = [f for f in frames if await hass.async_add_executor_job(_validate_frame, f)]
+        if not valid_frames:
+            return {
+                "success": False,
+                "error": (
+                    f"Captured {len(frames)} frame(s) from '{camera_id}' but ALL were invalid "
+                    "(mostly black or white — camera may be offline or in night mode transition). "
+                    "FAILED — no usable image. Do NOT describe anything."
+                ),
+            }
+
+        # Process the best frame (largest = most detail) at high quality
+        best_frame = max(valid_frames, key=len)
         processed = await hass.async_add_executor_job(
             process_frame, best_frame, 1280, 960, 85
         )
@@ -2280,8 +2319,11 @@ async def _execute_notification(
         async def _on_coming() -> None:
             if hasattr(manager, "_client") and manager._client and manager._client.connected:
                 await manager._client.inject_context(
-                    "[SYSTEM] The homeowner pressed 'Coming' — they are on their way to the door. "
-                    "Inform the visitor that someone is coming to meet them shortly.",
+                    "[SYSTEM] CONFIRMED BY HOMEOWNER: A resident has pressed the 'Coming' button "
+                    "on their phone. This is a VERIFIED human response — not a guess or assumption. "
+                    "Tell the visitor clearly: 'Le propriétaire m'a confirmé qu'il arrive. "
+                    "Veuillez patienter un instant.' Make it obvious this is confirmed information "
+                    "from the homeowner, not your own assumption.",
                     turn_complete=True,
                 )
 
@@ -2289,9 +2331,11 @@ async def _execute_notification(
         async def _on_not_available() -> None:
             if hasattr(manager, "_client") and manager._client and manager._client.connected:
                 await manager._client.inject_context(
-                    "[SYSTEM] The homeowner pressed 'Not Available' — nobody is coming to the door. "
-                    "Handle the visitor yourself: take a message, offer to save event details, "
-                    "or politely inform them nobody is available right now.",
+                    "[SYSTEM] CONFIRMED BY HOMEOWNER: All residents have pressed 'Not Available' "
+                    "on their phones. This is a VERIFIED human response — nobody is coming. "
+                    "Tell the visitor clearly that the homeowner has confirmed they are not available. "
+                    "Offer to take a message or save event details. Make it clear this is a confirmed "
+                    "response from the homeowner, not your assumption.",
                     turn_complete=True,
                 )
 

@@ -72,6 +72,8 @@ from .const import (
     CONF_REOLINK_MIC_METHOD,
     CONF_REOLINK_MIC_URL,
     CONF_SESSION_TIMEOUT,
+    CONF_HANG_TIMEOUT,
+    CONF_EVENT_NOTIFY_TARGETS,
     CONF_STOP_ENTITIES,
     CONF_SYSTEM_PROMPT,
     CONF_TASK_INSTRUCTIONS,
@@ -94,6 +96,7 @@ from .const import (
     DEFAULT_MODEL_GEMINI,
     DEFAULT_MODEL_OPENAI,
     DEFAULT_SESSION_TIMEOUT,
+    DEFAULT_HANG_TIMEOUT,
     DEFAULT_SYSTEM_PROMPT,
     DEFAULT_TEXT_MODEL_GEMINI,
     DEFAULT_TOOL_MODEL_GEMINI,
@@ -782,6 +785,10 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                         CONF_SESSION_TIMEOUT,
                         default=self._data.get(CONF_SESSION_TIMEOUT, DEFAULT_SESSION_TIMEOUT),
                     ): NumberSelector(NumberSelectorConfig(min=10, max=600, step=10, mode=NumberSelectorMode.SLIDER)),
+                    vol.Required(
+                        CONF_HANG_TIMEOUT,
+                        default=self._data.get(CONF_HANG_TIMEOUT, DEFAULT_HANG_TIMEOUT),
+                    ): NumberSelector(NumberSelectorConfig(min=0, max=60, step=1, mode=NumberSelectorMode.SLIDER)),
                     vol.Required(
                         CONF_MEMORY_RETENTION_DAYS,
                         default=self._data.get(
@@ -2250,6 +2257,7 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
             self._data[CONF_TAKEOVER_YIELD_DURATION] = user_input.get(CONF_TAKEOVER_YIELD_DURATION, DEFAULT_TAKEOVER_YIELD_DURATION)
             self._data[CONF_CHIME_DELAY] = user_input.get(CONF_CHIME_DELAY, DEFAULT_CHIME_DELAY)
             self._data[CONF_SILENCE_TIMEOUT] = user_input.get(CONF_SILENCE_TIMEOUT, DEFAULT_SILENCE_TIMEOUT)
+            self._data[CONF_EVENT_NOTIFY_TARGETS] = user_input.get(CONF_EVENT_NOTIFY_TARGETS, [])
             return self._save_options()
 
         current_start = self._data.get("start_triggers_config", [])
@@ -2310,6 +2318,23 @@ class DoorbellJeevesOptionsFlow(OptionsFlow):
                 default=self._data.get(CONF_SILENCE_TIMEOUT, DEFAULT_SILENCE_TIMEOUT),
             )
         ] = NumberSelector(NumberSelectorConfig(min=5, max=300, step=5, mode=NumberSelectorMode.SLIDER))
+        # Auto-notification targets for security events
+        notify_services = sorted(
+            svc for svc in self.hass.services.async_services().get("notify", {})
+        )
+        if notify_services:
+            schema[
+                vol.Optional(
+                    CONF_EVENT_NOTIFY_TARGETS,
+                    default=self._data.get(CONF_EVENT_NOTIFY_TARGETS, []),
+                )
+            ] = SelectSelector(
+                SelectSelectorConfig(
+                    options=[{"value": f"notify.{svc}", "label": f"notify.{svc}"} for svc in notify_services],
+                    multiple=True,
+                    mode=SelectSelectorMode.DROPDOWN,
+                )
+            )
         if is_reolink:
             schema[
                 vol.Optional(

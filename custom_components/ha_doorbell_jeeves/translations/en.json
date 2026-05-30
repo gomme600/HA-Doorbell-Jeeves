@@ -203,7 +203,8 @@
           "text_model": "Text Model (for recaps/memories)",
           "session_timeout": "Session Timeout",
           "memory_retention_days": "Memory Retention (days)",
-          "validator_model": "Security Validator Model"
+          "validator_model": "Security Validator Model",
+          "hang_timeout": "Hang Recovery Timeout (0=disabled)"
         }
       },
       "dual_model": {
@@ -411,7 +412,8 @@
           "takeover_yield_duration": "Yield Duration (ms the speaker is released for detection)",
           "chime_delay": "Doorbell Chime Delay",
           "silence_timeout": "Silence Auto-Hangup Timeout",
-          "takeover_poll_interval": "Reolink Poll Interval"
+          "takeover_poll_interval": "Reolink Poll Interval",
+          "event_notify_targets": "Auto-notify devices on new events"
         }
       },
       "identities": {
