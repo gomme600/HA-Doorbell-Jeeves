@@ -1887,10 +1887,28 @@ class JeevesSessionManager:
         config = dict(self._startup_media_config or self._config)
         self._startup_media_camera_entity = ""
         self._startup_media_config = None
-        self.hass.async_create_task(self._start_session_media(camera_entity, config))
-        if getattr(self, "_notify_after_greeting", False):
-            self._notify_after_greeting = False
-            self.hass.async_create_task(self._post_greeting_notify())
+        notify_after_greeting = getattr(self, "_notify_after_greeting", False)
+        self._notify_after_greeting = False
+        self.hass.async_create_task(
+            self._finish_initial_turn_startup(
+                camera_entity,
+                config,
+                notify_after_greeting,
+            )
+        )
+
+    async def _finish_initial_turn_startup(
+        self,
+        camera_entity: str,
+        config: dict[str, Any],
+        notify_after_greeting: bool,
+    ) -> None:
+        """Complete all deferred startup work once greeting turn 1 has ended."""
+        if self._client and self._client.connected:
+            await self._client.inject_pending_reference_images()
+        await self._start_session_media(camera_entity, config)
+        if notify_after_greeting:
+            await self._post_greeting_notify()
 
     async def _start_session_media(self, camera_entity: str, config: dict[str, Any]) -> None:
         """Start microphone/vision pipelines after the greeting turn completes."""

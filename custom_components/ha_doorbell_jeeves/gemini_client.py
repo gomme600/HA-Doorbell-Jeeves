@@ -86,6 +86,7 @@ class GeminiLiveClient(BaseRealtimeClient):
         self._keepalive_task: asyncio.Task[None] | None = None
         # Startup grace period: block audio/video input briefly after greeting to prevent 1008
         self._startup_grace_until: float = 0.0
+        self._reference_images_injected = False
 
     @property
     def connected(self) -> bool:
@@ -190,8 +191,10 @@ class GeminiLiveClient(BaseRealtimeClient):
         self._connected = True
         self._connect_time = time.time()
 
-        # Prefill static reference images before live turn-taking begins.
-        await self._inject_reference_images()
+        # Keep the first turn isolated. Static reference images are injected
+        # after the greeting completes instead of before the initial response.
+        if not greeting_text:
+            await self._inject_reference_images()
 
         # Start receiving BEFORE the first greeting so the initial turn is
         # drained immediately once generation begins.
@@ -236,7 +239,8 @@ class GeminiLiveClient(BaseRealtimeClient):
             )
             self._session = await self._session_cm.__aenter__()
             self._connect_time = time.time()
-            await self._inject_reference_images()
+            if turns_completed != 0:
+                await self._inject_reference_images()
 
             if turns_completed == 0:
                 # First turn (greeting) was interrupted by 1008.
@@ -554,10 +558,19 @@ class GeminiLiveClient(BaseRealtimeClient):
                 turns=[types.Content(role="user", parts=parts)],
                 turn_complete=False,  # Context only — don't trigger a response
             )
+            self._reference_images_injected = True
             # Small delay after injecting reference images to let server process
             await asyncio.sleep(0.3)
         except Exception:
             _LOGGER.exception("Failed to inject reference images")
+
+    async def inject_pending_reference_images(self) -> None:
+        """Inject deferred static reference images once the first turn is done."""
+        if self._reference_images_injected or not self._reference_images:
+            return
+        if not self._session or not self._connected:
+            return
+        await self._inject_reference_images()
 
     async def _receive_loop(self) -> None:
         turns_completed = 0
