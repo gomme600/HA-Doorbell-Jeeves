@@ -271,7 +271,7 @@ class GeminiLiveClient(BaseRealtimeClient):
         self._live_config = self._build_live_config()
         if not self._connected or not self._session:
             return False
-        _LOGGER.warning("Enabling Gemini tools after greeting turn via reconnect")
+        _LOGGER.warning("Enabling Gemini tools after greeting turn via reconnect (notify=%s)", bool(notify_instruction))
         return await self._reconnect_session(
             turns_completed=max(self._turns_completed, 1),
             restart_receive_task=True,
