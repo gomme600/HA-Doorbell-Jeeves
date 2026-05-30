@@ -200,7 +200,7 @@ def test_view_camera_fails_safely_when_parts_unsupported(monkeypatch: Any) -> No
 
 def test_enable_deferred_tools_after_greeting_reconnects_once() -> None:
     async def _run() -> None:
-        reconnect_turns: list[int] = []
+        reconnect_calls: list[tuple[int, bool]] = []
         fake_tool = gc_module.types.Tool(
             function_declarations=[
                 gc_module.types.FunctionDeclaration(
@@ -215,18 +215,95 @@ def test_enable_deferred_tools_after_greeting_reconnects_once() -> None:
         )
         client._connected = True
         client._session = object()
+        client._turns_completed = 1
 
-        async def _fake_reconnect(*, turns_completed: int = -1) -> bool:
-            reconnect_turns.append(turns_completed)
+        async def _fake_reconnect(
+            *,
+            turns_completed: int = -1,
+            restart_receive_task: bool = False,
+        ) -> bool:
+            reconnect_calls.append((turns_completed, restart_receive_task))
             return True
 
         client._reconnect_session = _fake_reconnect  # type: ignore[method-assign]
 
         assert client._tools == []
 
-        await client.enable_deferred_tools_after_greeting()
+        assert await client.enable_deferred_tools_after_greeting() is True
 
         assert client._tools == [fake_tool]
-        assert reconnect_turns == [1]
+        assert reconnect_calls == [(1, True)]
+
+    asyncio.run(_run())
+
+
+def test_controlled_reconnect_restarts_receive_loop_without_session_end() -> None:
+    async def _run() -> None:
+        session_end_calls: list[str] = []
+
+        class _BlockingSession(_FakeSession):
+            def __init__(self) -> None:
+                super().__init__()
+                self.started = asyncio.Event()
+
+            async def receive(self) -> Any:
+                self.started.set()
+                await asyncio.Future()
+                if False:  # pragma: no cover
+                    yield None
+
+        class _BlockingLive:
+            def __init__(self) -> None:
+                self.connect_calls: list[tuple[str, Any, _FakeSessionCM, _BlockingSession]] = []
+
+            def connect(self, *, model: str, config: Any) -> _FakeSessionCM:
+                session = _BlockingSession()
+                cm = _FakeSessionCM(session)
+                self.connect_calls.append((model, config, cm, session))
+                return cm
+
+        blocking_live = _BlockingLive()
+        client = GeminiLiveClient(
+            api_key="k",
+            model="gemini-test-model",
+            system_prompt="prompt",
+            tools=[],
+            voice="Puck",
+            reference_images=[],
+            on_audio_output=lambda _audio: None,
+            on_tool_call=lambda _name, _args: asyncio.sleep(0, result={"success": True}),
+            on_session_end=lambda: session_end_calls.append("ended"),
+            on_transcript=lambda _role, _text: None,
+        )
+
+        current_session = _BlockingSession()
+        client._client = SimpleNamespace(aio=SimpleNamespace(live=blocking_live))
+        client._live_config = gc_module.types.LiveConnectConfig(response_modalities=["AUDIO"])
+        client._session = current_session
+        client._session_cm = _FakeSessionCM(current_session)
+        client._connected = True
+        client._turns_completed = 1
+        client._conversation_turns = [
+            {"role": "assistant", "text": "Bonjour"},
+            {"role": "user", "text": "Pouvez-vous regarder dehors ?"},
+        ]
+
+        old_receive_task = asyncio.create_task(client._receive_loop())
+        client._receive_task = old_receive_task
+        await asyncio.wait_for(current_session.started.wait(), timeout=1.0)
+
+        assert await client._reconnect_session(turns_completed=1, restart_receive_task=True) is True
+
+        assert session_end_calls == []
+        assert old_receive_task.done() is True
+        assert client._receive_task is not old_receive_task
+        assert client._receive_task is not None
+        assert client._receive_task.done() is False
+        assert len(blocking_live.connect_calls) == 1
+        reconnect_session = blocking_live.connect_calls[0][3]
+        assert reconnect_session.client_content_calls
+        assert reconnect_session.client_content_calls[0][1] is False
+
+        await client.disconnect()
 
     asyncio.run(_run())

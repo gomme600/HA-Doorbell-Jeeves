@@ -189,8 +189,9 @@ def test_handle_model_turn_complete_starts_media_once() -> None:
         async def _fake_notify() -> None:
             calls.append("notify")
 
-        async def _fake_enable_tools() -> None:
+        async def _fake_enable_tools() -> bool:
             calls.append("tools")
+            return True
 
         async def _fake_inject_refs() -> None:
             calls.append("refs")
@@ -223,6 +224,43 @@ def test_handle_model_turn_complete_starts_media_once() -> None:
             "media:camera.entree:reolink",
             "notify",
         ]
+
+    asyncio.run(_run())
+
+
+def test_finish_initial_turn_startup_aborts_on_failed_tool_reconnect() -> None:
+    async def _run() -> None:
+        manager = JeevesSessionManager.__new__(JeevesSessionManager)
+        calls: list[str] = []
+
+        async def _fake_enable_tools() -> bool:
+            calls.append("tools")
+            return False
+
+        async def _fake_inject_refs() -> None:
+            calls.append("refs")
+
+        async def _fake_start_media(_camera_entity: str, _config: dict[str, Any]) -> None:
+            calls.append("media")
+
+        async def _fake_notify() -> None:
+            calls.append("notify")
+
+        manager._client = SimpleNamespace(
+            connected=True,
+            enable_deferred_tools_after_greeting=_fake_enable_tools,
+            inject_pending_reference_images=_fake_inject_refs,
+        )
+        manager._start_session_media = _fake_start_media
+        manager._post_greeting_notify = _fake_notify
+
+        await manager._finish_initial_turn_startup(
+            "camera.entree",
+            {"audio_mode": "reolink"},
+            True,
+        )
+
+        assert calls == ["tools"]
 
     asyncio.run(_run())
 

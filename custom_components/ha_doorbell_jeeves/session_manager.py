@@ -1908,11 +1908,17 @@ class JeevesSessionManager:
         notify_after_greeting: bool,
     ) -> None:
         """Complete all deferred startup work once greeting turn 1 has ended."""
-        if self._client and self._client.connected:
-            await self._client.enable_deferred_tools_after_greeting()
-            await self._client.inject_pending_reference_images()
+        client = self._client
+        if client and client.connected:
+            if not await client.enable_deferred_tools_after_greeting():
+                return
+            if not client.connected:
+                return
+            await client.inject_pending_reference_images()
+            if not client.connected:
+                return
         await self._start_session_media(camera_entity, config)
-        if notify_after_greeting:
+        if notify_after_greeting and self._client and self._client.connected:
             await self._post_greeting_notify()
 
     async def _start_session_media(self, camera_entity: str, config: dict[str, Any]) -> None:

@@ -89,6 +89,8 @@ class GeminiLiveClient(BaseRealtimeClient):
         # Startup grace period: block audio/video input briefly after greeting to prevent 1008
         self._startup_grace_until: float = 0.0
         self._reference_images_injected = False
+        self._turns_completed = 0
+        self._suppress_session_end = False
 
     @property
     def connected(self) -> bool:
@@ -232,6 +234,8 @@ class GeminiLiveClient(BaseRealtimeClient):
         self._session = await self._session_cm.__aenter__()
         self._connected = True
         self._connect_time = time.time()
+        self._turns_completed = 0
+        self._suppress_session_end = False
 
         # Keep the first turn isolated. Static reference images are injected
         # after the greeting completes instead of before the initial response.
@@ -263,21 +267,46 @@ class GeminiLiveClient(BaseRealtimeClient):
             return
         self._receive_task = asyncio.create_task(self._receive_loop())
 
-    async def enable_deferred_tools_after_greeting(self) -> None:
+    async def enable_deferred_tools_after_greeting(self) -> bool:
         """Reconnect once with the full tool list after the first greeting turn."""
         if not self._deferred_tools or self._tools:
-            return
+            return True
         self._tools = self._deferred_tools
         self._deferred_tools = []
         self._live_config = self._build_live_config()
         if not self._connected or not self._session:
-            return
+            return False
         _LOGGER.warning("Enabling Gemini tools after greeting turn via reconnect")
-        await self._reconnect_session(turns_completed=1)
+        return await self._reconnect_session(
+            turns_completed=max(self._turns_completed, 1),
+            restart_receive_task=True,
+        )
 
-    async def _reconnect_session(self, turns_completed: int = -1) -> bool:
+    async def _reconnect_session(
+        self,
+        turns_completed: int = -1,
+        restart_receive_task: bool = False,
+    ) -> bool:
         """Tear down current session and open a new one (same config). Returns True on success."""
+        if turns_completed < 0:
+            turns_completed = self._turns_completed
+
+        restart_receive = (
+            restart_receive_task
+            and self._receive_task is not None
+            and not self._receive_task.done()
+            and self._receive_task is not asyncio.current_task()
+        )
         try:
+            if restart_receive and self._receive_task is not None:
+                self._suppress_session_end = True
+                self._receive_task.cancel()
+                try:
+                    await self._receive_task
+                except asyncio.CancelledError:
+                    pass
+                self._receive_task = None
+
             if self._session_cm:
                 try:
                     await self._session_cm.__aexit__(None, None, None)
@@ -350,6 +379,9 @@ class GeminiLiveClient(BaseRealtimeClient):
                 self._startup_grace_until = time.time() + 2.0
                 _LOGGER.warning("Gemini reconnected — history restored (%d turns, %d conversation entries)",
                               len(history_turns), len(self._conversation_turns))
+
+            if restart_receive:
+                self.start_receive()
             return True
         except Exception:
             _LOGGER.exception("Gemini reconnect failed")
@@ -361,6 +393,8 @@ class GeminiLiveClient(BaseRealtimeClient):
         self._model_generating = False
         self._vision_paused = False
         self._monitor_turn_active = False
+        self._turns_completed = 0
+        self._suppress_session_end = False
         if self._receive_task and not self._receive_task.done():
             self._receive_task.cancel()
             try:
@@ -627,7 +661,6 @@ class GeminiLiveClient(BaseRealtimeClient):
         await self._inject_reference_images()
 
     async def _receive_loop(self) -> None:
-        turns_completed = 0
         reconnect_attempts = 0
         max_reconnects = 15  # INCREASED: more resilient to transient policy violations
         try:
@@ -647,7 +680,12 @@ class GeminiLiveClient(BaseRealtimeClient):
                     self._vision_paused = False
                     err_str = str(recv_err)
                     t_err = time.time() - self._connect_time if hasattr(self, '_connect_time') else -1
-                    _LOGGER.warning("Gemini receive() raised at T+%.1f: %s (turns=%d)", t_err, err_str[:200], turns_completed)
+                    _LOGGER.warning(
+                        "Gemini receive() raised at T+%.1f: %s (turns=%d)",
+                        t_err,
+                        err_str[:200],
+                        self._turns_completed,
+                    )
                     if ("close" in err_str.lower() or "1008" in err_str
                             or "1011" in err_str or "deadline" in err_str.lower()
                             or "not implemented" in err_str.lower()):
@@ -661,7 +699,9 @@ class GeminiLiveClient(BaseRealtimeClient):
                                 reconnect_attempts, max_reconnects, delay,
                             )
                             await asyncio.sleep(delay)
-                            if await self._reconnect_session(turns_completed=turns_completed):
+                            if await self._reconnect_session(
+                                turns_completed=self._turns_completed
+                            ):
                                 consecutive_empty_iters = 0
                                 continue
                         _LOGGER.warning("Gemini server closed connection permanently")
@@ -681,7 +721,8 @@ class GeminiLiveClient(BaseRealtimeClient):
                     break
 
                 if saw_message:
-                    turns_completed += 1
+                    self._turns_completed += 1
+                    turns_completed = self._turns_completed
                     consecutive_empty_iters = 0
                     if self._on_turn_complete:
                         try:
@@ -700,21 +741,33 @@ class GeminiLiveClient(BaseRealtimeClient):
                             "Empty-stream Gemini disconnect (attempt %d/%d) — reconnecting...",
                             reconnect_attempts, max_reconnects,
                         )
-                        if await self._reconnect_session(turns_completed=turns_completed):
+                        if await self._reconnect_session(
+                            turns_completed=self._turns_completed
+                        ):
                             consecutive_empty_iters = 0
                             continue
-                    _LOGGER.warning("Gemini receive stream ended repeatedly with no events (turns=%d)", turns_completed)
+                    _LOGGER.warning(
+                        "Gemini receive stream ended repeatedly with no events (turns=%d)",
+                        self._turns_completed,
+                    )
                     break
                 await asyncio.sleep(0.1)
         except asyncio.CancelledError:
             pass
         except Exception:
-            _LOGGER.exception("Gemini receive loop error (turns=%d)", turns_completed)
+            _LOGGER.exception("Gemini receive loop error (turns=%d)", self._turns_completed)
         finally:
-            _LOGGER.warning("Gemini receive loop exiting (turns=%d, connected=%s)", turns_completed, self._connected)
+            _LOGGER.warning(
+                "Gemini receive loop exiting (turns=%d, connected=%s)",
+                self._turns_completed,
+                self._connected,
+            )
             if self._connected:
-                self._connected = False
-                self._on_session_end()
+                if self._suppress_session_end:
+                    self._suppress_session_end = False
+                else:
+                    self._connected = False
+                    self._on_session_end()
 
     @staticmethod
     def _is_thinking_text(text: str) -> bool:
