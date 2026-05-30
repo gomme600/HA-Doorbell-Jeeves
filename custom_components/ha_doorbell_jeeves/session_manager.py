@@ -189,6 +189,7 @@ class JeevesSessionManager:
         self._startup_media_pending: bool = False
         self._startup_media_camera_entity: str = ""
         self._startup_media_config: dict[str, Any] | None = None
+        self._camera_availability: dict[str, bool] = {}  # entity_id -> available at session start
 
     def _normalize_manual_audio_config(self) -> None:
         """Backfill split go2rtc stream keys from the legacy single stream key."""
@@ -216,6 +217,26 @@ class JeevesSessionManager:
             return False
         # Camera must not be unavailable/unknown to be usable
         return state.state not in ("unavailable", "unknown")
+
+    def _check_camera_availability(self) -> dict[str, bool]:
+        """Check availability of all managed cameras at session start.
+
+        This allows immediate error reporting when a tool is called on
+        an unavailable camera, without needing to wait for timeout.
+        """
+        result: dict[str, bool] = {}
+        if not hasattr(self, "store") or not self.store:
+            return result
+        for entity in self.store.managed_entities:
+            if entity.entity_id.startswith("camera."):
+                available = self._camera_exists(entity.entity_id)
+                result[entity.entity_id] = available
+                if not available:
+                    _LOGGER.warning(
+                        "Camera %s (%s) is unavailable at session start",
+                        entity.name, entity.entity_id,
+                    )
+        return result
 
     def _resolve_camera_entity(self, preferred_entity: str) -> str:
         """Use the preferred camera when available, otherwise fall back to a managed camera.
@@ -612,6 +633,9 @@ class JeevesSessionManager:
 
             # Start hang detection watchdog
             self._hang_watchdog_task = asyncio.create_task(self._hang_watchdog())
+
+            # Check camera availability at session start (non-blocking)
+            self._camera_availability = self._check_camera_availability()
 
             self._register_stop_triggers()
 
@@ -1674,11 +1698,6 @@ class JeevesSessionManager:
                     # Reset the input time so we don't re-trigger
                     self._last_user_input_time = 0.0
 
-                    # Save current conversation context for restoration
-                    context_turns = []
-                    if self._client:
-                        context_turns = list(self._client._conversation_turns[-10:])
-
                     # Reconnect the Gemini session with context preserved
                     try:
                         if self._client and self._client.connected:
@@ -1694,7 +1713,8 @@ class JeevesSessionManager:
                             _LOGGER.warning("Hang recovery: client disconnected, cannot reconnect")
                     except Exception:
                         _LOGGER.exception("Hang recovery failed")
-                    break  # Exit watchdog — a new one will be started on reconnect
+                    # Continue watchdog loop to detect future hangs in same session
+                    continue
         except asyncio.CancelledError:
             pass
 
@@ -2250,6 +2270,22 @@ class JeevesSessionManager:
                     return {
                         "error": f"Action blocked: {reason}",
                         "instruction": "Inform the visitor this action cannot be completed.",
+                    }
+
+        # Fast-fail for camera tools targeting unavailable cameras
+        if function_name in ("view_camera", "switch_camera"):
+            target_cam = arguments.get("camera_entity_id", "")
+            if target_cam and self._camera_availability.get(target_cam) is False:
+                # Recheck current state (may have recovered)
+                if not self._camera_exists(target_cam):
+                    _LOGGER.warning("Fast-fail: camera %s unavailable (known at session start)", target_cam)
+                    return {
+                        "success": False,
+                        "error": (
+                            f"Camera '{target_cam}' is currently OFFLINE/UNAVAILABLE. "
+                            "This was detected at session start. The camera cannot be reached. "
+                            "Do NOT fabricate or imagine what this camera might show."
+                        ),
                     }
 
         try:
