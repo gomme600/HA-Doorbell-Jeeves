@@ -258,8 +258,12 @@ class GeminiLiveClient(BaseRealtimeClient):
             return
         self._receive_task = asyncio.create_task(self._receive_loop())
 
-    async def enable_deferred_tools_after_greeting(self) -> bool:
-        """Reconnect once with the full tool list after the first greeting turn."""
+    async def enable_deferred_tools_after_greeting(self, notify_instruction: str = "") -> bool:
+        """Reconnect once with the full tool list after the first greeting turn.
+        
+        If notify_instruction is provided, it's included in the reconnect history
+        to avoid a separate inject_context that would trigger a repeated greeting.
+        """
         if not self._deferred_tools or self._tools:
             return True
         self._tools = self._deferred_tools
@@ -271,12 +275,14 @@ class GeminiLiveClient(BaseRealtimeClient):
         return await self._reconnect_session(
             turns_completed=max(self._turns_completed, 1),
             restart_receive_task=True,
+            post_reconnect_instruction=notify_instruction,
         )
 
     async def _reconnect_session(
         self,
         turns_completed: int = -1,
         restart_receive_task: bool = False,
+        post_reconnect_instruction: str = "",
     ) -> bool:
         """Tear down current session and open a new one (same config). Returns True on success."""
         if turns_completed < 0:
@@ -357,20 +363,34 @@ class GeminiLiveClient(BaseRealtimeClient):
                             parts=[types.Part(text=" ".join(current_texts))]
                         ))
 
-                history_turns.append(types.Content(role="user", parts=[types.Part(text=(
-                    "[SYSTEM] Connection briefly interrupted. You already greeted this visitor. "
-                    "Do NOT repeat your greeting or re-introduce yourself. "
-                    "Wait silently for the visitor to speak next."
-                ))]))
+                # Build the final system instruction based on whether we need notify
+                if post_reconnect_instruction:
+                    system_msg = (
+                        "[SYSTEM] Connection briefly interrupted. You already greeted this visitor — "
+                        "your greeting is in the history above. "
+                        "ABSOLUTE RULE: Do NOT repeat your greeting, do NOT re-introduce yourself, "
+                        "do NOT say 'Bonjour' or any greeting words. "
+                        f"{post_reconnect_instruction}"
+                    )
+                else:
+                    system_msg = (
+                        "[SYSTEM] Connection briefly interrupted. You already greeted this visitor. "
+                        "Do NOT repeat your greeting or re-introduce yourself. "
+                        "Wait silently for the visitor to speak next."
+                    )
+                history_turns.append(types.Content(role="user", parts=[types.Part(text=system_msg)]))
 
+                # If we have an instruction (like notify), complete the turn to trigger action.
+                # Otherwise leave turn open so model waits for visitor to speak.
+                should_complete = bool(post_reconnect_instruction)
                 await self._session.send_client_content(
                     turns=history_turns,
-                    turn_complete=False,
+                    turn_complete=should_complete,
                 )
-                self._model_generating = False
+                self._model_generating = should_complete
                 self._startup_grace_until = time.time() + 2.0
-                _LOGGER.warning("Gemini reconnected — history restored (%d turns, %d conversation entries)",
-                              len(history_turns), len(self._conversation_turns))
+                _LOGGER.warning("Gemini reconnected — history restored (%d turns, %d conversation entries, turn_complete=%s)",
+                              len(history_turns), len(self._conversation_turns), should_complete)
 
             if restart_receive:
                 self.start_receive()

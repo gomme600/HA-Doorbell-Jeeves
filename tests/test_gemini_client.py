@@ -281,6 +281,7 @@ def test_enable_deferred_tools_after_greeting_reconnects_once() -> None:
             *,
             turns_completed: int = -1,
             restart_receive_task: bool = False,
+            post_reconnect_instruction: str = "",
         ) -> bool:
             reconnect_calls.append((turns_completed, restart_receive_task))
             return True
@@ -289,7 +290,7 @@ def test_enable_deferred_tools_after_greeting_reconnects_once() -> None:
 
         assert client._tools == []
 
-        assert await client.enable_deferred_tools_after_greeting() is True
+        assert await client.enable_deferred_tools_after_greeting("test instruction") is True
 
         assert client._tools == [fake_tool]
         assert reconnect_calls == [(1, True)]

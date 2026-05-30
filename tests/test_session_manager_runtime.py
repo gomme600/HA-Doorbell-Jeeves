@@ -189,15 +189,14 @@ def test_handle_model_turn_complete_starts_media_once() -> None:
         async def _fake_notify() -> None:
             calls.append("notify")
 
-        async def _fake_enable_tools() -> bool:
-            calls.append("tools")
+        async def _fake_enable_tools(notify_instruction: str = "") -> bool:
+            calls.append(f"tools:{bool(notify_instruction)}")
             return True
 
         async def _fake_inject_refs() -> None:
             calls.append("refs")
 
         manager._start_session_media = _fake_start
-        manager._post_greeting_notify = _fake_notify
         manager._client = SimpleNamespace(
             connected=True,
             enable_deferred_tools_after_greeting=_fake_enable_tools,
@@ -219,10 +218,9 @@ def test_handle_model_turn_complete_starts_media_once() -> None:
         await scheduled[0]
 
         assert calls == [
-            "tools",
+            "tools:True",  # notify_instruction passed
             "refs",
             "media:camera.entree:reolink",
-            "notify",
         ]
 
     asyncio.run(_run())
@@ -233,7 +231,7 @@ def test_finish_initial_turn_startup_aborts_on_failed_tool_reconnect() -> None:
         manager = JeevesSessionManager.__new__(JeevesSessionManager)
         calls: list[str] = []
 
-        async def _fake_enable_tools() -> bool:
+        async def _fake_enable_tools(notify_instruction: str = "") -> bool:
             calls.append("tools")
             return False
 

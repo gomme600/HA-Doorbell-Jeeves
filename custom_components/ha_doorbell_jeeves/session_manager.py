@@ -1912,7 +1912,17 @@ class JeevesSessionManager:
         """Complete all deferred startup work once greeting turn 1 has ended."""
         client = self._client
         if client and client.connected:
-            if not await client.enable_deferred_tools_after_greeting():
+            # Build notify instruction to pass into the reconnect itself
+            # (avoids a separate inject_context that triggers repeated greeting)
+            notify_instruction = ""
+            if notify_after_greeting:
+                notify_instruction = (
+                    "Now SILENTLY call the send_notification tool to alert the homeowner. "
+                    "Include a brief description of what you see in the notification message. "
+                    "Produce ZERO audio — only a silent tool call. "
+                    "After the tool call, say only 'Puis-je vous aider ?' and nothing else."
+                )
+            if not await client.enable_deferred_tools_after_greeting(notify_instruction):
                 return
             if not client.connected:
                 return
@@ -1920,8 +1930,6 @@ class JeevesSessionManager:
             if not client.connected:
                 return
         await self._start_session_media(camera_entity, config)
-        if notify_after_greeting and self._client and self._client.connected:
-            await self._post_greeting_notify()
 
     async def _start_session_media(self, camera_entity: str, config: dict[str, Any]) -> None:
         """Start microphone/vision pipelines after the greeting turn completes."""
