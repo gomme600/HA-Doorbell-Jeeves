@@ -173,9 +173,11 @@ def test_tool_response_omits_parts_kwarg_when_no_image(monkeypatch: Any) -> None
     asyncio.run(_run())
 
 
-def test_view_camera_fails_safely_when_parts_unsupported(monkeypatch: Any) -> None:
+def test_view_camera_injects_image_via_realtime_input(monkeypatch: Any) -> None:
+    """Test that view_camera tool images are injected via send_realtime_input after tool response."""
     async def _run() -> None:
         captured_kwargs: list[dict[str, Any]] = []
+        realtime_calls: list[dict[str, Any]] = []
 
         def _fake_function_response(**kwargs: Any) -> dict[str, Any]:
             captured_kwargs.append(kwargs)
@@ -183,6 +185,12 @@ def test_view_camera_fails_safely_when_parts_unsupported(monkeypatch: Any) -> No
 
         client = _build_client()
         session = _FakeSession()
+        # Track send_realtime_input calls
+        original_send = session.send_realtime_input
+        async def _track_realtime(**kwargs: Any) -> None:
+            realtime_calls.append(kwargs)
+        session.send_realtime_input = _track_realtime
+
         client._session = session
         client._connected = True
         client._pending_tool_image = (
@@ -191,7 +199,6 @@ def test_view_camera_fails_safely_when_parts_unsupported(monkeypatch: Any) -> No
         )
 
         monkeypatch.setattr(gc_module.types, "FunctionResponse", _fake_function_response)
-        monkeypatch.setattr(gc_module, "_FUNCTION_RESPONSE_SUPPORTS_PARTS", False)
 
         tool_call = SimpleNamespace(
             function_calls=[SimpleNamespace(id="tool-2", name="view_camera", args={})]
@@ -199,10 +206,12 @@ def test_view_camera_fails_safely_when_parts_unsupported(monkeypatch: Any) -> No
 
         await client._handle_tool_call(tool_call)
 
+        # Tool response should NOT contain parts (no image in response)
         assert len(captured_kwargs) == 1
         assert "parts" not in captured_kwargs[0]
-        assert "too old to support inline tool image parts" in captured_kwargs[0]["response"]["error"]
-        assert session.tool_response_calls == [[captured_kwargs[0]]]
+        # Image should have been injected via realtime_input
+        assert len(realtime_calls) == 1
+        assert "media" in realtime_calls[0]
 
     asyncio.run(_run())
 

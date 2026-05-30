@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import inspect
+
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -23,19 +23,6 @@ _SHARED_CLIENT_LOCKS: dict[str, asyncio.Lock] = {}
 _WARMED_LIVE_MODELS: set[tuple[str, str]] = set()
 _WARM_LOCKS: dict[tuple[str, str], asyncio.Lock] = {}
 
-
-def _function_response_supports_parts() -> bool:
-    """Detect whether the installed SDK supports FunctionResponse.parts."""
-    model_fields = getattr(types.FunctionResponse, "model_fields", None)
-    if isinstance(model_fields, dict):
-        return "parts" in model_fields
-    try:
-        return "parts" in inspect.signature(types.FunctionResponse).parameters
-    except (TypeError, ValueError):
-        return False
-
-
-_FUNCTION_RESPONSE_SUPPORTS_PARTS = _function_response_supports_parts()
 
 
 class GeminiLiveClient(BaseRealtimeClient):
@@ -872,6 +859,7 @@ class GeminiLiveClient(BaseRealtimeClient):
             self._monitor_turn_active = False
         try:
             function_responses: list[types.FunctionResponse] = []
+            pending_image_for_injection: tuple[str, str] | None = None
 
             for fc in tool_call.function_calls:
                 try:
@@ -879,23 +867,14 @@ class GeminiLiveClient(BaseRealtimeClient):
                 except Exception:
                     result = {"error": f"Tool '{fc.name}' execution failed"}
 
-                response_parts: list[types.FunctionResponsePart] | None = None
+                # Extract pending tool image for injection AFTER tool response
                 if self._pending_tool_image:
                     if len(self._pending_tool_image) == 2:
                         image_b64, pending_image_mime = self._pending_tool_image
                     else:
                         image_b64, pending_image_mime, _pending_image_ctx = self._pending_tool_image
                     self._pending_tool_image = None
-                    try:
-                        response_parts = [
-                            types.FunctionResponsePart.from_bytes(
-                                data=base64.b64decode(image_b64),
-                                mime_type=pending_image_mime,
-                            )
-                        ]
-                    except Exception as img_err:
-                        _LOGGER.warning("Failed to decode tool image: %s", img_err)
-                        response_parts = None
+                    pending_image_for_injection = (image_b64, pending_image_mime)
                 elif fc.name == "view_camera":
                     _LOGGER.warning("view_camera completed but no _pending_tool_image was set!")
 
@@ -904,20 +883,6 @@ class GeminiLiveClient(BaseRealtimeClient):
                     "name": fc.name,
                     "response": result,
                 }
-                if response_parts is not None:
-                    if _FUNCTION_RESPONSE_SUPPORTS_PARTS:
-                        function_response_kwargs["parts"] = response_parts
-                    else:
-                        _LOGGER.warning(
-                            "Installed google-genai SDK does not support FunctionResponse.parts"
-                        )
-                        if fc.name == "view_camera":
-                            function_response_kwargs["response"] = {
-                                "error": (
-                                    "Unable to attach the live camera image because the installed "
-                                    "google-genai SDK is too old to support inline tool image parts."
-                                )
-                            }
 
                 function_responses.append(types.FunctionResponse(**function_response_kwargs))
 
@@ -929,6 +894,26 @@ class GeminiLiveClient(BaseRealtimeClient):
                     )
                 except Exception:
                     _LOGGER.exception("Failed to send tool response")
+                    self._tool_call_pending = False
+                    self._stop_keepalive()
+                    return
+
+                # Inject the tool image AFTER the tool response via realtime media
+                # (FunctionResponsePart.from_bytes causes JSON serialization failures)
+                if pending_image_for_injection and self._session and self._connected:
+                    img_b64, img_mime = pending_image_for_injection
+                    try:
+                        img_bytes = base64.b64decode(img_b64)
+                        await self._session.send_realtime_input(
+                            media=types.Blob(data=img_bytes, mime_type=img_mime)
+                        )
+                        _LOGGER.warning("Tool image injected via realtime_input (%d bytes)", len(img_bytes))
+                    except Exception:
+                        _LOGGER.exception("Failed to inject tool image via realtime_input")
+            else:
+                # Session gone — clear pending state
+                self._tool_call_pending = False
+                self._stop_keepalive()
         finally:
             # NOTE: Do NOT stop keepalive here — the gap between send_tool_response
             # and model generation starting is the most dangerous idle period.

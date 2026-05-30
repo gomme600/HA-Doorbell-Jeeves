@@ -1982,7 +1982,7 @@ class JeevesSessionManager:
         first-connection 1008 errors with native audio models.
         """
         # Wait for the greeting audio to finish playing out
-        await asyncio.sleep(6.0)
+        await asyncio.sleep(4.0)
         if not self._active or not self._client or not self._client.connected:
             return
         # Wait for model to stop generating (greeting might still be in progress)
@@ -1993,11 +1993,13 @@ class JeevesSessionManager:
         if not self._active or not self._client or not self._client.connected:
             return
         await self._client.inject_context(
-            "[SYSTEM] Your greeting is complete. Now silently call the notify tool "
-            "to alert the homeowner that someone is at the door. "
-            "Describe the visitor briefly in the notification message based on what you see. "
-            "Do NOT tell the visitor about the notification — do NOT say anything about notifying. "
-            "After the notification, wait silently for the visitor to speak.",
+            "[SYSTEM] INSTRUCTION: Call the send_notification tool NOW to alert the homeowner. "
+            "Include a brief description of what you see at the door. "
+            "CRITICAL RULES: "
+            "1. Do NOT speak any words aloud — use ONLY the tool call, produce ZERO audio output. "
+            "2. Do NOT repeat your greeting — you already said it. "
+            "3. Do NOT say anything about notifying — just call the tool silently. "
+            "4. After the tool call, wait silently for the visitor to speak.",
             turn_complete=True,
         )
         _LOGGER.warning("Post-greeting notification trigger injected")
