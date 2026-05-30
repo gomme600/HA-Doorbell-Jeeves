@@ -173,22 +173,21 @@ class GeminiLiveClient(BaseRealtimeClient):
         self._connected = True
         self._connect_time = time.time()
 
-        # Atomic burst: ref images → greeting → receive loop (same as reconnect)
+        # Prefill static reference images before live turn-taking begins.
         await self._inject_reference_images()
 
+        # Start receiving BEFORE the first live prompt so the initial greeting
+        # follows the same pattern as reconnects: the receive loop is already
+        # actively draining server events when generation starts.
+        self._receive_task = asyncio.create_task(self._receive_loop())
+
         if greeting_text:
-            await self._session.send_client_content(
-                turns=[types.Content(role="user", parts=[types.Part(text=greeting_text)])],
-                turn_complete=True,
-            )
             self._model_generating = True
+            await self._session.send_realtime_input(text=greeting_text)
             _LOGGER.warning(
                 "Gemini connected + greeting sent at T+%.1f",
                 time.time() - self._connect_time,
             )
-
-        # Start receive loop AFTER greeting
-        self._receive_task = asyncio.create_task(self._receive_loop())
 
         # Set startup grace period
         self._startup_grace_until = time.time() + 5.0
@@ -224,15 +223,12 @@ class GeminiLiveClient(BaseRealtimeClient):
                 # First turn (greeting) was interrupted by 1008.
                 # Trigger a fresh greeting instead of "wait silently".
                 # This makes the 1008 recovery seamless for the user.
-                await self._session.send_client_content(
-                    turns=[types.Content(role="user", parts=[types.Part(text=(
-                        "[SYSTEM] A visitor is at the door. "
-                        "Greet them briefly and warmly. Ask how you can help. "
-                        "Do NOT call any tools. Speak now."
-                    ))])],
-                    turn_complete=True,
-                )
                 self._model_generating = True
+                await self._session.send_realtime_input(text=(
+                    "[SYSTEM] A visitor is at the door. "
+                    "Greet them briefly and warmly. Ask how you can help. "
+                    "Do NOT call any tools. Speak now."
+                ))
                 self._startup_grace_until = time.time() + 5.0
                 _LOGGER.warning("Gemini reconnected at turns=0 — re-triggering greeting")
             else:
@@ -442,10 +438,13 @@ class GeminiLiveClient(BaseRealtimeClient):
             # Retry once if WebSocket send fails (race with 1008 reconnection)
             for attempt in range(2):
                 try:
-                    await self._session.send_client_content(
-                        turns=[types.Content(role="user", parts=parts)],
-                        turn_complete=turn_complete,
-                    )
+                    if turn_complete and not image_base64:
+                        await self._session.send_realtime_input(text=text)
+                    else:
+                        await self._session.send_client_content(
+                            turns=[types.Content(role="user", parts=parts)],
+                            turn_complete=turn_complete,
+                        )
                     break  # Success
                 except Exception as send_err:
                     if attempt == 0 and self._connected:

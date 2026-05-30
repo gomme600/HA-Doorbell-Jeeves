@@ -10,9 +10,13 @@ from custom_components.ha_doorbell_jeeves.gemini_client import GeminiLiveClient
 class _FakeSession:
     def __init__(self) -> None:
         self.client_content_calls: list[tuple[Any, bool]] = []
+        self.realtime_input_calls: list[dict[str, Any]] = []
 
     async def send_client_content(self, *, turns: Any, turn_complete: bool = True) -> None:
         self.client_content_calls.append((turns, turn_complete))
+
+    async def send_realtime_input(self, **kwargs: Any) -> None:
+        self.realtime_input_calls.append(kwargs)
 
 
 class _FakeSessionCM:
@@ -111,8 +115,7 @@ def test_gemini_connect_uses_prewarmed_shared_client(monkeypatch: Any) -> None:
         assert len(_FakeGenAIClient.instances) == 1
         assert len(shared.aio.live.connect_calls) == 2
         actual_session = shared.aio.live.connect_calls[1][3]
-        assert actual_session.client_content_calls
-        assert actual_session.client_content_calls[0][1] is True
+        assert actual_session.realtime_input_calls == [{"text": "hello"}]
 
         await client.disconnect()
 
