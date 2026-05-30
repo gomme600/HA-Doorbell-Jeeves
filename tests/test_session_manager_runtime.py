@@ -177,14 +177,20 @@ def test_handle_model_turn_complete_starts_media_once() -> None:
         manager._startup_media_pending = True
         manager._startup_media_camera_entity = "camera.entree"
         manager._startup_media_config = {"audio_mode": "reolink"}
+        manager._notify_after_greeting = True
 
         scheduled: list[asyncio.Future[Any] | asyncio.Task[Any] | Any] = []
         calls: list[tuple[str, dict[str, Any]]] = []
+        notifications: list[str] = []
 
         async def _fake_start(camera_entity: str, config: dict[str, Any]) -> None:
             calls.append((camera_entity, config))
 
+        async def _fake_notify() -> None:
+            notifications.append("notify")
+
         manager._start_session_media = _fake_start
+        manager._post_greeting_notify = _fake_notify
         manager.hass = SimpleNamespace(
             async_create_task=lambda coro: scheduled.append(coro) or coro
         )
@@ -194,11 +200,14 @@ def test_handle_model_turn_complete_starts_media_once() -> None:
         assert manager._startup_media_pending is False
         assert manager._startup_media_camera_entity == ""
         assert manager._startup_media_config is None
-        assert len(scheduled) == 1
+        assert manager._notify_after_greeting is False
+        assert len(scheduled) == 2
 
         await scheduled[0]
+        await scheduled[1]
 
         assert calls == [("camera.entree", {"audio_mode": "reolink"})]
+        assert notifications == ["notify"]
 
     asyncio.run(_run())
 

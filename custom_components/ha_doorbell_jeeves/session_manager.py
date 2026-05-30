@@ -1888,6 +1888,9 @@ class JeevesSessionManager:
         self._startup_media_camera_entity = ""
         self._startup_media_config = None
         self.hass.async_create_task(self._start_session_media(camera_entity, config))
+        if getattr(self, "_notify_after_greeting", False):
+            self._notify_after_greeting = False
+            self.hass.async_create_task(self._post_greeting_notify())
 
     async def _start_session_media(self, camera_entity: str, config: dict[str, Any]) -> None:
         """Start microphone/vision pipelines after the greeting turn completes."""
@@ -1983,10 +1986,6 @@ class JeevesSessionManager:
         if getattr(self, "_greeting_phase", False):
             self._greeting_phase = False
             _LOGGER.warning("Greeting phase ended — tools now unblocked")
-            # Schedule post-greeting notification (separate turn to avoid 1008)
-            if getattr(self, "_notify_after_greeting", False):
-                self._notify_after_greeting = False
-                self.hass.async_create_task(self._post_greeting_notify())
         if self._audio_out_count <= 3:
             _LOGGER.warning(
                 "Audio output from AI: %d bytes (chunk #%d)",
