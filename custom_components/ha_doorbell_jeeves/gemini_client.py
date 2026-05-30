@@ -17,6 +17,11 @@ from .const import AUDIO_INPUT_SAMPLE_RATE
 
 _LOGGER = logging.getLogger(__name__)
 
+_SHARED_CLIENTS: dict[str, genai.Client] = {}
+_SHARED_CLIENT_LOCKS: dict[str, asyncio.Lock] = {}
+_WARMED_LIVE_MODELS: set[tuple[str, str]] = set()
+_WARM_LOCKS: dict[tuple[str, str], asyncio.Lock] = {}
+
 
 class GeminiLiveClient(BaseRealtimeClient):
     """Async client for the Gemini Multimodal Live streaming API."""
@@ -80,20 +85,58 @@ class GeminiLiveClient(BaseRealtimeClient):
         recent = self._conversation_turns[-5:]
         return " | ".join(f"[{t['role']}]: {t['text'][:100]}" for t in recent)
 
-    async def connect(self, greeting_text: str = "") -> None:
-        """Connect to Gemini Live API.
+    @classmethod
+    async def _get_shared_client(cls, api_key: str) -> genai.Client:
+        lock = _SHARED_CLIENT_LOCKS.setdefault(api_key, asyncio.Lock())
+        async with lock:
+            client = _SHARED_CLIENTS.get(api_key)
+            if client is not None:
+                return client
 
-        If greeting_text is provided, the greeting is sent as part of the initial
-        connection burst (ref images → greeting → receive loop) with NO delay.
-        This matches the reconnect pattern which NEVER gets 1008 errors.
+            loop = asyncio.get_running_loop()
+            client = await loop.run_in_executor(
+                None, lambda: genai.Client(api_key=api_key)
+            )
+            _SHARED_CLIENTS[api_key] = client
+            return client
+
+    @classmethod
+    async def prewarm_shared_client(cls, api_key: str, model: str) -> genai.Client:
+        """Create and prewarm a shared Live API client once per API key/model.
+
+        The first cold `genai.Client` + first live session is the only path that
+        consistently showed 1008 policy violations in production testing. The
+        official SDK examples keep a persistent `genai.Client`, and our own
+        reconnect path (same client, new session) proved stable. We therefore
+        prewarm the shared client at integration startup so real doorbell
+        sessions never use the cold path.
         """
-        # genai.Client() does blocking I/O (SSL cert loading) — run in executor
-        loop = asyncio.get_event_loop()
-        self._client = await loop.run_in_executor(
-            None, lambda: genai.Client(api_key=self._api_key)
-        )
+        client = await cls._get_shared_client(api_key)
+        warm_key = (api_key, model)
+        lock = _WARM_LOCKS.setdefault(warm_key, asyncio.Lock())
+        async with lock:
+            if warm_key in _WARMED_LIVE_MODELS:
+                return client
+            try:
+                warmup_cm = client.aio.live.connect(
+                    model=model,
+                    config=types.LiveConnectConfig(response_modalities=["AUDIO"]),
+                )
+                await warmup_cm.__aenter__()
+                await warmup_cm.__aexit__(None, None, None)
+                await asyncio.sleep(0.3)
+                _WARMED_LIVE_MODELS.add(warm_key)
+                _LOGGER.warning("Gemini shared client prewarmed (model=%s)", model)
+            except Exception:
+                _LOGGER.warning(
+                    "Gemini shared client prewarm failed (model=%s)",
+                    model,
+                    exc_info=True,
+                )
+        return client
 
-        self._live_config = types.LiveConnectConfig(
+    def _build_live_config(self) -> types.LiveConnectConfig:
+        return types.LiveConnectConfig(
             response_modalities=["AUDIO"],
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
@@ -114,22 +157,15 @@ class GeminiLiveClient(BaseRealtimeClient):
             ),
         )
 
-        # Warm-up connection: open and immediately close a session.
-        # This pre-establishes HTTP/2 connections and auth state in the client,
-        # reducing 1008 rate from ~60% to ~35%.
-        try:
-            warmup_cm = self._client.aio.live.connect(
-                model=self._model, config=self._live_config,
-            )
-            warmup_session = await warmup_cm.__aenter__()
-            await warmup_cm.__aexit__(None, None, None)
-            await asyncio.sleep(0.3)
-            _LOGGER.warning("Warm-up connection completed — opening real session")
-        except Exception:
-            _LOGGER.warning("Warm-up connection failed (non-fatal)")
-            await asyncio.sleep(0.5)
+    async def connect(self, greeting_text: str = "") -> None:
+        """Connect to Gemini Live API.
 
-        # Real connection (equivalent to a reconnect from the client's perspective)
+        If greeting_text is provided, the greeting is sent as part of the initial
+        connection burst (ref images → greeting → receive loop) with NO delay.
+        """
+        self._client = await self.prewarm_shared_client(self._api_key, self._model)
+        self._live_config = self._build_live_config()
+
         self._session_cm = self._client.aio.live.connect(
             model=self._model, config=self._live_config,
         )
@@ -146,7 +182,10 @@ class GeminiLiveClient(BaseRealtimeClient):
                 turn_complete=True,
             )
             self._model_generating = True
-            _LOGGER.warning("Gemini connected + greeting sent at T+%.1f (post-warmup)", time.time() - self._connect_time)
+            _LOGGER.warning(
+                "Gemini connected + greeting sent at T+%.1f",
+                time.time() - self._connect_time,
+            )
 
         # Start receive loop AFTER greeting
         self._receive_task = asyncio.create_task(self._receive_loop())
@@ -679,10 +718,6 @@ class GeminiLiveClient(BaseRealtimeClient):
             self._monitor_turn_active = False
         try:
             function_responses: list[types.FunctionResponse] = []
-            # Track image data for realtime media delivery
-            pending_image_bytes: bytes | None = None
-            pending_image_mime: str = "image/jpeg"
-            pending_image_ctx: str = ""
 
             for fc in tool_call.function_calls:
                 try:
@@ -690,74 +725,40 @@ class GeminiLiveClient(BaseRealtimeClient):
                 except Exception:
                     result = {"error": f"Tool '{fc.name}' execution failed"}
 
-                # Extract pending image if the tool produced one
+                response_parts: list[types.FunctionResponsePart] | None = None
                 if self._pending_tool_image:
                     if len(self._pending_tool_image) == 2:
                         image_b64, pending_image_mime = self._pending_tool_image
-                        pending_image_ctx = ""
                     else:
-                        image_b64, pending_image_mime, pending_image_ctx = self._pending_tool_image
+                        image_b64, pending_image_mime, _pending_image_ctx = self._pending_tool_image
                     self._pending_tool_image = None
                     try:
-                        pending_image_bytes = base64.b64decode(image_b64)
+                        response_parts = [
+                            types.FunctionResponsePart.from_bytes(
+                                data=base64.b64decode(image_b64),
+                                mime_type=pending_image_mime,
+                            )
+                        ]
                     except Exception as img_err:
                         _LOGGER.warning("Failed to decode tool image: %s", img_err)
-                        pending_image_bytes = None
+                        response_parts = None
                 elif fc.name == "view_camera":
                     _LOGGER.warning("view_camera completed but no _pending_tool_image was set!")
 
-                # Build FunctionResponse (text-only — image goes via realtime_input)
                 function_responses.append(
-                    types.FunctionResponse(id=fc.id, name=fc.name, response=result)
+                    types.FunctionResponse(
+                        id=fc.id,
+                        name=fc.name,
+                        response=result,
+                        parts=response_parts,
+                    )
                 )
 
             if self._session and self._connected:
-                # CRITICAL: Inject tool image as a proper content Part (inline_data).
-                # Using send_client_content with turn_complete=False injects the image
-                # into the conversation context where the model can deeply analyze it.
-                # Previous approach (send_realtime_input) only put it in the transient
-                # video buffer which the model treated as "live feed" rather than
-                # analyzing it carefully for the tool response.
-                if pending_image_bytes:
-                    try:
-                        image_parts: list[types.Part] = [
-                            types.Part(text=pending_image_ctx),
-                            types.Part(inline_data=types.Blob(
-                                data=pending_image_bytes, mime_type=pending_image_mime
-                            )),
-                        ]
-                        await self._session.send_client_content(
-                            turns=[types.Content(role="user", parts=image_parts)],
-                            turn_complete=False,  # Context injection, no new generation
-                        )
-                        _LOGGER.warning(
-                            "Tool image injected via send_client_content (%d bytes, %s)",
-                            len(pending_image_bytes), pending_image_mime,
-                        )
-                    except Exception:
-                        _LOGGER.warning("Failed to inject tool image via client_content, falling back to realtime_input")
-                        # Fallback: use realtime media channel
-                        for frame_i in range(3):
-                            try:
-                                await self._session.send_realtime_input(
-                                    media=types.Blob(
-                                        data=pending_image_bytes, mime_type=pending_image_mime
-                                    )
-                                )
-                            except Exception:
-                                break
-                            if frame_i < 2:
-                                await asyncio.sleep(0.1)
-
                 # Send tool_response (this triggers model generation)
-                # The model sees the image in conversation context and the tool response text.
                 try:
-                    plain = [
-                        types.FunctionResponse(id=fr.id, name=fr.name, response=fr.response)
-                        for fr in function_responses
-                    ]
                     await self._session.send_tool_response(
-                        function_responses=plain
+                        function_responses=function_responses
                     )
                 except Exception:
                     _LOGGER.exception("Failed to send tool response")

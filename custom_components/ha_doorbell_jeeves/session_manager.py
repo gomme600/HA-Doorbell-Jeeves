@@ -339,6 +339,14 @@ class JeevesSessionManager:
             [t.entity_id for t in self.store.start_triggers],
         )
 
+        if self._config.get(CONF_PROVIDER, PROVIDER_GEMINI) == PROVIDER_GEMINI:
+            api_key = self._config.get(CONF_API_KEY, "")
+            model = self._config.get(CONF_MODEL, DEFAULT_MODEL_GEMINI)
+            if api_key:
+                from .gemini_client import GeminiLiveClient  # noqa: PLC0415
+
+                await GeminiLiveClient.prewarm_shared_client(api_key, model)
+
     async def async_shutdown(self) -> None:
         """Release background listeners and helpers during unload."""
         await self._notification_manager.async_teardown()

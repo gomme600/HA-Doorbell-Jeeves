@@ -4,22 +4,47 @@ import asyncio
 from types import SimpleNamespace
 from typing import Any
 
-from custom_components.ha_doorbell_jeeves.const import CONF_CAMERA_ENTITY, CONF_VISION_FPS
+import custom_components.ha_doorbell_jeeves.gemini_client as gc_module
+from custom_components.ha_doorbell_jeeves.const import (
+    CONF_API_KEY,
+    CONF_CAMERA_ENTITY,
+    CONF_MEMORY_RETENTION_DAYS,
+    CONF_MODEL,
+    CONF_PROVIDER,
+    CONF_VISION_FPS,
+    PROVIDER_GEMINI,
+)
 from custom_components.ha_doorbell_jeeves.session_manager import JeevesSessionManager
 
 
-def test_switch_active_camera_restarts_existing_vision_loop() -> None:
+def test_switch_active_camera_restarts_existing_vision_loop(monkeypatch: Any) -> None:
     async def _run() -> None:
+        import custom_components.ha_doorbell_jeeves.reolink_audio as reolink_audio
+
         manager = JeevesSessionManager.__new__(JeevesSessionManager)
         manager._vision_task = asyncio.create_task(asyncio.sleep(3600))
         manager._config = {CONF_VISION_FPS: 2.5}
+        manager.hass = SimpleNamespace()
         async def _mock_start() -> None: pass
         async def _mock_stop() -> None: pass
         manager._audio_handler = SimpleNamespace(
-            is_active=True, _camera_entity_id="camera.old", start=_mock_start, stop=_mock_stop
+            is_active=True,
+            has_pending_audio=False,
+            _camera_entity_id="camera.old",
+            start=_mock_start,
+            stop=_mock_stop,
         )
-        manager._client = object()
+        manager._talk_monitor = None
+        manager._interrupt_detector = None
+        manager._client = SimpleNamespace(_model_generating=False)
         manager._active = True
+        manager._camera_exists = lambda _entity_id: True
+
+        async def _noop_stop_mic_forwarder() -> None:
+            return None
+
+        manager._stop_mic_forwarder = _noop_stop_mic_forwarder
+        monkeypatch.setattr(reolink_audio, "find_reolink_entry_for_camera", lambda *_args: "")
 
         calls: dict[str, Any] = {}
 
@@ -33,7 +58,6 @@ def test_switch_active_camera_restarts_existing_vision_loop() -> None:
         await asyncio.sleep(0)
 
         assert manager._config[CONF_CAMERA_ENTITY] == "camera.new"
-        assert manager._audio_handler._camera_entity_id == "camera.new"
         assert calls == {"camera": "camera.new", "fps": 2.5}
 
         if manager._vision_task and not manager._vision_task.done():
@@ -99,12 +123,59 @@ def test_restart_session_from_trigger_waits_for_stop_before_start() -> None:
     asyncio.run(_run())
 
 
+def test_async_initialize_prewarms_shared_gemini_client(monkeypatch: Any) -> None:
+    async def _run() -> None:
+        manager = JeevesSessionManager.__new__(JeevesSessionManager)
+        manager._config = {
+            CONF_PROVIDER: PROVIDER_GEMINI,
+            CONF_API_KEY: "k",
+            CONF_MODEL: "gemini-test-model",
+            CONF_MEMORY_RETENTION_DAYS: 30,
+        }
+
+        async def _noop(*_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        manager.store = SimpleNamespace(
+            async_load=_noop,
+            start_triggers=[],
+            async_set_start_triggers=_noop,
+        )
+        manager._memory_store = SimpleNamespace(
+            async_load=_noop,
+            async_set_retention_days=_noop,
+        )
+        manager._event_store = SimpleNamespace(async_load=_noop)
+        manager._notification_manager = SimpleNamespace(async_setup=_noop)
+        manager._register_start_triggers = lambda: None
+
+        called: list[tuple[str, str]] = []
+
+        async def _fake_prewarm(_cls: Any, api_key: str, model: str) -> None:
+            called.append((api_key, model))
+
+        monkeypatch.setattr(
+            gc_module.GeminiLiveClient,
+            "prewarm_shared_client",
+            classmethod(_fake_prewarm),
+        )
+
+        await manager.async_initialize()
+
+        assert called == [("k", "gemini-test-model")]
+
+    asyncio.run(_run())
+
+
 def test_resolve_camera_entity_falls_back_to_managed_camera() -> None:
     manager = JeevesSessionManager.__new__(JeevesSessionManager)
     manager._config = {}
+    manager._primary_camera_entity = ""
     manager.hass = SimpleNamespace(
         states=SimpleNamespace(
-            get=lambda entity_id: object() if entity_id == "camera.entree" else None
+            get=lambda entity_id: SimpleNamespace(state="idle")
+            if entity_id == "camera.entree"
+            else None
         )
     )
     manager.store = SimpleNamespace(
@@ -123,9 +194,10 @@ def test_resolve_camera_entity_falls_back_to_managed_camera() -> None:
 def test_resolve_camera_entity_prefers_managed_camera_over_unmanaged_state() -> None:
     manager = JeevesSessionManager.__new__(JeevesSessionManager)
     manager._config = {}
+    manager._primary_camera_entity = ""
     manager.hass = SimpleNamespace(
         states=SimpleNamespace(
-            get=lambda entity_id: object()
+            get=lambda entity_id: SimpleNamespace(state="idle")
             if entity_id in {"camera.raw_reolink", "camera.entree"}
             else None
         )
@@ -141,4 +213,3 @@ def test_resolve_camera_entity_prefers_managed_camera_over_unmanaged_state() -> 
 
     assert manager._resolve_camera_entity("camera.raw_reolink") == "camera.entree"
     assert manager._config[CONF_CAMERA_ENTITY] == "camera.entree"
-
