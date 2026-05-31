@@ -918,46 +918,39 @@ class GeminiLiveClient(BaseRealtimeClient):
                             inline_data=types.Blob(data=img_bytes, mime_type=img_mime)
                         )
 
-                        # 1. Inject into conversation context via send_client_content
-                        # Send the image as a standalone message first (high attention)
-                        await self._session.send_client_content(
-                            turns=[types.Content(
-                                role="user",
-                                parts=[image_part],
-                            )],
-                            turn_complete=False,
-                        )
-
-                        # 2. Then inject with analysis instructions
+                        # 1. Inject image + instructions together in one message
+                        # (proven more reliable than split approach — model sees
+                        # context and image atomically)
                         await self._session.send_client_content(
                             turns=[types.Content(
                                 role="user",
                                 parts=[
+                                    image_part,
                                     types.Part(text=(
-                                        "[CAMERA SNAPSHOT FOR ANALYSIS]\n"
-                                        "The image above is a HIGH-RESOLUTION snapshot "
-                                        "just captured from the requested camera.\n"
-                                        "IMPORTANT: This is NOT from your live video feed. "
-                                        "Analyze THIS image carefully. "
-                                        "Identify ALL visible objects: vehicles, people, "
-                                        "furniture, plants, structures. Count them precisely."
+                                        "[CAMERA SNAPSHOT — ANALYZE THIS IMAGE]\n"
+                                        "This high-resolution snapshot was just captured from "
+                                        "the requested camera. It is NOT your live video feed.\n"
+                                        "CAREFULLY examine the ENTIRE image. Count ALL objects:\n"
+                                        "- Vehicles: count each one, describe color and type\n"
+                                        "- People: count and describe\n"
+                                        "- Other: furniture, plants, structures\n"
+                                        "If this is a night/IR image, objects appear as bright "
+                                        "shapes. You CAN still identify and count them."
                                     )),
                                 ],
                             )],
                             turn_complete=False,
                         )
 
-                        # 3. Also inject into the realtime video buffer so the model's
-                        # "current view" matches the snapshot (prevents it from seeing
-                        # the primary camera feed instead of the target camera)
+                        # 2. Also inject into the realtime video buffer
                         try:
                             await self._session.send_realtime_input(
                                 media=types.Blob(data=img_bytes, mime_type=img_mime)
                             )
                         except Exception:
-                            pass  # Non-critical: conversation context is the primary method
+                            pass
 
-                        # 4. Allow server to fully process image before tool_response
+                        # 3. Allow server to fully process image before tool_response
                         await asyncio.sleep(0.5)
 
                         _LOGGER.warning(
