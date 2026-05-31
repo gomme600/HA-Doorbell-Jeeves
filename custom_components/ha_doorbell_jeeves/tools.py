@@ -1446,11 +1446,12 @@ async def _execute_view_camera(
                 ),
             }
 
-        # Use the best (largest) frame. Send at high resolution (2048px max)
-        # to preserve detail for object recognition in wide-angle night shots.
+        # Use the best (largest) frame. Process to 1024px — this resolution
+        # proved most reliable in testing (model analyzes smaller images more
+        # carefully in the Live API context).
         best_frame = max(valid_frames, key=len)
         processed = await hass.async_add_executor_job(
-            process_frame, best_frame, 2048, 2048, 85
+            process_frame, best_frame, 1024, 1024, 92
         )
 
         _LOGGER.warning(
@@ -1477,12 +1478,15 @@ async def _execute_view_camera(
                 f"You MUST analyze the injected image, NOT your live video feed."
             ),
             "message": (
-                f"SUCCESS: High-resolution snapshot ({len(processed)} bytes) from '{cam_name}' "
-                f"has been injected into the conversation. "
-                f"IMPORTANT: Analyze THIS image carefully — it is from '{cam_name}', "
-                f"NOT your live video feed. "
-                f"Describe what you see: count vehicles, people, objects. "
-                f"State colors and positions. If night/IR mode, shapes are still identifiable."
+                f"SUCCESS: A high-resolution snapshot ({len(processed)} bytes) from '{cam_name}' "
+                f"has been injected into the conversation AND your video feed. "
+                f"CRITICAL INSTRUCTION: You MUST describe what you see in this snapshot. "
+                f"This image is from '{cam_name}' — it is DIFFERENT from your live doorbell feed. "
+                f"Carefully examine the entire image. Count ALL vehicles (state exact number "
+                f"and color of each). List all visible objects: furniture, plants, people, "
+                f"animals, bicycles, etc. If the image is dark (night/IR mode), you can still "
+                f"identify shapes and objects — describe them. "
+                f"DO NOT say 'nothing visible' or '0 objects' unless the image is truly blank."
             ),
         }
     except asyncio.TimeoutError:
