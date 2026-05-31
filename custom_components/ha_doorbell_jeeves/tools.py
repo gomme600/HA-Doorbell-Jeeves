@@ -1393,6 +1393,36 @@ async def _execute_view_camera(
         if raw_jpeg and len(raw_jpeg) > 1000:
             frames.append(raw_jpeg)
 
+        # Capture a second frame after a short delay for better analysis reliability
+        if frames:
+            await asyncio.sleep(0.5)
+            raw_jpeg_2: bytes | None = None
+            # Re-capture using the same method that worked for the first frame
+            if reolink_entry_id:
+                entry = hass.config_entries.async_get_entry(reolink_entry_id)
+                if entry and hasattr(entry, "runtime_data") and entry.runtime_data:
+                    try:
+                        host_obj = entry.runtime_data.host
+                        api_obj = host_obj.api
+                        snapshot_bytes = await asyncio.wait_for(
+                            api_obj.get_snapshot(0, None), timeout=8,
+                        )
+                        if snapshot_bytes and len(snapshot_bytes) > 1000:
+                            raw_jpeg_2 = snapshot_bytes
+                    except Exception:
+                        pass
+            if not raw_jpeg_2:
+                try:
+                    image = await asyncio.wait_for(
+                        ha_camera_get_image(hass, camera_id, timeout=8), timeout=10,
+                    )
+                    if image and image.content:
+                        raw_jpeg_2 = image.content
+                except Exception:
+                    pass
+            if raw_jpeg_2 and len(raw_jpeg_2) > 1000:
+                frames.append(raw_jpeg_2)
+
         if not frames:
             return {
                 "success": False,
