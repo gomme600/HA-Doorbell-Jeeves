@@ -1446,13 +1446,13 @@ async def _execute_view_camera(
                 ),
             }
 
-        # Process frame: downscale high-res (2K/4K) to 1024x1024 max for Gemini.
-        # Gemini's vision works best at moderate resolution — too large and the model
-        # may not analyze it carefully. 1024px gives good detail while ensuring
-        # the model treats it as a discrete image to analyze (not video).
+        # Process frame: use high resolution for best object recognition.
+        # The raw Reolink snapshot is full-res (2K+) which may be too large,
+        # but we keep it at 2048px max to preserve detail for small objects
+        # (e.g. vehicles in a wide-angle carport view at night).
         best_frame = max(valid_frames, key=len)
         processed = await hass.async_add_executor_job(
-            process_frame, best_frame, 1024, 1024, 92
+            process_frame, best_frame, 2048, 2048, 85
         )
 
         _LOGGER.warning(
