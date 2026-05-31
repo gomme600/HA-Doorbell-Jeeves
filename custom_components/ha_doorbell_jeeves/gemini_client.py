@@ -919,27 +919,35 @@ class GeminiLiveClient(BaseRealtimeClient):
                         )
 
                         # 1. Inject into conversation context via send_client_content
+                        # Send the image as a standalone message first (high attention)
+                        await self._session.send_client_content(
+                            turns=[types.Content(
+                                role="user",
+                                parts=[image_part],
+                            )],
+                            turn_complete=False,
+                        )
+
+                        # 2. Then inject with analysis instructions
                         await self._session.send_client_content(
                             turns=[types.Content(
                                 role="user",
                                 parts=[
                                     types.Part(text=(
                                         "[CAMERA SNAPSHOT FOR ANALYSIS]\n"
-                                        "The image attached to this message is a HIGH-RESOLUTION "
-                                        "snapshot just captured from the requested camera.\n"
+                                        "The image above is a HIGH-RESOLUTION snapshot "
+                                        "just captured from the requested camera.\n"
                                         "IMPORTANT: This is NOT from your live video feed. "
-                                        "This is a dedicated snapshot you MUST analyze carefully.\n"
-                                        "Look at this image and identify ALL objects: "
-                                        "vehicles (count them, state their colors), people, "
-                                        "furniture, plants, animals. Be thorough and accurate."
+                                        "Analyze THIS image carefully. "
+                                        "Identify ALL visible objects: vehicles, people, "
+                                        "furniture, plants, structures. Count them precisely."
                                     )),
-                                    image_part,
                                 ],
                             )],
                             turn_complete=False,
                         )
 
-                        # 2. Also inject into the realtime video buffer so the model's
+                        # 3. Also inject into the realtime video buffer so the model's
                         # "current view" matches the snapshot (prevents it from seeing
                         # the primary camera feed instead of the target camera)
                         try:
@@ -949,9 +957,8 @@ class GeminiLiveClient(BaseRealtimeClient):
                         except Exception:
                             pass  # Non-critical: conversation context is the primary method
 
-                        # 3. Small delay to ensure server processes the image before
-                        # we send tool_response (which triggers generation)
-                        await asyncio.sleep(0.3)
+                        # 4. Allow server to fully process image before tool_response
+                        await asyncio.sleep(0.5)
 
                         _LOGGER.warning(
                             "Tool image injected (context+realtime) BEFORE tool_response (%d bytes)",
