@@ -2337,11 +2337,14 @@ class JeevesSessionManager:
                     ),
                 )
             )
+            extra_b64 = result.pop("_extra_image_base64", "")
             self._client._pending_tool_image = (
                 result.pop("_image_base64"),
                 result.pop("_image_mime", "image/jpeg"),
                 image_context,
             )
+            if extra_b64:
+                self._client._pending_extra_image = extra_b64
             # Include the analysis instructions IN the tool response so the model
             # sees them alongside the image frame. Previously this was extracted
             # but never sent to the model, causing it to not engage with the image.
@@ -2356,6 +2359,8 @@ class JeevesSessionManager:
                 result.pop("_image_mime")
             if "_image_context" in result:
                 result.pop("_image_context")
+            if "_extra_image_base64" in result:
+                result.pop("_extra_image_base64")
 
         extend_seconds = int(result.pop("_extend_session_seconds", 0) or 0)
         if extend_seconds > 0:

@@ -65,6 +65,7 @@ class GeminiLiveClient(BaseRealtimeClient):
         self._conversation_turns: list[dict[str, str]] = []
         self._recap_future: asyncio.Future[str] | None = None
         self._pending_tool_image: tuple[str, str, str] | None = None
+        self._pending_extra_image: str = ""  # Second frame for multi-frame injection
         self._tool_call_pending = False
         self._vision_paused = False  # Pause vision loop during tool image injection
         # Track model generation state (informational — used by reconnect logic)
@@ -921,23 +922,36 @@ class GeminiLiveClient(BaseRealtimeClient):
                         # 1. Inject image + instructions together in one message
                         # (proven more reliable than split approach — model sees
                         # context and image atomically)
+                        parts_to_send: list[types.Part] = [image_part]
+
+                        # If we have a second frame, include it for multi-angle analysis
+                        extra_b64 = self._pending_extra_image
+                        self._pending_extra_image = ""
+                        if extra_b64:
+                            extra_bytes = base64.b64decode(extra_b64)
+                            extra_part = types.Part(inline_data=types.Blob(
+                                mime_type="image/jpeg",
+                                data=extra_bytes,
+                            ))
+                            parts_to_send.append(extra_part)
+
+                        parts_to_send.append(types.Part(text=(
+                            "[CAMERA SNAPSHOT — ANALYZE THIS IMAGE]\n"
+                            "This high-resolution snapshot was just captured from "
+                            "the requested camera. It is NOT your live video feed.\n"
+                            f"{'TWO frames captured at different moments. ' if extra_b64 else ''}"
+                            "CAREFULLY examine the ENTIRE image(s). Count ALL objects:\n"
+                            "- Vehicles: count each one, describe color and type\n"
+                            "- People: count and describe\n"
+                            "- Other: furniture, plants, structures\n"
+                            "If this is a night/IR image, objects appear as bright "
+                            "shapes. You CAN still identify and count them."
+                        )))
+
                         await self._session.send_client_content(
                             turns=[types.Content(
                                 role="user",
-                                parts=[
-                                    image_part,
-                                    types.Part(text=(
-                                        "[CAMERA SNAPSHOT — ANALYZE THIS IMAGE]\n"
-                                        "This high-resolution snapshot was just captured from "
-                                        "the requested camera. It is NOT your live video feed.\n"
-                                        "CAREFULLY examine the ENTIRE image. Count ALL objects:\n"
-                                        "- Vehicles: count each one, describe color and type\n"
-                                        "- People: count and describe\n"
-                                        "- Other: furniture, plants, structures\n"
-                                        "If this is a night/IR image, objects appear as bright "
-                                        "shapes. You CAN still identify and count them."
-                                    )),
-                                ],
+                                parts=parts_to_send,
                             )],
                             turn_complete=False,
                         )
@@ -948,12 +962,12 @@ class GeminiLiveClient(BaseRealtimeClient):
                         # send_client_content alone (conversation context) is the
                         # authoritative source for image analysis.
 
-                        # 3. Allow server to fully process image before tool_response
-                        await asyncio.sleep(0.5)
+                        # 3. Allow server to fully process image(s) before tool_response
+                        await asyncio.sleep(0.8)
 
                         _LOGGER.warning(
-                            "Tool image injected (context only) BEFORE tool_response (%d bytes)",
-                            len(img_bytes),
+                            "Tool image injected (context only) BEFORE tool_response (%d bytes, extra=%s)",
+                            len(img_bytes), bool(extra_b64),
                         )
                     except Exception:
                         _LOGGER.exception("Failed to inject tool image via send_client_content")

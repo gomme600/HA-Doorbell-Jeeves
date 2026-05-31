@@ -1446,49 +1446,64 @@ async def _execute_view_camera(
                 ),
             }
 
-        # Use the best (largest) frame. Process to 1024px — this resolution
-        # proved most reliable in testing (model analyzes smaller images more
-        # carefully in the Live API context).
-        best_frame = max(valid_frames, key=len)
-        processed = await hass.async_add_executor_job(
-            process_frame, best_frame, 1024, 1024, 92
-        )
+        # Process the two best frames (different moments = better coverage).
+        # Sending 2 frames gives the model more information to work with,
+        # reducing the chance of missing objects due to a single bad capture.
+        sorted_frames = sorted(valid_frames, key=len, reverse=True)
+        frames_to_send = sorted_frames[:2]  # Top 2 by size
+
+        processed_frames: list[bytes] = []
+        for frame in frames_to_send:
+            processed = await hass.async_add_executor_job(
+                process_frame, frame, 1024, 1024, 92
+            )
+            processed_frames.append(processed)
 
         _LOGGER.warning(
-            "view_camera: processed frame for %s: raw=%d bytes → processed=%d bytes",
-            camera_id, len(best_frame), len(processed),
+            "view_camera: processed %d frames for %s: sizes=%s",
+            len(processed_frames), camera_id,
+            [len(f) for f in processed_frames],
         )
 
-        # Return base64 image — the session manager will inject this into the model
-        image_b64 = base64.b64encode(processed).decode("ascii")
+        # Use the first (largest) frame as primary, include second as extra
+        primary = processed_frames[0]
+        image_b64 = base64.b64encode(primary).decode("ascii")
+        # If we have a second frame, include it for richer analysis
+        extra_image_b64 = ""
+        if len(processed_frames) > 1:
+            extra_image_b64 = base64.b64encode(processed_frames[1]).decode("ascii")
+
         managed = store.get_entity(camera_id)
         cam_name = managed.name if managed else camera_id
 
-        return {
+        result: dict[str, Any] = {
             "success": True,
             "camera": cam_name,
             "camera_entity_id": camera_id,
             "reason": reason,
-            "frames_captured": len(frames),
+            "frames_captured": len(processed_frames),
             "_image_base64": image_b64,
             "_image_mime": "image/jpeg",
             "_image_context": (
                 f"[CAMERA SNAPSHOT: {cam_name}] "
-                f"A high-resolution snapshot from '{cam_name}' was captured and injected. "
-                f"You MUST analyze the injected image, NOT your live video feed."
+                f"High-resolution snapshots from '{cam_name}' captured and injected. "
+                f"You MUST analyze these images, NOT your live video feed."
             ),
             "message": (
-                f"SUCCESS: A high-resolution snapshot ({len(processed)} bytes) from '{cam_name}' "
-                f"has been injected into the conversation AND your video feed. "
-                f"CRITICAL INSTRUCTION: You MUST describe what you see in this snapshot. "
-                f"This image is from '{cam_name}' — it is DIFFERENT from your live doorbell feed. "
-                f"Carefully examine the entire image. Count ALL vehicles (state exact number "
+                f"SUCCESS: {len(processed_frames)} high-resolution snapshot(s) from '{cam_name}' "
+                f"have been injected into the conversation. "
+                f"CRITICAL INSTRUCTION: You MUST describe what you see in these snapshots. "
+                f"These images are from '{cam_name}' — DIFFERENT from your live doorbell feed. "
+                f"Carefully examine the ENTIRE image(s). Count ALL vehicles (state exact number "
                 f"and color of each). List all visible objects: furniture, plants, people, "
                 f"animals, bicycles, etc. If the image is dark (night/IR mode), you can still "
                 f"identify shapes and objects — describe them. "
                 f"DO NOT say 'nothing visible' or '0 objects' unless the image is truly blank."
             ),
         }
+        if extra_image_b64:
+            result["_extra_image_base64"] = extra_image_b64
+        return result
     except asyncio.TimeoutError:
         return {
             "success": False,
