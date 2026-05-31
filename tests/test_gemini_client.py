@@ -216,11 +216,11 @@ def test_view_camera_injects_image_via_client_content(monkeypatch: Any) -> None:
         # Tool response should NOT contain parts (no image in response)
         assert len(captured_kwargs) == 1
         assert "parts" not in captured_kwargs[0]
-        # Image should have been injected via send_client_content BEFORE tool_response
+        # Image should have been injected via send_client_content AFTER tool_response
         assert len(client_content_calls) == 1
         assert "turns" in client_content_calls[0]
-        # Verify ordering: image injection comes before tool response
-        assert call_order == ["client_content", "tool_response"]
+        # Verify ordering: tool response first, then image injection (forces dedicated analysis turn)
+        assert call_order == ["tool_response", "client_content"]
 
     asyncio.run(_run())
 

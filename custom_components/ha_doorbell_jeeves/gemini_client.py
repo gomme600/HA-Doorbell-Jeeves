@@ -908,20 +908,37 @@ class GeminiLiveClient(BaseRealtimeClient):
                 function_responses.append(types.FunctionResponse(**function_response_kwargs))
 
             if self._session and self._connected:
-                # Inject tool image BEFORE tool_response so it's in the model's
-                # conversation context when generation starts. send_tool_response
-                # triggers generation — any image sent after would arrive too late.
+                # NEW APPROACH: Send tool_response FIRST, then inject image AFTER.
+                # The model will acknowledge the tool response briefly ("Un instant").
+                # Then the image arrives as a new user message with turn_complete=True,
+                # forcing the model to generate a dedicated response analyzing the image.
+                # This is more reliable than pre-injection because the model cannot
+                # "skip over" the image — it MUST respond to it as a new input.
+
+                # 1. Send tool_response (triggers model generation)
+                try:
+                    await self._session.send_tool_response(
+                        function_responses=function_responses
+                    )
+                except Exception:
+                    _LOGGER.exception("Failed to send tool response")
+                    self._tool_call_pending = False
+                    self._stop_keepalive()
+                    return
+
+                # 2. If we have an image to inject, wait briefly then inject it
+                # as a new user message that forces another model turn
                 if pending_image_for_injection and self._session and self._connected:
                     img_b64, img_mime = pending_image_for_injection
                     try:
+                        # Wait for the model to process the tool response
+                        await asyncio.sleep(1.5)
+
                         img_bytes = base64.b64decode(img_b64)
                         image_part = types.Part(
                             inline_data=types.Blob(data=img_bytes, mime_type=img_mime)
                         )
 
-                        # 1. Inject image + instructions together in one message
-                        # (proven more reliable than split approach — model sees
-                        # context and image atomically)
                         parts_to_send: list[types.Part] = [image_part]
 
                         # If we have a second frame, include it for multi-angle analysis
@@ -936,7 +953,7 @@ class GeminiLiveClient(BaseRealtimeClient):
                             parts_to_send.append(extra_part)
 
                         parts_to_send.append(types.Part(text=(
-                            "[CAMERA SNAPSHOT — ANALYZE THIS IMAGE]\n"
+                            "[CAMERA SNAPSHOT — YOU MUST ANALYZE THIS IMAGE NOW]\n"
                             "This high-resolution snapshot was just captured from "
                             "the requested camera. It is NOT your live video feed.\n"
                             f"{'TWO frames captured at different moments. ' if extra_b64 else ''}"
@@ -945,7 +962,8 @@ class GeminiLiveClient(BaseRealtimeClient):
                             "- People: count and describe\n"
                             "- Other: furniture, plants, structures\n"
                             "If this is a night/IR image, objects appear as bright "
-                            "shapes. You CAN still identify and count them."
+                            "shapes against dark background. You CAN identify and count them.\n"
+                            "RESPOND NOW with your description. Do NOT say 'un instant' — describe immediately."
                         )))
 
                         await self._session.send_client_content(
@@ -953,36 +971,15 @@ class GeminiLiveClient(BaseRealtimeClient):
                                 role="user",
                                 parts=parts_to_send,
                             )],
-                            turn_complete=False,
+                            turn_complete=True,
                         )
 
-                        # 2. Do NOT inject into realtime video buffer — this can
-                        # confuse the model by mixing the snapshot with its live
-                        # video feed, causing it to see a blended/faded image.
-                        # send_client_content alone (conversation context) is the
-                        # authoritative source for image analysis.
-
-                        # 3. Allow server to fully process image(s) before tool_response
-                        await asyncio.sleep(0.8)
-
                         _LOGGER.warning(
-                            "Tool image injected (context only) BEFORE tool_response (%d bytes, extra=%s)",
+                            "Tool image injected AFTER tool_response (%d bytes, extra=%s) with turn_complete=True",
                             len(img_bytes), bool(extra_b64),
                         )
                     except Exception:
                         _LOGGER.exception("Failed to inject tool image via send_client_content")
-
-                # Now send tool_response (this triggers model generation).
-                # The image is already in context so the model will see it.
-                try:
-                    await self._session.send_tool_response(
-                        function_responses=function_responses
-                    )
-                except Exception:
-                    _LOGGER.exception("Failed to send tool response")
-                    self._tool_call_pending = False
-                    self._stop_keepalive()
-                    return
             else:
                 # Session gone — clear pending state
                 self._tool_call_pending = False

@@ -1409,8 +1409,8 @@ async def _execute_view_camera(
                         )
                         if snapshot_bytes and len(snapshot_bytes) > 1000:
                             raw_jpeg_2 = snapshot_bytes
-                    except Exception:
-                        pass
+                    except Exception as e2:
+                        _LOGGER.debug("Second frame Reolink capture failed: %s", e2)
             if not raw_jpeg_2:
                 try:
                     image = await asyncio.wait_for(
@@ -1418,10 +1418,13 @@ async def _execute_view_camera(
                     )
                     if image and image.content:
                         raw_jpeg_2 = image.content
-                except Exception:
-                    pass
+                except Exception as e2:
+                    _LOGGER.debug("Second frame HA camera capture failed: %s", e2)
             if raw_jpeg_2 and len(raw_jpeg_2) > 1000:
                 frames.append(raw_jpeg_2)
+                _LOGGER.info("view_camera: captured second frame (%d bytes)", len(raw_jpeg_2))
+            else:
+                _LOGGER.info("view_camera: second frame capture failed, proceeding with 1 frame")
 
         if not frames:
             return {
