@@ -1319,12 +1319,11 @@ async def _analyze_image_with_vision_api(
     """
     from google import genai  # noqa: PLC0415
     from google.genai import types as genai_types  # noqa: PLC0415
+    from .gemini_client import GeminiClient  # noqa: PLC0415
 
     try:
-        loop = asyncio.get_running_loop()
-        client = await loop.run_in_executor(
-            None, lambda: genai.Client(api_key=api_key)
-        )
+        # Reuse the shared client (already warmed up during integration startup)
+        client = await GeminiClient._get_shared_client(api_key)
 
         image_part = genai_types.Part.from_bytes(
             data=image_bytes,
@@ -1348,18 +1347,22 @@ async def _analyze_image_with_vision_api(
             "If you're unsure about an object, say 'possibly' rather than omitting it."
         )
 
-        response = await loop.run_in_executor(
-            None,
-            lambda: client.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=[image_part, prompt],
-            ),
-        )
+        async with asyncio.timeout(15):
+            response = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=[image_part, prompt],
+                ),
+            )
 
         if response and response.text:
             return response.text.strip()
         return ""
 
+    except TimeoutError:
+        _LOGGER.warning("Vision API timed out for %s (15s limit)", camera_id)
+        return ""
     except Exception as exc:  # noqa: BLE001
         _LOGGER.warning(
             "Vision API analysis failed for %s: %s", camera_id, exc,
