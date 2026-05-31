@@ -942,19 +942,17 @@ class GeminiLiveClient(BaseRealtimeClient):
                             turn_complete=False,
                         )
 
-                        # 2. Also inject into the realtime video buffer
-                        try:
-                            await self._session.send_realtime_input(
-                                media=types.Blob(data=img_bytes, mime_type=img_mime)
-                            )
-                        except Exception:
-                            pass
+                        # 2. Do NOT inject into realtime video buffer — this can
+                        # confuse the model by mixing the snapshot with its live
+                        # video feed, causing it to see a blended/faded image.
+                        # send_client_content alone (conversation context) is the
+                        # authoritative source for image analysis.
 
                         # 3. Allow server to fully process image before tool_response
                         await asyncio.sleep(0.5)
 
                         _LOGGER.warning(
-                            "Tool image injected (context+realtime) BEFORE tool_response (%d bytes)",
+                            "Tool image injected (context only) BEFORE tool_response (%d bytes)",
                             len(img_bytes),
                         )
                     except Exception:
