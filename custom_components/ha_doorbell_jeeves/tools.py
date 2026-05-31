@@ -1330,11 +1330,36 @@ async def _execute_view_camera(
 
     try:
         frames: list[bytes] = []
-        num_captures = 3  # Capture multiple frames for reliability
 
-        for attempt in range(num_captures):
-            raw_jpeg: bytes | None = None
-            # Try HA camera snapshot API
+        # Strategy: try Reolink API main-stream snapshot first (high res: 2K/4K),
+        # then fall back to HA camera proxy (fluent sub-stream: 640x360).
+        raw_jpeg: bytes | None = None
+
+        # 1. Try Reolink API get_snapshot (main stream = full resolution)
+        from .reolink_audio import find_reolink_entry_for_camera  # noqa: PLC0415
+        reolink_entry_id = find_reolink_entry_for_camera(hass, camera_id)
+        if reolink_entry_id:
+            entry = hass.config_entries.async_get_entry(reolink_entry_id)
+            if entry and hasattr(entry, "runtime_data") and entry.runtime_data:
+                try:
+                    host_obj = entry.runtime_data.host
+                    api_obj = host_obj.api
+                    # get_snapshot(channel=0, stream=None) → main stream full resolution
+                    snapshot_bytes = await asyncio.wait_for(
+                        api_obj.get_snapshot(0, None),
+                        timeout=8,
+                    )
+                    if snapshot_bytes and len(snapshot_bytes) > 1000:
+                        raw_jpeg = snapshot_bytes
+                        _LOGGER.info(
+                            "view_camera: got HIGH-RES snapshot via Reolink API (%d bytes) from %s",
+                            len(raw_jpeg), camera_id,
+                        )
+                except Exception as reolink_err:
+                    _LOGGER.debug("Reolink API snapshot failed for %s: %s", camera_id, reolink_err)
+
+        # 2. Fallback: HA camera snapshot API (fluent/sub stream, 640x360)
+        if not raw_jpeg:
             try:
                 image = await asyncio.wait_for(
                     ha_camera_get_image(hass, camera_id, timeout=8),
@@ -1345,32 +1370,28 @@ async def _execute_view_camera(
             except Exception:
                 pass
 
-            if not raw_jpeg:
-                # Fallback: try go2rtc snapshot
-                import aiohttp  # noqa: PLC0415
+        # 3. Fallback: go2rtc snapshot
+        if not raw_jpeg:
+            import aiohttp  # noqa: PLC0415
 
-                from homeassistant.helpers.aiohttp_client import async_get_clientsession  # noqa: PLC0415
+            from homeassistant.helpers.aiohttp_client import async_get_clientsession  # noqa: PLC0415
 
-                from .reolink_audio import _discover_go2rtc_url, _get_go2rtc_session  # noqa: PLC0415
-                base_url = await _discover_go2rtc_url(hass)
-                if base_url:
-                    url = f"{base_url}/api/frame.jpeg?src={camera_id}"
-                    session = _get_go2rtc_session(hass)
-                    if session is None:
-                        session = async_get_clientsession(hass)
-                    try:
-                        async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                            if resp.status == 200:
-                                raw_jpeg = await resp.read()
-                    except Exception:
-                        pass
+            from .reolink_audio import _discover_go2rtc_url, _get_go2rtc_session  # noqa: PLC0415
+            base_url = await _discover_go2rtc_url(hass)
+            if base_url:
+                url = f"{base_url}/api/frame.jpeg?src={camera_id}"
+                session = _get_go2rtc_session(hass)
+                if session is None:
+                    session = async_get_clientsession(hass)
+                try:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                        if resp.status == 200:
+                            raw_jpeg = await resp.read()
+                except Exception:
+                    pass
 
-            if raw_jpeg and len(raw_jpeg) > 1000:
-                frames.append(raw_jpeg)
-
-            # Small delay between captures for temporal diversity
-            if attempt < num_captures - 1:
-                await asyncio.sleep(0.5)
+        if raw_jpeg and len(raw_jpeg) > 1000:
+            frames.append(raw_jpeg)
 
         if not frames:
             return {
@@ -1425,12 +1446,11 @@ async def _execute_view_camera(
                 ),
             }
 
-        # Process the best frame (largest = most detail) at maximum quality.
-        # Source cameras are typically 640x360 (fluent stream) — don't downsample,
-        # and use quality 95 to preserve maximum detail for object recognition.
+        # Process frame: downscale high-res (2K/4K) to 1280x720 for Gemini context window
+        # efficiency while preserving detail, quality 90 for clear object recognition.
         best_frame = max(valid_frames, key=len)
         processed = await hass.async_add_executor_job(
-            process_frame, best_frame, 1920, 1080, 95
+            process_frame, best_frame, 1280, 720, 90
         )
 
         # Return base64 image — the session manager will inject this into the model

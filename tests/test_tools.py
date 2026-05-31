@@ -223,6 +223,9 @@ def test_execute_view_camera_returns_labeled_image_context(hass: object, monkeyp
 
         monkeypatch.setattr(tools_module, "ha_camera_get_image", _fake_get_image)
         monkeypatch.setattr(frame_processor_module, "process_frame", _fake_process_frame)
+        # Mock reolink lookup to return None (no reolink entry in test)
+        from custom_components.ha_doorbell_jeeves import reolink_audio as reolink_audio_module
+        monkeypatch.setattr(reolink_audio_module, "find_reolink_entry_for_camera", lambda *a, **kw: None)
 
         store = _DummyStore(
             managed_entities=[
