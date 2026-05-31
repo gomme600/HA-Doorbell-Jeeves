@@ -1522,12 +1522,14 @@ async def _execute_view_camera(
             "message": (
                 f"SUCCESS: {len(processed_frames)} high-resolution snapshot(s) from '{cam_name}' "
                 f"have been injected into the conversation. "
-                f"CRITICAL INSTRUCTION: You MUST describe what you see in these snapshots. "
+                f"YOU MUST NOW IMMEDIATELY DESCRIBE WHAT YOU SEE IN THE IMAGE(S). "
+                f"Do NOT just say 'Un instant' or 'Let me check' — DESCRIBE the image NOW. "
                 f"These images are from '{cam_name}' — DIFFERENT from your live doorbell feed. "
-                f"Carefully examine the ENTIRE image(s). Count ALL vehicles (state exact number "
-                f"and color of each). List all visible objects: furniture, plants, people, "
-                f"animals, bicycles, etc. If the image is dark (night/IR mode), you can still "
-                f"identify shapes and objects — describe them. "
+                f"Carefully examine the ENTIRE image(s). Count ALL vehicles visible (state exact "
+                f"number and color of each). List all visible objects: furniture, plants, people, "
+                f"animals, bicycles, etc. If the image is dark (night/IR mode), objects appear as "
+                f"bright shapes against dark background — you CAN identify and count them. "
+                f"DO NOT say 'nothing visible' or '0 objects' unless the image is truly blank/black."
                 f"DO NOT say 'nothing visible' or '0 objects' unless the image is truly blank."
             ),
         }
