@@ -1307,6 +1307,7 @@ async def execute_tool_call(
 async def _analyze_image_with_vision_api(
     hass: HomeAssistant,
     api_key: str,
+    model: str,
     image_bytes: bytes,
     camera_id: str,
     reason: str,
@@ -1316,10 +1317,20 @@ async def _analyze_image_with_vision_api(
     The Live API model is optimized for streaming audio/video and is unreliable
     at careful image analysis. This function uses a separate generate_content call
     with the image, which gives much more accurate object detection and counting.
+
+    The configured model (e.g. gemini-2.5-flash-native-audio-latest) is converted
+    to its base form for generate_content compatibility.
     """
     from google import genai  # noqa: PLC0415
     from google.genai import types as genai_types  # noqa: PLC0415
     from .gemini_client import GeminiClient  # noqa: PLC0415
+
+    # Convert audio-specific model name to base model for generate_content
+    vision_model = model
+    for suffix in ("-native-audio-latest", "-native-audio"):
+        vision_model = vision_model.replace(suffix, "")
+    if not vision_model:
+        vision_model = "gemini-2.5-flash"
 
     try:
         # Reuse the shared client (already warmed up during integration startup)
@@ -1351,7 +1362,7 @@ async def _analyze_image_with_vision_api(
             response = await asyncio.get_running_loop().run_in_executor(
                 None,
                 lambda: client.models.generate_content(
-                    model="gemini-2.5-flash",
+                    model=vision_model,
                     contents=[image_part, prompt],
                 ),
             )
@@ -1532,11 +1543,12 @@ async def _execute_view_camera(
         # the image gives much more accurate results.
         vision_description = ""
         if config:
-            from .const import CONF_API_KEY  # noqa: PLC0415
+            from .const import CONF_API_KEY, CONF_MODEL  # noqa: PLC0415
             api_key = config.get(CONF_API_KEY, "")
+            model = config.get(CONF_MODEL, "gemini-2.5-flash-native-audio-latest")
             if api_key:
                 vision_description = await _analyze_image_with_vision_api(
-                    hass, api_key, processed, camera_id, reason
+                    hass, api_key, model, processed, camera_id, reason
                 )
                 if vision_description:
                     _LOGGER.warning(
