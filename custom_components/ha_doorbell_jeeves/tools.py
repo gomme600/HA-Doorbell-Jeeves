@@ -1446,14 +1446,19 @@ async def _execute_view_camera(
                 ),
             }
 
-        # Process frame: use high resolution for best object recognition.
-        # The raw Reolink snapshot is full-res (2K+) which may be too large,
-        # but we keep it at 2048px max to preserve detail for small objects
-        # (e.g. vehicles in a wide-angle carport view at night).
+        # Use the best (largest) frame. The raw Reolink snapshot is already JPEG
+        # at full resolution. Send it directly without downscaling to preserve
+        # maximum detail for object recognition (especially for night/IR images
+        # where vehicles may appear as subtle shapes).
         best_frame = max(valid_frames, key=len)
-        processed = await hass.async_add_executor_job(
-            process_frame, best_frame, 2048, 2048, 85
-        )
+
+        # Only process if the image is unreasonably large (>1MB)
+        if len(best_frame) > 1_000_000:
+            processed = await hass.async_add_executor_job(
+                process_frame, best_frame, 2048, 2048, 85
+            )
+        else:
+            processed = best_frame
 
         _LOGGER.warning(
             "view_camera: processed frame for %s: raw=%d bytes → processed=%d bytes",
