@@ -1446,11 +1446,18 @@ async def _execute_view_camera(
                 ),
             }
 
-        # Process frame: downscale high-res (2K/4K) to 1280x720 for Gemini context window
-        # efficiency while preserving detail, quality 90 for clear object recognition.
+        # Process frame: downscale high-res (2K/4K) to 1024x1024 max for Gemini.
+        # Gemini's vision works best at moderate resolution — too large and the model
+        # may not analyze it carefully. 1024px gives good detail while ensuring
+        # the model treats it as a discrete image to analyze (not video).
         best_frame = max(valid_frames, key=len)
         processed = await hass.async_add_executor_job(
-            process_frame, best_frame, 1280, 720, 90
+            process_frame, best_frame, 1024, 1024, 92
+        )
+
+        _LOGGER.warning(
+            "view_camera: processed frame for %s: raw=%d bytes → processed=%d bytes",
+            camera_id, len(best_frame), len(processed),
         )
 
         # Return base64 image — the session manager will inject this into the model
@@ -1468,16 +1475,19 @@ async def _execute_view_camera(
             "_image_mime": "image/jpeg",
             "_image_context": (
                 f"[CAMERA SNAPSHOT: {cam_name}] "
-                f"A snapshot from camera '{cam_name}' has been injected into the conversation above. "
-                f"Look at THAT image (not your live feed). "
-                f"Describe what you see: count vehicles, people, objects. State colors and positions."
+                f"A high-resolution snapshot from '{cam_name}' was captured and injected. "
+                f"You MUST analyze the injected image, NOT your live video feed."
             ),
             "message": (
-                f"SUCCESS: High-quality snapshot captured from '{cam_name}'. "
-                f"The image was injected immediately before this response. "
-                f"IMPORTANT: Look at the injected image above to answer the user. "
-                f"That image is from {cam_name}, NOT from your primary live camera feed. "
-                f"Count ALL visible objects carefully (vehicles, people, furniture, animals)."
+                f"SUCCESS: A high-resolution snapshot ({len(processed)} bytes) from '{cam_name}' "
+                f"has been injected into the conversation AND your video feed. "
+                f"CRITICAL INSTRUCTION: You MUST describe what you see in this snapshot. "
+                f"This image is from '{cam_name}' — it is DIFFERENT from your live doorbell feed. "
+                f"Carefully examine the entire image. Count ALL vehicles (state exact number "
+                f"and color of each). List all visible objects: furniture, plants, people, "
+                f"animals, bicycles, etc. If the image is dark (night/IR mode), you can still "
+                f"identify shapes and objects — describe them. "
+                f"DO NOT say 'nothing visible' or '0 objects' unless the image is truly blank."
             ),
         }
     except asyncio.TimeoutError:
