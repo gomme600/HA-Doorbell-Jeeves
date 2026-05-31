@@ -1304,6 +1304,69 @@ async def execute_tool_call(
 # ─── Smart Tool Implementations ───────────────────────────────────────────────
 
 
+async def _analyze_image_with_vision_api(
+    hass: HomeAssistant,
+    api_key: str,
+    image_bytes: bytes,
+    camera_id: str,
+    reason: str,
+) -> str:
+    """Use the standard Gemini Vision API for reliable image analysis.
+
+    The Live API model is optimized for streaming audio/video and is unreliable
+    at careful image analysis. This function uses a separate generate_content call
+    with the image, which gives much more accurate object detection and counting.
+    """
+    from google import genai  # noqa: PLC0415
+    from google.genai import types as genai_types  # noqa: PLC0415
+
+    try:
+        loop = asyncio.get_running_loop()
+        client = await loop.run_in_executor(
+            None, lambda: genai.Client(api_key=api_key)
+        )
+
+        image_part = genai_types.Part.from_bytes(
+            data=image_bytes,
+            mime_type="image/jpeg",
+        )
+
+        prompt = (
+            "You are a security camera image analyst. Analyze this camera image carefully.\n"
+            f"Camera: {camera_id}\n"
+            f"Context: {reason}\n\n"
+            "Provide a detailed factual description:\n"
+            "1. Count ALL vehicles visible (cars, motorcycles, bicycles). State exact number.\n"
+            "2. For each vehicle: describe color, type (sedan, SUV, truck, etc.), position.\n"
+            "3. Count ALL people visible. Describe their appearance briefly.\n"
+            "4. List other notable objects: furniture, plants, structures, animals.\n"
+            "5. Describe lighting conditions (day/night/IR/artificial).\n"
+            "6. If this is an IR/night-vision image, note that colors are unreliable "
+            "but shapes and objects are still clearly identifiable.\n\n"
+            "Be precise. Do NOT hallucinate objects that aren't there. "
+            "Do NOT say '0' for any category unless you've carefully verified nothing is present. "
+            "If you're unsure about an object, say 'possibly' rather than omitting it."
+        )
+
+        response = await loop.run_in_executor(
+            None,
+            lambda: client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=[image_part, prompt],
+            ),
+        )
+
+        if response and response.text:
+            return response.text.strip()
+        return ""
+
+    except Exception as exc:  # noqa: BLE001
+        _LOGGER.warning(
+            "Vision API analysis failed for %s: %s", camera_id, exc,
+        )
+        return ""
+
+
 async def _execute_view_camera(
     hass: HomeAssistant, store: DataStore, arguments: dict[str, Any],
     config: dict[str, Any] | None = None,
@@ -1460,10 +1523,47 @@ async def _execute_view_camera(
             camera_id, len(best_frame), len(processed),
         )
 
+        # Use the standard (non-live) Gemini Vision API to analyze the image.
+        # The Live API model is unreliable at image analysis because it's optimized
+        # for streaming, not careful vision. A dedicated generate_content call with
+        # the image gives much more accurate results.
+        vision_description = ""
+        if config:
+            from .const import CONF_API_KEY  # noqa: PLC0415
+            api_key = config.get(CONF_API_KEY, "")
+            if api_key:
+                vision_description = await _analyze_image_with_vision_api(
+                    hass, api_key, processed, camera_id, reason
+                )
+                if vision_description:
+                    _LOGGER.warning(
+                        "view_camera: vision API analysis for %s: %s",
+                        camera_id, vision_description[:100],
+                    )
+
         # Return base64 image — the session manager will inject this into the model
         image_b64 = base64.b64encode(processed).decode("ascii")
         managed = store.get_entity(camera_id)
         cam_name = managed.name if managed else camera_id
+
+        # Build the message with the vision analysis if available
+        if vision_description:
+            message_text = (
+                f"SUCCESS: High-resolution snapshot from '{cam_name}' captured and analyzed.\n"
+                f"\n"
+                f"VISION ANALYSIS RESULT (from dedicated image analysis):\n"
+                f"{vision_description}\n"
+                f"\n"
+                f"The snapshot image has also been injected for your reference. "
+                f"Use the VISION ANALYSIS RESULT above as the ground truth for your response. "
+                f"Report these findings to the user accurately."
+            )
+        else:
+            message_text = (
+                f"SUCCESS: High-resolution snapshot ({len(processed)} bytes) from '{cam_name}' "
+                f"has been injected. Analyze the image carefully. "
+                f"Count ALL vehicles, describe colors and positions of all visible objects."
+            )
 
         return {
             "success": True,
@@ -1478,17 +1578,7 @@ async def _execute_view_camera(
                 f"A high-resolution snapshot from '{cam_name}' was captured and injected. "
                 f"You MUST analyze the injected image, NOT your live video feed."
             ),
-            "message": (
-                f"SUCCESS: A high-resolution snapshot ({len(processed)} bytes) from '{cam_name}' "
-                f"has been injected into the conversation AND your video feed. "
-                f"CRITICAL INSTRUCTION: You MUST describe what you see in this snapshot. "
-                f"This image is from '{cam_name}' — it is DIFFERENT from your live doorbell feed. "
-                f"Carefully examine the entire image. Count ALL vehicles (state exact number "
-                f"and color of each). List all visible objects: furniture, plants, people, "
-                f"animals, bicycles, etc. If the image is dark (night/IR mode), you can still "
-                f"identify shapes and objects — describe them. "
-                f"DO NOT say 'nothing visible' or '0 objects' unless the image is truly blank."
-            ),
+            "message": message_text,
         }
     except asyncio.TimeoutError:
         return {
