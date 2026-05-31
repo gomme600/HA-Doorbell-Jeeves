@@ -242,7 +242,6 @@ def test_execute_view_camera_returns_labeled_image_context(hass: object, monkeyp
         assert result["success"] is True
         assert result["camera_entity_id"] == "camera.carport"
         assert "_image_base64" in result
-        assert "camera.carport" in result["_image_context"]
         assert "Carport" in result["_image_context"]
 
     asyncio.run(_run())

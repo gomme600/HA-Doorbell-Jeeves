@@ -1425,10 +1425,12 @@ async def _execute_view_camera(
                 ),
             }
 
-        # Process the best frame (largest = most detail) at high quality
+        # Process the best frame (largest = most detail) at maximum quality.
+        # Source cameras are typically 640x360 (fluent stream) — don't downsample,
+        # and use quality 95 to preserve maximum detail for object recognition.
         best_frame = max(valid_frames, key=len)
         processed = await hass.async_add_executor_job(
-            process_frame, best_frame, 1280, 960, 85
+            process_frame, best_frame, 1920, 1080, 95
         )
 
         # Return base64 image — the session manager will inject this into the model
@@ -1445,27 +1447,17 @@ async def _execute_view_camera(
             "_image_base64": image_b64,  # Special key: session manager injects as image
             "_image_mime": "image/jpeg",
             "_image_context": (
-                f"╔══════════════════════════════════════════════════════════╗\n"
-                f"║  IMAGE SOURCE: {cam_name} ({camera_id})\n"
-                f"║  THIS IS NOT YOUR LIVE FEED — this is a dedicated snapshot.\n"
-                f"╚══════════════════════════════════════════════════════════╝\n"
-                f"\n"
-                f"MANDATORY ANALYSIS RULES:\n"
-                f"1. This image is from camera '{cam_name}'. It is NOT from your primary live stream.\n"
-                f"2. Describe ONLY what you can ACTUALLY SEE in the pixel data below.\n"
-                f"3. Do NOT use your live feed memory or camera area descriptions to fabricate content.\n"
-                f"4. If the image shows an empty scene, say it is empty.\n"
-                f"5. Count objects (cars, people, animals) by carefully examining the image.\n"
-                f"6. If you cannot clearly identify something, say so.\n"
-                f"7. {len(frames)} frame(s) were captured to verify consistency.\n"
-                f"\n"
-                f"Analyze this image from {cam_name} NOW. What do you ACTUALLY see in it?"
+                f"[CAMERA SNAPSHOT: {cam_name}] "
+                f"A snapshot from camera '{cam_name}' has been injected into the conversation above. "
+                f"Look at THAT image (not your live feed). "
+                f"Describe what you see: count vehicles, people, objects. State colors and positions."
             ),
             "message": (
-                f"Snapshot captured from {cam_name} ({len(frames)} frames taken for verification). "
-                f"The image has been injected — analyze ONLY what is visible in THIS specific image. "
-                f"This image is from {cam_name}, NOT from your primary live feed camera. "
-                f"If no cars/people/objects are visible, say so clearly. Do NOT fabricate."
+                f"SUCCESS: High-quality snapshot captured from '{cam_name}'. "
+                f"The image was injected immediately before this response. "
+                f"IMPORTANT: Look at the injected image above to answer the user. "
+                f"That image is from {cam_name}, NOT from your primary live camera feed. "
+                f"Count ALL visible objects carefully (vehicles, people, furniture, animals)."
             ),
         }
     except asyncio.TimeoutError:

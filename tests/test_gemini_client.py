@@ -174,10 +174,11 @@ def test_tool_response_omits_parts_kwarg_when_no_image(monkeypatch: Any) -> None
 
 
 def test_view_camera_injects_image_via_client_content(monkeypatch: Any) -> None:
-    """Test that view_camera tool images are injected via send_client_content after tool response."""
+    """Test that view_camera tool images are injected via send_client_content BEFORE tool response."""
     async def _run() -> None:
         captured_kwargs: list[dict[str, Any]] = []
         client_content_calls: list[dict[str, Any]] = []
+        call_order: list[str] = []
 
         def _fake_function_response(**kwargs: Any) -> dict[str, Any]:
             captured_kwargs.append(kwargs)
@@ -185,10 +186,17 @@ def test_view_camera_injects_image_via_client_content(monkeypatch: Any) -> None:
 
         client = _build_client()
         session = _FakeSession()
-        # Track send_client_content calls
+        # Track send_client_content calls with ordering
         async def _track_client_content(**kwargs: Any) -> None:
             client_content_calls.append(kwargs)
+            call_order.append("client_content")
         session.send_client_content = _track_client_content
+
+        original_send_tool = session.send_tool_response
+        async def _track_tool_response(**kwargs: Any) -> None:
+            call_order.append("tool_response")
+            await original_send_tool(**kwargs)
+        session.send_tool_response = _track_tool_response
 
         client._session = session
         client._connected = True
@@ -208,9 +216,11 @@ def test_view_camera_injects_image_via_client_content(monkeypatch: Any) -> None:
         # Tool response should NOT contain parts (no image in response)
         assert len(captured_kwargs) == 1
         assert "parts" not in captured_kwargs[0]
-        # Image should have been injected via send_client_content
+        # Image should have been injected via send_client_content BEFORE tool_response
         assert len(client_content_calls) == 1
         assert "turns" in client_content_calls[0]
+        # Verify ordering: image injection comes before tool response
+        assert call_order == ["client_content", "tool_response"]
 
     asyncio.run(_run())
 

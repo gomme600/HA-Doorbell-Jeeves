@@ -907,21 +907,9 @@ class GeminiLiveClient(BaseRealtimeClient):
                 function_responses.append(types.FunctionResponse(**function_response_kwargs))
 
             if self._session and self._connected:
-                # Send tool_response (this triggers model generation)
-                try:
-                    await self._session.send_tool_response(
-                        function_responses=function_responses
-                    )
-                except Exception:
-                    _LOGGER.exception("Failed to send tool response")
-                    self._tool_call_pending = False
-                    self._stop_keepalive()
-                    return
-
-                # Inject the tool image AFTER the tool response via send_client_content.
-                # Using inline_data in a Content part puts the image into conversation
-                # context so the model can actually analyze it. send_realtime_input(media=...)
-                # only goes to the transient video buffer and causes hallucinations.
+                # Inject tool image BEFORE tool_response so it's in the model's
+                # conversation context when generation starts. send_tool_response
+                # triggers generation — any image sent after would arrive too late.
                 if pending_image_for_injection and self._session and self._connected:
                     img_b64, img_mime = pending_image_for_injection
                     try:
@@ -934,18 +922,35 @@ class GeminiLiveClient(BaseRealtimeClient):
                                 role="user",
                                 parts=[
                                     types.Part(text=(
-                                        "[SYSTEM] The image below was captured by the requested camera. "
-                                        "Analyze THIS image to answer the user's question. "
-                                        "Describe ONLY what you actually see in this specific image."
+                                        "[SYSTEM IMAGE INJECTION] The image below is a snapshot "
+                                        "from the requested camera. When you receive the tool "
+                                        "response, analyze THIS image carefully. Count all "
+                                        "visible objects (vehicles, people, furniture, etc). "
+                                        "Describe colors, positions, and quantities accurately."
                                     )),
                                     image_part,
                                 ],
                             )],
                             turn_complete=False,
                         )
-                        _LOGGER.warning("Tool image injected via send_client_content (%d bytes)", len(img_bytes))
+                        _LOGGER.warning(
+                            "Tool image injected BEFORE tool_response via send_client_content (%d bytes)",
+                            len(img_bytes),
+                        )
                     except Exception:
                         _LOGGER.exception("Failed to inject tool image via send_client_content")
+
+                # Now send tool_response (this triggers model generation).
+                # The image is already in context so the model will see it.
+                try:
+                    await self._session.send_tool_response(
+                        function_responses=function_responses
+                    )
+                except Exception:
+                    _LOGGER.exception("Failed to send tool response")
+                    self._tool_call_pending = False
+                    self._stop_keepalive()
+                    return
             else:
                 # Session gone — clear pending state
                 self._tool_call_pending = False
